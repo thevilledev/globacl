@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "globacl-commitd"
+version = "0.1.0"
+dependencies = [
+ "globacl-core",
+]
+
+[[package]]
 name = "globacl-control"
 version = "0.1.0"
 dependencies = [

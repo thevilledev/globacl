@@ -2,6 +2,7 @@
 members = [
     "crates/globacl-agent",
     "crates/globacl-bench",
+    "crates/globacl-commitd",
     "crates/globacl-control",
     "crates/globacl-core",
     "crates/globacl-demo-app",

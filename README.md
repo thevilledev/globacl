@@ -12,7 +12,7 @@ globacl implements the core shape of that system:
 
 ```text
 ACL API
-  -> quorum-backed source of truth
+  -> ACL commit service
   -> durable per-shard append log
   -> relay fanout
   -> PoP agent
@@ -20,7 +20,7 @@ ACL API
   -> binary snapshots for bootstrap and repair
 ```
 
-The request path evaluates denies locally. Updates are committed to the source of truth, assigned per-shard sequence numbers, replicated across control-plane peers in the HA deployment, exposed through a mutation stream, pulled by the relay/agent path, and applied to the local edge state. Snapshots provide cold-start and repair without relying on JSON polling as the main propagation mechanism.
+The request path evaluates denies locally. Updates enter the stateless control API, are committed by the separate ACL commit service, assigned per-shard sequence numbers, replicated across commit peers in the HA deployment, exposed through a mutation stream, pulled by the relay/agent path, and applied to the local edge state. Snapshots provide cold-start and repair without relying on JSON polling as the main propagation mechanism.
 
 The propagation path also records per-agent acknowledgements, writes per-mutation delta bundles for repair, tags updates as P0/P1/P2 delivery priority, and supports synthetic canaries for measuring propagation.
 
@@ -79,7 +79,8 @@ This workspace intentionally has no third-party crate dependencies yet, so it ca
 | Component | Role | What it owns |
 | --- | --- | --- |
 | `globacl-core` | Shared engine/library | Domain model, per-shard sequencing, binary snapshots, mutation streams, append logs, delta bundles, edge lookup state, compiled IPv4/domain rules, integrity seals, and tests. |
-| `globacl-control` | ACL authoring and source of truth | Accepts deny/rule writes, elects a Raft-style leader, assigns shard sequences, replicates committed mutations through quorum, persists mutation logs, writes snapshot archives, applies blast-radius checks, records audit entries, and performs rollback through forward mutations. |
+| `globacl-control` | ACL authoring/API gateway | Validates public deny/rule requests, rejects broad updates without override, proxies committed-state reads and writes to `globacl-commitd`, and gives clients a stable API endpoint. |
+| `globacl-commitd` | ACL commit service and source of truth | Elects a Raft-style leader, assigns shard sequences, replicates committed mutations through quorum, persists mutation logs, writes snapshot archives, records audit entries, serves snapshots/deltas, and performs rollback through forward mutations. |
 | `globacl-relay` | Distribution fanout layer | Proxies mutations, watermarks, snapshots, and delta bundles from an upstream control/relay; records PoP acknowledgements; can be chained into a relay tree. |
 | `globacl-agent` | PoP edge updater and lookup service | Boots from snapshots, verifies integrity seals, polls/apply deltas, repairs gaps, sends acks, checks canaries, reports stale health, and serves local lookups. |
 | `globacl-demo-app` | Example consumer service | Calls the local agent for request-time ACL decisions and returns `access=allowed` or `access=denied`. |

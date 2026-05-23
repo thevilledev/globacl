@@ -1,19 +1,27 @@
 # Getting Started
 
-Start the control plane:
+Start the ACL commit service:
 
 ```sh
-cargo run -p globacl-control -- data/control 127.0.0.1:7000 4096 0
+cargo run -p globacl-commitd -- data/commitd 127.0.0.1:7003 4096 0
 ```
 
 The final argument is the synthetic canary interval in seconds. Use `0` to disable automatic canaries, or a positive value such as `60` to inject a P0 canary every minute.
 
-Optional snapshot integrity keys can be set on both control and agents:
+Optional snapshot integrity keys can be set on commitd and agents:
 
 ```sh
 export GLOBACL_SIGNATURE_KEY_ID=dev
 export GLOBACL_SIGNATURE_SECRET=globacl-dev-secret
 ```
+
+Start the public control API gateway:
+
+```sh
+cargo run -p globacl-control -- 127.0.0.1:7003 127.0.0.1:7000
+```
+
+The control process is stateless. It validates public authoring requests and proxies committed-state APIs to `globacl-commitd`.
 
 Start one regional relay:
 

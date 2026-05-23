@@ -8,6 +8,7 @@ The manifests are intentionally small and dependency-free:
 Docker image:      globacl:ci
 Namespace:         globacl
 Control port:      7000
+Commitd port:      7003
 Relay port:        7001
 Agent port:        7002
 Demo app port:     8080
@@ -25,6 +26,7 @@ Use this when you want the smallest runnable deployment:
 
 ```text
 one k3s cluster
+  globacl-commitd replicas=1
   globacl-control replicas=1
   globacl-relay   replicas=1
   globacl-agent   replicas=1
@@ -49,7 +51,7 @@ The script:
 1. Builds Docker image globacl:ci.
 2. Creates one k3d-backed k3s cluster.
 3. Imports the image into the cluster.
-4. Deploys control, relay, agent, and demo app.
+4. Deploys commitd, control, relay, agent, and demo app.
 5. Commits a P0 deny to control.
 6. Calls the demo app until it returns access=denied.
 ```
@@ -60,10 +62,11 @@ Use this to demonstrate the intended production shape with one central source of
 
 ```text
 central k3s cluster
-  globacl-control StatefulSet replicas=3
-  one persistent volume per control replica
+  globacl-commitd StatefulSet replicas=3
+  one persistent volume per commitd replica
   automatic Raft-style leader election
   quorum 2 of 3
+  globacl-control Deployment replicas=2
 
 region-a k3s cluster
   globacl-relay replicas=2
@@ -81,7 +84,7 @@ region-c k3s cluster
   globacl-demo  replicas=1
 ```
 
-The central control deployment is HA for storage: each control pod has a stable identity and durable volume, nodes persist term/vote state, elect a leader with majority votes, and forward writes to the current leader. The leader commits only after a quorum of control peers prepares the mutation. Followers persist committed mutations and run a catch-up loop against the leader so a regional relay can read from any healthy control pod behind the central Service.
+The central commit deployment is HA for storage: each `globacl-commitd` pod has a stable identity and durable volume, nodes persist term/vote state, elect a leader with majority votes, and forward writes to the current leader. The leader commits only after a quorum of commit peers prepares the mutation. Followers persist committed mutations and run a catch-up loop against the leader. `globacl-control` is a stateless public API gateway in front of commitd, so regional relays can read through any healthy control pod behind the central Service.
 
 The regional relay deployment is HA inside each region. The relay pods are stateless fanout/cache nodes behind a Kubernetes Service. Agents and demo apps stay regional.
 
@@ -105,7 +108,7 @@ The script:
 2. Creates a shared Docker network for k3d clusters.
 3. Creates one central k3s cluster.
 4. Creates three regional k3s clusters.
-5. Waits for the three-replica central control StatefulSet.
+5. Waits for the three-replica central commitd StatefulSet and control Deployment.
 6. Exposes central control on host port 17000.
 7. Points regional HA relays at the central k3d server node's NodePort address on the shared Docker network.
 8. Commits a P0 deny to central control.
@@ -148,16 +151,16 @@ Use `KEEP_CLUSTER=1` or `KEEP_CLUSTERS=1` when debugging locally so the script d
 
 When `CONTROL_UPSTREAM` is unset, the global smoke script resolves the central k3d server container IP and uses `<central-server-ip>:30080`. Override it only when your environment has a different routable address for central control.
 
-The central control consensus settings are configured in `deploy/k8s/global/central.yaml`:
+The central commitd consensus settings are configured in `deploy/k8s/global/central.yaml`:
 
 ```text
-GLOBACL_CONTROL_NODE_ID       pod name, from metadata.name
-GLOBACL_CONTROL_CLUSTER_ID    logical consensus cluster id
-GLOBACL_CONTROL_PEERS         node_id=host:port peer list
-GLOBACL_CONTROL_QUORUM        majority threshold
-GLOBACL_CONTROL_HEARTBEAT_MS  leader heartbeat interval
-GLOBACL_CONTROL_ELECTION_MS   follower election timeout base
-GLOBACL_CONTROL_SYNC_MS       follower mutation catch-up interval
+GLOBACL_COMMITD_NODE_ID       pod name, from metadata.name
+GLOBACL_COMMITD_CLUSTER_ID    logical consensus cluster id
+GLOBACL_COMMITD_PEERS         node_id=host:port peer list
+GLOBACL_COMMITD_QUORUM        majority threshold
+GLOBACL_COMMITD_HEARTBEAT_MS  leader heartbeat interval
+GLOBACL_COMMITD_ELECTION_MS   follower election timeout base
+GLOBACL_COMMITD_SYNC_MS       follower mutation catch-up interval
 ```
 
 ## Production Notes
@@ -167,8 +170,9 @@ These manifests prove the distribution mechanics, but they are intentionally not
 For production:
 
 ```text
-control: multiple ACL API/commit pods behind a load balancer
-source of truth: built-in ACL-specific Raft commit log
+control: multiple stateless ACL API pods behind a load balancer
+commitd: 3 or 5 ACL commit service pods with persistent volumes
+source of truth: built-in ACL-specific Raft commit log owned by commitd
 logs: Kafka/Pulsar/NATS/Redpanda or cloud Pub/Sub
 snapshots: durable object storage
 relays: regional/PoP relay pools with autoscaling
@@ -176,4 +180,4 @@ agents: one per node or service workload depending latency needs
 signing: replace fnv64-dev seal with Ed25519/HSM-backed signatures
 ```
 
-The included control consensus layer is intentionally ACL-specific rather than a general KV store. It owns term/vote persistence, leader heartbeats, majority election, idempotent mutation application, durable peer replication, and follower catch-up for the committed mutation log.
+The included commitd consensus layer is intentionally ACL-specific rather than a general KV store. It owns term/vote persistence, leader heartbeats, majority election, idempotent mutation application, durable peer replication, and follower catch-up for the committed mutation log.

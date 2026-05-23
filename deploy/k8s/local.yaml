@@ -16,6 +16,69 @@ stringData:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: globacl-commitd
+  namespace: globacl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: globacl-commitd
+  template:
+    metadata:
+      labels:
+        app: globacl-commitd
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: commitd
+          image: globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-commitd"]
+          args: ["/data/commitd", "0.0.0.0:7003", "64", "0"]
+          env:
+            - name: GLOBACL_SIGNATURE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: key_id
+            - name: GLOBACL_SIGNATURE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: secret
+          ports:
+            - containerPort: 7003
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-commitd
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-commitd
+  ports:
+    - name: http
+      port: 7003
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: globacl-control
   namespace: globacl
 spec:
@@ -31,24 +94,14 @@ spec:
       securityContext:
         runAsUser: 65532
         runAsGroup: 65532
-        fsGroup: 65532
       containers:
         - name: control
           image: globacl:ci
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-control"]
-          args: ["/data/control", "0.0.0.0:7000", "64", "0"]
-          env:
-            - name: GLOBACL_SIGNATURE_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: globacl-signature
-                  key: key_id
-            - name: GLOBACL_SIGNATURE_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: globacl-signature
-                  key: secret
+          args:
+            - "globacl-commitd.globacl.svc.cluster.local:7003"
+            - "0.0.0.0:7000"
           ports:
             - containerPort: 7000
               name: http
@@ -56,12 +109,6 @@ spec:
             httpGet:
               path: /health
               port: http
-          volumeMounts:
-            - name: data
-              mountPath: /data
-      volumes:
-        - name: data
-          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

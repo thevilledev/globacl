@@ -16,62 +16,62 @@ stringData:
 apiVersion: v1
 kind: Service
 metadata:
-  name: globacl-control-peer
+  name: globacl-commitd-peer
   namespace: globacl
 spec:
   clusterIP: None
   selector:
-    app: globacl-control
+    app: globacl-commitd
   ports:
     - name: http
-      port: 7000
+      port: 7003
       targetPort: http
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: globacl-control
+  name: globacl-commitd
   namespace: globacl
 spec:
-  serviceName: globacl-control-peer
+  serviceName: globacl-commitd-peer
   replicas: 3
   selector:
     matchLabels:
-      app: globacl-control
+      app: globacl-commitd
   podManagementPolicy: Parallel
   template:
     metadata:
       labels:
-        app: globacl-control
+        app: globacl-commitd
     spec:
       securityContext:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
       containers:
-        - name: control
+        - name: commitd
           image: globacl:ci
           imagePullPolicy: IfNotPresent
-          command: ["/usr/local/bin/globacl-control"]
-          args: ["/data/control", "0.0.0.0:7000", "64", "0"]
+          command: ["/usr/local/bin/globacl-commitd"]
+          args: ["/data/commitd", "0.0.0.0:7003", "64", "0"]
           env:
-            - name: GLOBACL_CONTROL_NODE_ID
+            - name: GLOBACL_COMMITD_NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: GLOBACL_CONTROL_CLUSTER_ID
+            - name: GLOBACL_COMMITD_CLUSTER_ID
               value: globacl-global
-            - name: GLOBACL_CONTROL_QUORUM
+            - name: GLOBACL_COMMITD_QUORUM
               value: "2"
-            - name: GLOBACL_CONTROL_HEARTBEAT_MS
+            - name: GLOBACL_COMMITD_HEARTBEAT_MS
               value: "250"
-            - name: GLOBACL_CONTROL_ELECTION_MS
+            - name: GLOBACL_COMMITD_ELECTION_MS
               value: "1200"
-            - name: GLOBACL_CONTROL_PEERS
+            - name: GLOBACL_COMMITD_PEERS
               value: >-
-                globacl-control-0=globacl-control-0.globacl-control-peer.globacl.svc.cluster.local:7000,
-                globacl-control-1=globacl-control-1.globacl-control-peer.globacl.svc.cluster.local:7000,
-                globacl-control-2=globacl-control-2.globacl-control-peer.globacl.svc.cluster.local:7000
+                globacl-commitd-0=globacl-commitd-0.globacl-commitd-peer.globacl.svc.cluster.local:7003,
+                globacl-commitd-1=globacl-commitd-1.globacl-commitd-peer.globacl.svc.cluster.local:7003,
+                globacl-commitd-2=globacl-commitd-2.globacl-commitd-peer.globacl.svc.cluster.local:7003
             - name: GLOBACL_SIGNATURE_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -83,7 +83,7 @@ spec:
                   name: globacl-signature
                   key: secret
           ports:
-            - containerPort: 7000
+            - containerPort: 7003
               name: http
           readinessProbe:
             httpGet:
@@ -101,6 +101,53 @@ spec:
         resources:
           requests:
             storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-commitd
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-commitd
+  ports:
+    - name: http
+      port: 7003
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-control
+  namespace: globacl
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: globacl-control
+  template:
+    metadata:
+      labels:
+        app: globacl-control
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: control
+          image: globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-control"]
+          args:
+            - "globacl-commitd.globacl.svc.cluster.local:7003"
+            - "0.0.0.0:7000"
+          ports:
+            - containerPort: 7000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
 ---
 apiVersion: v1
 kind: Service

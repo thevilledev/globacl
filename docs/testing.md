@@ -48,9 +48,9 @@ Run k3d-backed k3s smoke tests:
 ./deploy/k3s/global-smoke.sh
 ```
 
-The local smoke deploys one control, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys a three-replica central control StatefulSet with persistent volumes, plus three regional k3s clusters with HA relays and demo apps.
+The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
 
-The global smoke also exercises the custom control-plane consensus path: the three central control pods elect a leader, writes can arrive at any control pod through the Service, and committed mutations are replicated to the control quorum before regional relays and agents observe them.
+The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
 
 Rollback smoke test:
 

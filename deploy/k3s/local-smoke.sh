@@ -63,6 +63,7 @@ k3d cluster create "${CLUSTER}" --agents 1 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
 k apply -f "${ROOT_DIR}/deploy/k8s/local.yaml"
+k -n "${NAMESPACE}" rollout status deploy/globacl-commitd --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-relay --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-agent --timeout=180s

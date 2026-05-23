@@ -49,7 +49,16 @@ GET  /v1/acks
 
 Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
-Control `/health` includes quorum state in HA deployments:
+Control `/health` reports gateway health and whether commitd is reachable:
+
+```text
+status=ok|degraded
+role=control
+commitd=ok|bad|unreachable
+commit_addr=...
+```
+
+Commitd `/health` includes quorum state in HA deployments:
 
 ```text
 role=leader|candidate|follower
@@ -65,7 +74,7 @@ last_peer_sync_unix=...
 sync_errors=...
 ```
 
-Followers proxy write requests to the elected leader. The leader assigns the per-shard sequence and only makes the mutation locally visible after a quorum of control peers prepares it.
+Commitd followers proxy write requests to the elected leader. The leader assigns the per-shard sequence and only makes the mutation locally visible after a quorum of commit peers prepares it.
 
 The demo consumer app exposes:
 
@@ -169,7 +178,7 @@ Relays expose the current in-memory ack table at `GET /v1/acks`.
 
 ## Delta Bundles
 
-Control writes per-mutation delta bundle files under its data directory and also serves bundle ranges:
+Commitd writes per-mutation delta bundle files under its data directory and also serves bundle ranges through the control gateway:
 
 ```text
 GET /v1/delta_bundle?shard=7&from_seq=41&to_seq=42
@@ -179,13 +188,13 @@ Agents try this repair path when they detect a sequence gap, then fall back to t
 
 ## Snapshots And Rollback
 
-Control writes:
+Commitd writes:
 
 ```text
-data/control/snapshots/latest.gacl
-data/control/snapshots/latest.gacl.sig
-data/control/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl
-data/control/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl.sig
+data/commitd/snapshots/latest.gacl
+data/commitd/snapshots/latest.gacl.sig
+data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl
+data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl.sig
 ```
 
 `GET /v1/snapshot.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return dependency-free keyed integrity seals:
@@ -215,7 +224,7 @@ Agents receive rollback as ordinary forward mutation stream entries.
 
 ## Audit Log
 
-Control appends audit lines to `data/control/audit.log` for committed denies, committed rules, rejected broad updates, canaries, snapshot uploads, and rollbacks.
+Commitd appends audit lines to `data/commitd/audit.log` for committed denies, committed rules, canaries, snapshot uploads, and rollbacks. The public control gateway rejects broad requests before proxying them to commitd.
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/audit
