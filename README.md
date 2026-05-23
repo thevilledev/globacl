@@ -30,11 +30,13 @@ The control plane now includes production-hardening hooks around that path: broa
 
 This workspace intentionally has no third-party crate dependencies yet, so it can build in restricted environments.
 
-- `globacl-core`: domain model, idempotent source-of-truth state, immutable sorted edge index, negative filter, exact delta overlay, compiled IPv4/domain rule indices, binary mutation stream, binary snapshot format, per-shard append log, delta bundle, and ack helpers.
-- `globacl-control`: ACL authoring/API service with point-deny and compiled-rule authoring, blast-radius checks, audit logging, signed snapshot archives, rollback by compensating mutations, a linearized in-process source of truth, and durable per-shard append logs.
-- `globacl-relay`: regional relay that proxies mutation/snapshot fetches, records PoP acknowledgements, and can be chained as a location-aware relay tree.
-- `globacl-agent`: PoP agent that cold-starts from a snapshot, verifies snapshot/mutation integrity seals when present, polls deltas through the relay, repairs gaps, acknowledges watermarks, checks canaries, reports stale health, applies exact local state, and exposes local lookup.
-- `globacl-bench`: dependency-free benchmark runner for edge state build time, positive lookups, negative lookups, and memory estimates.
+| Component | Role | What it owns |
+| --- | --- | --- |
+| `globacl-core` | Shared engine/library | Domain model, per-shard sequencing, binary snapshots, mutation streams, append logs, delta bundles, edge lookup state, compiled IPv4/domain rules, integrity seals, and tests. |
+| `globacl-control` | ACL authoring and source of truth | Accepts deny/rule writes, assigns shard sequences, persists mutation logs, writes snapshot archives, applies blast-radius checks, records audit entries, and performs rollback through forward mutations. |
+| `globacl-relay` | Distribution fanout layer | Proxies mutations, watermarks, snapshots, and delta bundles from an upstream control/relay; records PoP acknowledgements; can be chained into a relay tree. |
+| `globacl-agent` | PoP edge updater and lookup service | Boots from snapshots, verifies integrity seals, polls/apply deltas, repairs gaps, sends acks, checks canaries, reports stale health, and serves local lookups. |
+| `globacl-bench` | Local benchmark tool | Measures edge-state build time, positive lookups, negative lookups, and memory estimates without external dependencies. |
 
 ## Docs
 
