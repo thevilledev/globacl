@@ -1,0 +1,44 @@
+name: yamllint
+description: Run a pinned yamllint version through uv.
+
+inputs:
+  version:
+    description: yamllint version to run from PyPI through uv.
+    required: false
+    default: "1.38.0"
+  config:
+    description: yamllint config file.
+    required: false
+    default: ".yamllint"
+  paths:
+    description: Newline-delimited files or directories to lint.
+    required: false
+    default: |
+      .github/actions
+      .github/workflows
+      deploy/k8s/local.yaml
+      deploy/k8s/global/central.yaml
+      deploy/k8s/global/region.yaml.tpl
+
+runs:
+  using: composite
+  steps:
+    - name: Check uv
+      shell: bash
+      run: |
+        set -euo pipefail
+        uv --version
+
+    - name: Run yamllint
+      shell: bash
+      run: |
+        set -euo pipefail
+        mapfile -t paths <<'EOF'
+        ${{ inputs.paths }}
+        EOF
+        filtered=()
+        for path in "${paths[@]}"; do
+          [[ -n "${path}" ]] && filtered+=("${path}")
+        done
+        uvx --from "yamllint==${{ inputs.version }}" yamllint --version
+        uvx --from "yamllint==${{ inputs.version }}" yamllint -c "${{ inputs.config }}" "${filtered[@]}"

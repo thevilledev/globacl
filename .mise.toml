@@ -1,0 +1,9 @@
+[tools]
+uv = "0.11.7"
+
+[env]
+YAMLLINT_VERSION = "1.38.0"
+
+[tasks.yamllint]
+description = "Lint GitHub workflow and Kubernetes YAML"
+run = "uvx --from yamllint==$YAMLLINT_VERSION yamllint -c .yamllint .github/actions .github/workflows deploy/k8s/local.yaml deploy/k8s/global/central.yaml deploy/k8s/global/region.yaml.tpl"

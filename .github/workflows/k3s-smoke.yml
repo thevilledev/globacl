@@ -1,4 +1,4 @@
-name: k3s smoke
+name: k3s smoke manual
 
 on:
   workflow_dispatch:
@@ -16,37 +16,43 @@ on:
 permissions:
   contents: read
 
+env:
+  K3D_VERSION: v5.8.3
+  KUBECTL_VERSION: v1.31.5
+
 jobs:
   local:
     if: ${{ inputs.suite == 'local' || inputs.suite == 'all' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Install kubectl
         run: |
           set -euo pipefail
-          version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-          curl -fsSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
-        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
       - name: Run local k3s smoke
         run: ./deploy/k3s/local-smoke.sh
 
   global:
     if: ${{ inputs.suite == 'global' || inputs.suite == 'all' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Install kubectl
         run: |
           set -euo pipefail
-          version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-          curl -fsSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
-        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
       - name: Run global k3s smoke
         run: ./deploy/k3s/global-smoke.sh
