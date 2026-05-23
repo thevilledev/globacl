@@ -31,5 +31,8 @@ The core tests cover:
 - PoP acknowledgement parsing/formatting
 - source watermark formatting/parsing
 - immutable base plus exact delta overlay behavior
+- IPv4 CIDR rule compilation and matching
+- domain suffix rule compilation and matching
+- rule delete overlays
 
-For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, inspect relay acknowledgements, then commit a delete and confirm the agent returns `decision=allow`.
+For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, then commit a delete and confirm the agent returns `decision=allow`.

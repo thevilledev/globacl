@@ -163,6 +163,53 @@ impl AclKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RuleKind {
+    Ipv4Cidr,
+    DomainSuffix,
+}
+
+impl RuleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleKind::Ipv4Cidr => "ipv4_cidr",
+            RuleKind::DomainSuffix => "domain_suffix",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ip" | "ipv4" | "cidr" | "ipv4_cidr" => Ok(RuleKind::Ipv4Cidr),
+            "domain" | "domain_suffix" | "suffix" => Ok(RuleKind::DomainSuffix),
+            other => Err(GlobAclError::Parse(format!("unknown rule kind {other:?}"))),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            RuleKind::Ipv4Cidr => 1,
+            RuleKind::DomainSuffix => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(RuleKind::Ipv4Cidr),
+            2 => Ok(RuleKind::DomainSuffix),
+            _ => Err(GlobAclError::InvalidData(format!(
+                "unknown rule kind tag {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct RuleKey {
+    tenant_id: String,
+    kind: RuleKind,
+    rule_hash: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenyRequest {
     pub op_id: String,
@@ -218,6 +265,65 @@ impl DenyRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleRequest {
+    pub op_id: String,
+    pub tenant_id: String,
+    pub kind: RuleKind,
+    pub pattern: String,
+    pub action: Action,
+    pub priority: u32,
+    pub reason_code: String,
+    pub expires_at: u64,
+    pub created_by: String,
+    pub delivery_priority: DeliveryPriority,
+}
+
+impl RuleRequest {
+    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+        let op_id = required(form, "op_id")?;
+        let tenant_id = required(form, "tenant_id")?;
+        let kind = RuleKind::from_name(
+            form.get("kind")
+                .or_else(|| form.get("rule_kind"))
+                .map(String::as_str)
+                .unwrap_or("ipv4_cidr"),
+        )?;
+        let pattern = required(form, "pattern")?;
+        let action = Action::from_name(form.get("action").map(String::as_str).unwrap_or("deny"))?;
+        let priority = parse_u32(form.get("priority").map(String::as_str), 0, "priority")?;
+        let reason_code = form
+            .get("reason_code")
+            .cloned()
+            .unwrap_or_else(|| "unspecified".to_owned());
+        let expires_at = parse_u64(form.get("expires_at").map(String::as_str), 0, "expires_at")?;
+        let created_by = form
+            .get("created_by")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let delivery_priority = form
+            .get("delivery_priority")
+            .or_else(|| form.get("channel"))
+            .or_else(|| form.get("stream"))
+            .map(|value| DeliveryPriority::from_name(value))
+            .transpose()?
+            .unwrap_or(DeliveryPriority::P1);
+
+        Ok(Self {
+            op_id,
+            tenant_id,
+            kind,
+            pattern,
+            action,
+            priority,
+            reason_code,
+            expires_at,
+            created_by,
+            delivery_priority,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenyEntry {
     pub tenant_id: String,
     pub namespace: String,
@@ -246,6 +352,38 @@ impl DenyEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleEntry {
+    pub tenant_id: String,
+    pub kind: RuleKind,
+    pub pattern: String,
+    pub rule_hash: u64,
+    pub action: Action,
+    pub priority: u32,
+    pub reason_code: String,
+    pub expires_at: u64,
+    pub created_by: String,
+    pub commit_seq: u64,
+    pub shard_id: u16,
+    pub ipv4_network: u32,
+    pub ipv4_prefix_len: u8,
+    pub domain_suffix: String,
+}
+
+impl RuleEntry {
+    fn rule_key(&self) -> RuleKey {
+        RuleKey {
+            tenant_id: self.tenant_id.clone(),
+            kind: self.kind,
+            rule_hash: self.rule_hash,
+        }
+    }
+
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        self.expires_at != 0 && self.expires_at <= now_unix
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitId {
     pub shard_id: u16,
     pub seq: u64,
@@ -258,6 +396,7 @@ pub struct Mutation {
     pub op_id: String,
     pub commit_id: CommitId,
     pub entry: DenyEntry,
+    pub rule: Option<RuleEntry>,
     pub delivery_priority: DeliveryPriority,
     pub committed_at_unix: u64,
 }
@@ -294,6 +433,7 @@ pub enum ApplyStatus {
 pub struct SourceOfTruth {
     shard_count: u16,
     entries: HashMap<AclKey, DenyEntry>,
+    rules: HashMap<RuleKey, RuleEntry>,
     watermarks: Vec<u64>,
     mutations: Vec<Mutation>,
     op_index: HashMap<String, Mutation>,
@@ -307,6 +447,7 @@ impl SourceOfTruth {
         Self {
             shard_count,
             entries: HashMap::new(),
+            rules: HashMap::new(),
             watermarks: vec![0; shard_count as usize],
             mutations: Vec::new(),
             op_index: HashMap::new(),
@@ -372,6 +513,81 @@ impl SourceOfTruth {
             op_id: request.op_id,
             commit_id,
             entry,
+            rule: None,
+            delivery_priority: request.delivery_priority,
+            committed_at_unix: now_unix(),
+        };
+
+        self.apply_committed_mutation(&mutation)?;
+        self.op_index
+            .insert(mutation.op_id.clone(), mutation.clone());
+        self.mutations.push(mutation.clone());
+
+        Ok(CommitOutcome {
+            mutation,
+            duplicate: false,
+        })
+    }
+
+    pub fn commit_rule(&mut self, request: RuleRequest) -> Result<CommitOutcome> {
+        if request.op_id.trim().is_empty() {
+            return Err(GlobAclError::Parse("op_id must not be empty".to_owned()));
+        }
+
+        if let Some(existing) = self.op_index.get(&request.op_id) {
+            return Ok(CommitOutcome {
+                mutation: existing.clone(),
+                duplicate: true,
+            });
+        }
+
+        let compiled = compile_rule_pattern(request.kind, &request.pattern)?;
+        let rule_hash = stable_key_hash(
+            &request.tenant_id,
+            request.kind.as_str(),
+            &compiled.canonical_pattern,
+        );
+        let shard_id = shard_for_hash(rule_hash, self.shard_count);
+        let seq = self.watermarks[shard_id as usize] + 1;
+        let commit_id = CommitId {
+            shard_id,
+            seq,
+            epoch: self.epoch,
+            source_region: self.source_region.clone(),
+        };
+        let entry = DenyEntry {
+            tenant_id: request.tenant_id.clone(),
+            namespace: format!("__rule:{}", request.kind.as_str()),
+            key_hash: rule_hash,
+            action: request.action,
+            priority: request.priority,
+            reason_code: request.reason_code.clone(),
+            expires_at: request.expires_at,
+            created_by: request.created_by.clone(),
+            commit_seq: seq,
+            shard_id,
+        };
+        let rule = RuleEntry {
+            tenant_id: request.tenant_id,
+            kind: request.kind,
+            pattern: compiled.canonical_pattern,
+            rule_hash,
+            action: request.action,
+            priority: request.priority,
+            reason_code: request.reason_code,
+            expires_at: request.expires_at,
+            created_by: request.created_by,
+            commit_seq: seq,
+            shard_id,
+            ipv4_network: compiled.ipv4_network,
+            ipv4_prefix_len: compiled.ipv4_prefix_len,
+            domain_suffix: compiled.domain_suffix,
+        };
+        let mutation = Mutation {
+            op_id: request.op_id,
+            commit_id,
+            entry,
+            rule: Some(rule),
             delivery_priority: request.delivery_priority,
             committed_at_unix: now_unix(),
         };
@@ -398,6 +614,27 @@ impl SourceOfTruth {
         decision_for_entry(self.entries.get(&key), now_unix)
     }
 
+    pub fn check(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        raw_value: &str,
+        now_unix: u64,
+    ) -> Decision {
+        let point = self.lookup(tenant_id, namespace, raw_value, now_unix);
+        if point.is_denied() {
+            return point;
+        }
+
+        let mut best = RuleMatch::default();
+        for rule in self.rules.values() {
+            if rule.tenant_id == tenant_id && rule_matches_namespace(rule, namespace, raw_value) {
+                best.consider(rule, now_unix);
+            }
+        }
+        best.into_decision()
+    }
+
     pub fn mutations_for_shard(&self, shard_id: u16, from_seq: u64) -> Vec<Mutation> {
         self.mutations
             .iter()
@@ -413,6 +650,7 @@ impl SourceOfTruth {
             shard_count: self.shard_count,
             watermarks: self.watermarks.clone(),
             entries: self.entries.values().cloned().collect(),
+            rules: self.rules.values().cloned().collect(),
         }
     }
 
@@ -458,13 +696,25 @@ impl SourceOfTruth {
             });
         }
 
-        let key = mutation.entry.acl_key();
-        match mutation.entry.action {
-            Action::Delete => {
-                self.entries.remove(&key);
+        if let Some(rule) = &mutation.rule {
+            let key = rule.rule_key();
+            match rule.action {
+                Action::Delete => {
+                    self.rules.remove(&key);
+                }
+                Action::Deny | Action::AllowOverride => {
+                    self.rules.insert(key, rule.clone());
+                }
             }
-            Action::Deny | Action::AllowOverride => {
-                self.entries.insert(key, mutation.entry.clone());
+        } else {
+            let key = mutation.entry.acl_key();
+            match mutation.entry.action {
+                Action::Delete => {
+                    self.entries.remove(&key);
+                }
+                Action::Deny | Action::AllowOverride => {
+                    self.entries.insert(key, mutation.entry.clone());
+                }
             }
         }
         self.watermarks[shard_id as usize] = mutation.commit_id.seq;
@@ -477,6 +727,7 @@ pub struct Snapshot {
     pub shard_count: u16,
     pub watermarks: Vec<u64>,
     pub entries: Vec<DenyEntry>,
+    pub rules: Vec<RuleEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -485,6 +736,9 @@ pub struct ActiveState {
     base: Arc<ImmutableBase>,
     delta_adds: HashMap<AclKey, DenyEntry>,
     delta_removes: HashMap<AclKey, u64>,
+    rule_base: Arc<CompiledRules>,
+    delta_rule_adds: HashMap<RuleKey, RuleEntry>,
+    delta_rule_removes: HashMap<RuleKey, u64>,
     watermarks: Vec<u64>,
 }
 
@@ -500,11 +754,21 @@ struct NegativeFilter {
     bit_len: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CompiledRules {
+    ipv4_by_prefix: Vec<HashMap<(String, u32), Vec<RuleEntry>>>,
+    domain_suffixes: HashMap<(String, String), Vec<RuleEntry>>,
+    rules_len: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveStateStats {
     pub base_entries: usize,
     pub delta_adds: usize,
     pub delta_removes: usize,
+    pub base_rules: usize,
+    pub delta_rule_adds: usize,
+    pub delta_rule_removes: usize,
     pub filter_bits: usize,
     pub estimated_bytes: usize,
 }
@@ -517,6 +781,9 @@ impl ActiveState {
             base: Arc::new(ImmutableBase::from_entries(Vec::new())),
             delta_adds: HashMap::new(),
             delta_removes: HashMap::new(),
+            rule_base: Arc::new(CompiledRules::from_rules(Vec::new())),
+            delta_rule_adds: HashMap::new(),
+            delta_rule_removes: HashMap::new(),
             watermarks: vec![0; shard_count as usize],
         }
     }
@@ -538,12 +805,23 @@ impl ActiveState {
                 )));
             }
         }
+        for rule in &snapshot.rules {
+            if rule.shard_id >= snapshot.shard_count {
+                return Err(GlobAclError::InvalidData(format!(
+                    "rule shard {} is outside shard_count {}",
+                    rule.shard_id, snapshot.shard_count
+                )));
+            }
+        }
 
         Ok(Self {
             shard_count: snapshot.shard_count,
             base: Arc::new(ImmutableBase::from_entries(snapshot.entries)),
             delta_adds: HashMap::new(),
             delta_removes: HashMap::new(),
+            rule_base: Arc::new(CompiledRules::from_rules(snapshot.rules)),
+            delta_rule_adds: HashMap::new(),
+            delta_rule_removes: HashMap::new(),
             watermarks: snapshot.watermarks,
         })
     }
@@ -571,15 +849,29 @@ impl ActiveState {
             });
         }
 
-        let key = mutation.entry.acl_key();
-        match mutation.entry.action {
-            Action::Delete => {
-                self.delta_adds.remove(&key);
-                self.delta_removes.insert(key, mutation.commit_id.seq);
+        if let Some(rule) = &mutation.rule {
+            let key = rule.rule_key();
+            match rule.action {
+                Action::Delete => {
+                    self.delta_rule_adds.remove(&key);
+                    self.delta_rule_removes.insert(key, mutation.commit_id.seq);
+                }
+                Action::Deny | Action::AllowOverride => {
+                    self.delta_rule_removes.remove(&key);
+                    self.delta_rule_adds.insert(key, rule.clone());
+                }
             }
-            Action::Deny | Action::AllowOverride => {
-                self.delta_removes.remove(&key);
-                self.delta_adds.insert(key, mutation.entry.clone());
+        } else {
+            let key = mutation.entry.acl_key();
+            match mutation.entry.action {
+                Action::Delete => {
+                    self.delta_adds.remove(&key);
+                    self.delta_removes.insert(key, mutation.commit_id.seq);
+                }
+                Action::Deny | Action::AllowOverride => {
+                    self.delta_removes.remove(&key);
+                    self.delta_adds.insert(key, mutation.entry.clone());
+                }
             }
         }
         self.watermarks[shard_id as usize] = mutation.commit_id.seq;
@@ -605,12 +897,39 @@ impl ActiveState {
         decision_for_entry(self.base.lookup(&key), now_unix)
     }
 
+    pub fn check(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        raw_value: &str,
+        now_unix: u64,
+    ) -> Decision {
+        let point = self.lookup(tenant_id, namespace, raw_value, now_unix);
+        if point.is_denied() {
+            return point;
+        }
+
+        let mut best = RuleMatch::default();
+        self.consider_delta_rules(tenant_id, namespace, raw_value, now_unix, &mut best);
+        self.rule_base.consider_matches(
+            tenant_id,
+            namespace,
+            raw_value,
+            now_unix,
+            &self.delta_rule_removes,
+            &mut best,
+        );
+        best.into_decision()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let entries = self.materialized_entries();
+        let rules = self.materialized_rules();
         Snapshot {
             shard_count: self.shard_count,
             watermarks: self.watermarks.clone(),
             entries,
+            rules,
         }
     }
 
@@ -642,28 +961,45 @@ impl ActiveState {
         let filter_bytes = self.base.filter.bits.len() * std::mem::size_of::<u64>();
         let overlay_bytes = (self.delta_adds.len() * std::mem::size_of::<(AclKey, DenyEntry)>())
             + (self.delta_removes.len() * std::mem::size_of::<(AclKey, u64)>());
+        let rule_bytes = self.rule_base.rules_len * std::mem::size_of::<RuleEntry>()
+            + (self.delta_rule_adds.len() * std::mem::size_of::<(RuleKey, RuleEntry)>())
+            + (self.delta_rule_removes.len() * std::mem::size_of::<(RuleKey, u64)>());
 
         ActiveStateStats {
             base_entries: self.base.entries.len(),
             delta_adds: self.delta_adds.len(),
             delta_removes: self.delta_removes.len(),
+            base_rules: self.rule_base.rules_len,
+            delta_rule_adds: self.delta_rule_adds.len(),
+            delta_rule_removes: self.delta_rule_removes.len(),
             filter_bits: self.base.filter.bit_len,
-            estimated_bytes: base_bytes + filter_bytes + overlay_bytes,
+            estimated_bytes: base_bytes + filter_bytes + overlay_bytes + rule_bytes,
         }
     }
 
     pub fn delta_entries_len(&self) -> usize {
-        self.delta_adds.len() + self.delta_removes.len()
+        self.delta_adds.len()
+            + self.delta_removes.len()
+            + self.delta_rule_adds.len()
+            + self.delta_rule_removes.len()
     }
 
     pub fn compact_delta_overlay(&mut self) {
-        if self.delta_adds.is_empty() && self.delta_removes.is_empty() {
+        if self.delta_adds.is_empty()
+            && self.delta_removes.is_empty()
+            && self.delta_rule_adds.is_empty()
+            && self.delta_rule_removes.is_empty()
+        {
             return;
         }
         let entries = self.materialized_entries();
         self.base = Arc::new(ImmutableBase::from_entries(entries));
+        let rules = self.materialized_rules();
+        self.rule_base = Arc::new(CompiledRules::from_rules(rules));
         self.delta_adds.clear();
         self.delta_removes.clear();
+        self.delta_rule_adds.clear();
+        self.delta_rule_removes.clear();
     }
 
     fn materialized_entries(&self) -> Vec<DenyEntry> {
@@ -680,6 +1016,31 @@ impl ActiveState {
         }
         entries.extend(self.delta_adds.values().cloned());
         entries
+    }
+
+    fn materialized_rules(&self) -> Vec<RuleEntry> {
+        let mut rules = self.rule_base.all_rules();
+        rules.retain(|rule| {
+            let key = rule.rule_key();
+            !self.delta_rule_removes.contains_key(&key) && !self.delta_rule_adds.contains_key(&key)
+        });
+        rules.extend(self.delta_rule_adds.values().cloned());
+        rules
+    }
+
+    fn consider_delta_rules(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        raw_value: &str,
+        now_unix: u64,
+        best: &mut RuleMatch,
+    ) {
+        for rule in self.delta_rule_adds.values() {
+            if rule.tenant_id == tenant_id && rule_matches_namespace(rule, namespace, raw_value) {
+                best.consider(rule, now_unix);
+            }
+        }
     }
 }
 
@@ -777,6 +1138,141 @@ impl NegativeFilter {
     }
 }
 
+impl CompiledRules {
+    fn from_rules(rules: Vec<RuleEntry>) -> Self {
+        let mut compiled = Self {
+            ipv4_by_prefix: vec![HashMap::new(); 33],
+            domain_suffixes: HashMap::new(),
+            rules_len: 0,
+        };
+
+        for rule in rules {
+            if rule.action == Action::Delete {
+                continue;
+            }
+            compiled.rules_len += 1;
+            match rule.kind {
+                RuleKind::Ipv4Cidr => {
+                    let key = (rule.tenant_id.clone(), rule.ipv4_network);
+                    compiled.ipv4_by_prefix[rule.ipv4_prefix_len as usize]
+                        .entry(key)
+                        .or_default()
+                        .push(rule);
+                }
+                RuleKind::DomainSuffix => {
+                    let key = (rule.tenant_id.clone(), rule.domain_suffix.clone());
+                    compiled.domain_suffixes.entry(key).or_default().push(rule);
+                }
+            }
+        }
+
+        for prefix_bucket in &mut compiled.ipv4_by_prefix {
+            for rules in prefix_bucket.values_mut() {
+                rules.sort_by(compare_rules_for_match);
+            }
+        }
+        for rules in compiled.domain_suffixes.values_mut() {
+            rules.sort_by(compare_rules_for_match);
+        }
+
+        compiled
+    }
+
+    fn consider_matches(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        raw_value: &str,
+        now_unix: u64,
+        removed: &HashMap<RuleKey, u64>,
+        best: &mut RuleMatch,
+    ) {
+        match rule_kind_for_namespace(namespace) {
+            Some(RuleKind::Ipv4Cidr) => {
+                if let Ok(ip) = parse_ipv4_addr(raw_value) {
+                    for prefix_len in (0..=32u8).rev() {
+                        let network = mask_ipv4(ip, prefix_len);
+                        let key = (tenant_id.to_owned(), network);
+                        if let Some(rules) = self.ipv4_by_prefix[prefix_len as usize].get(&key) {
+                            for rule in rules {
+                                if !removed.contains_key(&rule.rule_key()) {
+                                    best.consider(rule, now_unix);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(RuleKind::DomainSuffix) => {
+                let Ok(domain) = canonicalize_domain(raw_value) else {
+                    return;
+                };
+                for suffix in domain_suffix_candidates(&domain) {
+                    let key = (tenant_id.to_owned(), suffix);
+                    if let Some(rules) = self.domain_suffixes.get(&key) {
+                        for rule in rules {
+                            if !removed.contains_key(&rule.rule_key()) {
+                                best.consider(rule, now_unix);
+                            }
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn all_rules(&self) -> Vec<RuleEntry> {
+        let mut rules = Vec::with_capacity(self.rules_len);
+        for prefix_bucket in &self.ipv4_by_prefix {
+            for bucket in prefix_bucket.values() {
+                rules.extend(bucket.iter().cloned());
+            }
+        }
+        for bucket in self.domain_suffixes.values() {
+            rules.extend(bucket.iter().cloned());
+        }
+        rules
+    }
+}
+
+#[derive(Default)]
+struct RuleMatch {
+    rule: Option<RuleEntry>,
+}
+
+impl RuleMatch {
+    fn consider(&mut self, rule: &RuleEntry, now_unix: u64) {
+        if rule.is_expired(now_unix) {
+            return;
+        }
+        match &self.rule {
+            Some(current) if compare_rules_for_match(rule, current) != Ordering::Less => {}
+            _ => self.rule = Some(rule.clone()),
+        }
+    }
+
+    fn into_decision(self) -> Decision {
+        let Some(rule) = self.rule else {
+            return Decision::Allow;
+        };
+
+        match rule.action {
+            Action::Deny => Decision::Deny {
+                reason_code: rule.reason_code,
+                priority: rule.priority,
+                commit_id: CommitId {
+                    shard_id: rule.shard_id,
+                    seq: rule.commit_seq,
+                    epoch: 1,
+                    source_region: String::new(),
+                },
+            },
+            Action::AllowOverride | Action::Delete => Decision::Allow,
+        }
+    }
+}
+
 pub fn stable_key_hash(tenant_id: &str, namespace: &str, raw_key: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for chunk in [
@@ -839,6 +1335,152 @@ fn same_entry_key(left: &DenyEntry, right: &DenyEntry) -> bool {
         && left.key_hash == right.key_hash
 }
 
+struct CompiledRulePattern {
+    canonical_pattern: String,
+    ipv4_network: u32,
+    ipv4_prefix_len: u8,
+    domain_suffix: String,
+}
+
+fn compile_rule_pattern(kind: RuleKind, pattern: &str) -> Result<CompiledRulePattern> {
+    match kind {
+        RuleKind::Ipv4Cidr => {
+            let (network, prefix_len, canonical) = parse_ipv4_cidr(pattern)?;
+            Ok(CompiledRulePattern {
+                canonical_pattern: canonical,
+                ipv4_network: network,
+                ipv4_prefix_len: prefix_len,
+                domain_suffix: String::new(),
+            })
+        }
+        RuleKind::DomainSuffix => {
+            let suffix = canonicalize_domain(pattern)?;
+            Ok(CompiledRulePattern {
+                canonical_pattern: suffix.clone(),
+                ipv4_network: 0,
+                ipv4_prefix_len: 0,
+                domain_suffix: suffix,
+            })
+        }
+    }
+}
+
+fn parse_ipv4_cidr(pattern: &str) -> Result<(u32, u8, String)> {
+    let trimmed = pattern.trim();
+    let (addr, prefix) = trimmed.split_once('/').unwrap_or((trimmed, "32"));
+    let prefix_len = prefix
+        .parse::<u8>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid IPv4 CIDR prefix: {err}")))?;
+    if prefix_len > 32 {
+        return Err(GlobAclError::Parse(format!(
+            "IPv4 CIDR prefix {prefix_len} is greater than 32"
+        )));
+    }
+    let ip = parse_ipv4_addr(addr)?;
+    let network = mask_ipv4(ip, prefix_len);
+    Ok((
+        network,
+        prefix_len,
+        format!("{}/{}", format_ipv4(network), prefix_len),
+    ))
+}
+
+fn parse_ipv4_addr(value: &str) -> Result<u32> {
+    let mut octets = [0u8; 4];
+    let mut count = 0usize;
+    for part in value.trim().split('.') {
+        if count >= 4 {
+            return Err(GlobAclError::Parse(format!(
+                "invalid IPv4 address {value:?}"
+            )));
+        }
+        octets[count] = part
+            .parse::<u8>()
+            .map_err(|err| GlobAclError::Parse(format!("invalid IPv4 address {value:?}: {err}")))?;
+        count += 1;
+    }
+    if count != 4 {
+        return Err(GlobAclError::Parse(format!(
+            "invalid IPv4 address {value:?}"
+        )));
+    }
+    Ok(u32::from_be_bytes(octets))
+}
+
+fn format_ipv4(value: u32) -> String {
+    let octets = value.to_be_bytes();
+    format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+}
+
+fn mask_ipv4(value: u32, prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else {
+        value & (!0u32 << (32 - prefix_len))
+    }
+}
+
+fn canonicalize_domain(value: &str) -> Result<String> {
+    let mut domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(stripped) = domain.strip_prefix("*.") {
+        domain = stripped.to_owned();
+    }
+    if domain.is_empty() || domain.split('.').any(|label| label.is_empty()) {
+        return Err(GlobAclError::Parse(format!(
+            "invalid domain suffix {value:?}"
+        )));
+    }
+    Ok(domain)
+}
+
+fn domain_suffix_candidates(domain: &str) -> Vec<String> {
+    let labels = domain.split('.').collect::<Vec<_>>();
+    let mut suffixes = Vec::with_capacity(labels.len());
+    for index in 0..labels.len() {
+        suffixes.push(labels[index..].join("."));
+    }
+    suffixes
+}
+
+fn rule_kind_for_namespace(namespace: &str) -> Option<RuleKind> {
+    match namespace.trim().to_ascii_lowercase().as_str() {
+        "ip" | "ipv4" | "ipv4_cidr" => Some(RuleKind::Ipv4Cidr),
+        "domain" | "host" | "hostname" | "dns" => Some(RuleKind::DomainSuffix),
+        _ => None,
+    }
+}
+
+fn rule_matches_namespace(rule: &RuleEntry, namespace: &str, raw_value: &str) -> bool {
+    if rule_kind_for_namespace(namespace) != Some(rule.kind) {
+        return false;
+    }
+
+    match rule.kind {
+        RuleKind::Ipv4Cidr => parse_ipv4_addr(raw_value)
+            .map(|ip| mask_ipv4(ip, rule.ipv4_prefix_len) == rule.ipv4_network)
+            .unwrap_or(false),
+        RuleKind::DomainSuffix => canonicalize_domain(raw_value)
+            .map(|domain| domain_suffix_candidates(&domain).contains(&rule.domain_suffix))
+            .unwrap_or(false),
+    }
+}
+
+fn compare_rules_for_match(left: &RuleEntry, right: &RuleEntry) -> Ordering {
+    right
+        .priority
+        .cmp(&left.priority)
+        .then_with(|| action_rank(right.action).cmp(&action_rank(left.action)))
+        .then_with(|| right.commit_seq.cmp(&left.commit_seq))
+}
+
+fn action_rank(action: Action) -> u8 {
+    match action {
+        Action::Deny => 2,
+        Action::AllowOverride => 1,
+        Action::Delete => 0,
+    }
+}
+
 pub fn shard_for_hash(key_hash: u64, shard_count: u16) -> u16 {
     (key_hash % u64::from(shard_count.max(1))) as u16
 }
@@ -862,6 +1504,10 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     }
     for entry in &snapshot.entries {
         encode_entry(&mut out, entry);
+    }
+    write_u64(&mut out, snapshot.rules.len() as u64);
+    for rule in &snapshot.rules {
+        encode_rule_entry(&mut out, rule);
     }
     out
 }
@@ -895,11 +1541,20 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     for _ in 0..entry_count {
         entries.push(decode_entry(&mut cursor)?);
     }
+    let mut rules = Vec::new();
+    if cursor_remaining(&cursor) >= 8 {
+        let rule_count = read_u64(&mut cursor)? as usize;
+        rules = Vec::with_capacity(rule_count);
+        for _ in 0..rule_count {
+            rules.push(decode_rule_entry(&mut cursor)?);
+        }
+    }
 
     Ok(Snapshot {
         shard_count,
         watermarks,
         entries,
+        rules,
     })
 }
 
@@ -934,6 +1589,13 @@ pub fn encode_mutation(mutation: &Mutation) -> Vec<u8> {
     encode_entry(&mut out, &mutation.entry);
     out.push(mutation.delivery_priority.to_u8());
     write_u64(&mut out, mutation.committed_at_unix);
+    match &mutation.rule {
+        Some(rule) => {
+            out.push(1);
+            encode_rule_entry(&mut out, rule);
+        }
+        None => out.push(0),
+    }
     out
 }
 
@@ -1244,7 +1906,7 @@ pub fn write_http_response(
 
 pub fn format_commit_outcome(outcome: &CommitOutcome) -> String {
     let entries_changed = if outcome.duplicate { 0 } else { 1 };
-    format!(
+    let mut body = format!(
         "duplicate={}\nshard_id={}\nseq={}\nepoch={}\naction={}\nkey_hash={}\ndelivery_priority={}\ncommitted_at_unix={}\nentries_changed={entries_changed}\n",
         outcome.duplicate,
         outcome.mutation.commit_id.shard_id,
@@ -1254,7 +1916,16 @@ pub fn format_commit_outcome(outcome: &CommitOutcome) -> String {
         outcome.mutation.entry.key_hash,
         outcome.mutation.delivery_priority.as_str(),
         outcome.mutation.committed_at_unix
-    )
+    );
+    if let Some(rule) = &outcome.mutation.rule {
+        body.push_str(&format!(
+            "rule_kind={}\npattern={}\nrule_hash={}\n",
+            rule.kind.as_str(),
+            rule.pattern,
+            rule.rule_hash
+        ));
+    }
+    body
 }
 
 pub fn format_decision(decision: &Decision) -> String {
@@ -1410,6 +2081,23 @@ fn encode_entry(out: &mut Vec<u8>, entry: &DenyEntry) {
     write_u16(out, entry.shard_id);
 }
 
+fn encode_rule_entry(out: &mut Vec<u8>, rule: &RuleEntry) {
+    write_string(out, &rule.tenant_id);
+    out.push(rule.kind.to_u8());
+    write_string(out, &rule.pattern);
+    write_u64(out, rule.rule_hash);
+    out.push(rule.action.to_u8());
+    write_u32(out, rule.priority);
+    write_string(out, &rule.reason_code);
+    write_u64(out, rule.expires_at);
+    write_string(out, &rule.created_by);
+    write_u64(out, rule.commit_seq);
+    write_u16(out, rule.shard_id);
+    write_u32(out, rule.ipv4_network);
+    out.push(rule.ipv4_prefix_len);
+    write_string(out, &rule.domain_suffix);
+}
+
 fn decode_entry(cursor: &mut Cursor<&[u8]>) -> Result<DenyEntry> {
     Ok(DenyEntry {
         tenant_id: read_string(cursor)?,
@@ -1422,6 +2110,25 @@ fn decode_entry(cursor: &mut Cursor<&[u8]>) -> Result<DenyEntry> {
         created_by: read_string(cursor)?,
         commit_seq: read_u64(cursor)?,
         shard_id: read_u16(cursor)?,
+    })
+}
+
+fn decode_rule_entry(cursor: &mut Cursor<&[u8]>) -> Result<RuleEntry> {
+    Ok(RuleEntry {
+        tenant_id: read_string(cursor)?,
+        kind: RuleKind::from_u8(read_u8(cursor)?)?,
+        pattern: read_string(cursor)?,
+        rule_hash: read_u64(cursor)?,
+        action: Action::from_u8(read_u8(cursor)?)?,
+        priority: read_u32(cursor)?,
+        reason_code: read_string(cursor)?,
+        expires_at: read_u64(cursor)?,
+        created_by: read_string(cursor)?,
+        commit_seq: read_u64(cursor)?,
+        shard_id: read_u16(cursor)?,
+        ipv4_network: read_u32(cursor)?,
+        ipv4_prefix_len: read_u8(cursor)?,
+        domain_suffix: read_string(cursor)?,
     })
 }
 
@@ -1449,6 +2156,19 @@ fn decode_mutation_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Mutation> {
     } else {
         0
     };
+    let rule = if cursor_remaining(cursor) >= 1 {
+        match read_u8(cursor)? {
+            0 => None,
+            1 => Some(decode_rule_entry(cursor)?),
+            value => {
+                return Err(GlobAclError::InvalidData(format!(
+                    "unknown mutation rule tag {value}"
+                )))
+            }
+        }
+    } else {
+        None
+    };
     Ok(Mutation {
         op_id,
         commit_id: CommitId {
@@ -1458,6 +2178,7 @@ fn decode_mutation_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Mutation> {
             source_region,
         },
         entry,
+        rule,
         delivery_priority,
         committed_at_unix,
     })
@@ -1586,6 +2307,21 @@ mod tests {
         }
     }
 
+    fn rule_request(op_id: &str, kind: RuleKind, pattern: &str, action: Action) -> RuleRequest {
+        RuleRequest {
+            op_id: op_id.to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            kind,
+            pattern: pattern.to_owned(),
+            action,
+            priority: 50,
+            reason_code: "rule-test".to_owned(),
+            expires_at: 0,
+            created_by: "unit-test".to_owned(),
+            delivery_priority: DeliveryPriority::P1,
+        }
+    }
+
     #[test]
     fn duplicate_op_id_is_idempotent() {
         let mut source = SourceOfTruth::new(16, "local");
@@ -1653,6 +2389,14 @@ mod tests {
         let mut source = SourceOfTruth::new(16, "local");
         source.commit(request("op-1", "u1", Action::Deny)).unwrap();
         source.commit(request("op-2", "u2", Action::Deny)).unwrap();
+        source
+            .commit_rule(rule_request(
+                "rule-1",
+                RuleKind::Ipv4Cidr,
+                "10.0.0.0/8",
+                Action::Deny,
+            ))
+            .unwrap();
 
         let snapshot = source.snapshot();
         let decoded = decode_snapshot(&encode_snapshot(&snapshot)).unwrap();
@@ -1668,6 +2412,9 @@ mod tests {
             active.lookup("tenant-a", "user", "u3", now_unix()),
             Decision::Allow
         );
+        assert!(active
+            .check("tenant-a", "ip", "10.1.2.3", now_unix())
+            .is_denied());
     }
 
     #[test]
@@ -1692,6 +2439,89 @@ mod tests {
 
         assert_eq!(decoded.delivery_priority, DeliveryPriority::P0);
         assert_ne!(decoded.committed_at_unix, 0);
+    }
+
+    #[test]
+    fn ipv4_rule_matches_source_and_active_state() {
+        let mut source = SourceOfTruth::new(16, "local");
+        let outcome = source
+            .commit_rule(rule_request(
+                "rule-1",
+                RuleKind::Ipv4Cidr,
+                "192.168.0.0/16",
+                Action::Deny,
+            ))
+            .unwrap();
+
+        assert!(source
+            .check("tenant-a", "ip", "192.168.10.20", now_unix())
+            .is_denied());
+        assert_eq!(
+            source.check("tenant-a", "ip", "192.169.10.20", now_unix()),
+            Decision::Allow
+        );
+
+        let decoded = decode_mutation(&encode_mutation(&outcome.mutation)).unwrap();
+        assert!(decoded.rule.is_some());
+
+        let active = ActiveState::from_snapshot(source.snapshot()).unwrap();
+        assert!(active
+            .check("tenant-a", "ipv4", "192.168.1.1", now_unix())
+            .is_denied());
+    }
+
+    #[test]
+    fn domain_suffix_rule_matches_subdomains() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source
+            .commit_rule(rule_request(
+                "rule-1",
+                RuleKind::DomainSuffix,
+                "*.Example.COM.",
+                Action::Deny,
+            ))
+            .unwrap();
+
+        let active = ActiveState::from_snapshot(source.snapshot()).unwrap();
+        assert!(active
+            .check("tenant-a", "domain", "api.example.com", now_unix())
+            .is_denied());
+        assert!(active
+            .check("tenant-a", "domain", "example.com", now_unix())
+            .is_denied());
+        assert_eq!(
+            active.check("tenant-a", "domain", "example.org", now_unix()),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn rule_delete_removes_base_rule_through_overlay() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source
+            .commit_rule(rule_request(
+                "rule-1",
+                RuleKind::Ipv4Cidr,
+                "10.0.0.0/8",
+                Action::Deny,
+            ))
+            .unwrap();
+        let mut active = ActiveState::from_snapshot(source.snapshot()).unwrap();
+        let delete = source
+            .commit_rule(rule_request(
+                "rule-2",
+                RuleKind::Ipv4Cidr,
+                "10.0.0.0/8",
+                Action::Delete,
+            ))
+            .unwrap();
+
+        active.apply_mutation(&delete.mutation).unwrap();
+        assert_eq!(
+            active.check("tenant-a", "ip", "10.1.2.3", now_unix()),
+            Decision::Allow
+        );
+        assert_eq!(active.stats().delta_rule_removes, 1);
     }
 
     #[test]

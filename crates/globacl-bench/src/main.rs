@@ -105,6 +105,7 @@ fn build_snapshot(entries: usize, shard_count: u16) -> (Snapshot, Vec<String>) {
             shard_count,
             watermarks,
             entries: snapshot_entries,
+            rules: Vec::new(),
         },
         raw_keys,
     )

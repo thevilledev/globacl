@@ -35,6 +35,32 @@ Query the agent:
 curl -sS 'http://127.0.0.1:7002/v1/lookup?tenant_id=tenant-a&namespace=user&key=user-123'
 ```
 
+Commit an IPv4 CIDR rule:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rule \
+  --data-binary $'op_id=net-1\ntenant_id=tenant-a\nkind=ipv4_cidr\npattern=10.0.0.0/8\naction=deny\nreason_code=blocked_network\n'
+```
+
+Check the compiled rule at the agent:
+
+```sh
+curl -sS 'http://127.0.0.1:7002/v1/check?tenant_id=tenant-a&namespace=ip&value=10.1.2.3'
+```
+
+Commit a domain suffix rule:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rule \
+  --data-binary $'op_id=domain-1\ntenant_id=tenant-a\nkind=domain_suffix\npattern=*.example.com\naction=deny\nreason_code=blocked_domain\n'
+```
+
+Check the domain rule:
+
+```sh
+curl -sS 'http://127.0.0.1:7002/v1/check?tenant_id=tenant-a&namespace=domain&value=api.example.com'
+```
+
 Delete/unblock with a higher sequence:
 
 ```sh

@@ -3,7 +3,7 @@ use globacl_core::{
     format_commit_outcome, format_decision, format_watermarks, load_all_logs, now_unix,
     parse_form_lines, parse_query_path, read_http_request, write_delta_bundle_file,
     write_http_response, write_snapshot_file, Action, DeliveryPriority, DenyRequest, GlobAclError,
-    Result, SourceOfTruth, DEFAULT_SHARD_COUNT,
+    Result, RuleRequest, SourceOfTruth, DEFAULT_SHARD_COUNT,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -110,6 +110,13 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let body = format_commit_outcome(&outcome);
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
+        ("POST", "/v1/rule") => {
+            let form = parse_form_lines(&request.body)?;
+            let rule_request = RuleRequest::from_form(&form)?;
+            let outcome = commit_rule_request(&app, rule_request)?;
+            let body = format_commit_outcome(&outcome);
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
         ("POST", "/v1/canary") => {
             let canary = commit_canary(&app)?;
             let body = format_canary_status(&canary);
@@ -207,6 +214,22 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let body = format_decision(&decision);
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
+        ("GET", "/v1/check") => {
+            let tenant_id = required_query(&query, "tenant_id")?;
+            let namespace = required_query(&query, "namespace")?;
+            let value = query
+                .get("value")
+                .or_else(|| query.get("key"))
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GlobAclError::Parse("missing query parameter value".to_owned()))?;
+            let decision = {
+                let state = lock_state(&app)?;
+                state.check(tenant_id, namespace, value, now_unix())
+            };
+            let body = format_decision(&decision);
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
         _ => {
             write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
         }
@@ -218,6 +241,26 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 fn commit_request(app: &App, deny_request: DenyRequest) -> Result<globacl_core::CommitOutcome> {
     let mut state = lock_state(app)?;
     let outcome = state.commit(deny_request)?;
+    if !outcome.duplicate {
+        append_mutation_to_log(&app.log_dir, &outcome.mutation)?;
+        write_delta_bundle_file(
+            &app.bundle_dir,
+            outcome.mutation.commit_id.shard_id,
+            outcome.mutation.commit_id.seq,
+            outcome.mutation.commit_id.seq,
+            std::slice::from_ref(&outcome.mutation),
+        )?;
+        write_snapshot_file(&app.snapshot_path, &state.snapshot())?;
+    }
+    Ok(outcome)
+}
+
+fn commit_rule_request(
+    app: &App,
+    rule_request: RuleRequest,
+) -> Result<globacl_core::CommitOutcome> {
+    let mut state = lock_state(app)?;
+    let outcome = state.commit_rule(rule_request)?;
     if !outcome.duplicate {
         append_mutation_to_log(&app.log_dir, &outcome.mutation)?;
         write_delta_bundle_file(

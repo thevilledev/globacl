@@ -111,13 +111,16 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
             let stats = state.stats();
             let body = format!(
-                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nfilter_bits={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
+                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nbase_rules={}\ndelta_rule_adds={}\ndelta_rule_removes={}\nfilter_bits={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
                 app.agent_id,
                 state.shard_count(),
                 state.entries_len(),
                 stats.base_entries,
                 stats.delta_adds,
                 stats.delta_removes,
+                stats.base_rules,
+                stats.delta_rule_adds,
+                stats.delta_rule_removes,
                 stats.filter_bits,
                 stats.estimated_bytes,
                 max_seq,
@@ -139,6 +142,22 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let decision = {
                 let state = current_state(&app)?;
                 state.lookup(tenant_id, namespace, key, now_unix())
+            };
+            let body = format_decision(&decision);
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
+        ("GET", "/v1/check") => {
+            let tenant_id = required_query(&query, "tenant_id")?;
+            let namespace = required_query(&query, "namespace")?;
+            let value = query
+                .get("value")
+                .or_else(|| query.get("key"))
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| GlobAclError::Parse("missing query parameter value".to_owned()))?;
+            let decision = {
+                let state = current_state(&app)?;
+                state.check(tenant_id, namespace, value, now_unix())
             };
             let body = format_decision(&decision);
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
