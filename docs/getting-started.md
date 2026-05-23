@@ -8,6 +8,13 @@ cargo run -p globacl-control -- data/control 127.0.0.1:7000 4096 0
 
 The final argument is the synthetic canary interval in seconds. Use `0` to disable automatic canaries, or a positive value such as `60` to inject a P0 canary every minute.
 
+Optional snapshot integrity keys can be set on both control and agents:
+
+```sh
+export GLOBACL_SIGNATURE_KEY_ID=dev
+export GLOBACL_SIGNATURE_SECRET=globacl-dev-secret
+```
+
 Start one regional relay:
 
 ```sh
@@ -19,8 +26,10 @@ The relay can point at control or at another relay, which lets you chain `global
 Start one PoP agent:
 
 ```sh
-cargo run -p globacl-agent -- 127.0.0.1:7001 127.0.0.1:7002 data/agent/latest.gacl 1000 agent-local
+cargo run -p globacl-agent -- 127.0.0.1:7001 127.0.0.1:7002 data/agent/latest.gacl 1000 agent-local 60
 ```
+
+The final argument is `stale_after_secs`; the agent reports `status=stale` if it cannot successfully poll the relay within that window.
 
 Commit a deny mutation:
 
@@ -61,6 +70,13 @@ Check the domain rule:
 curl -sS 'http://127.0.0.1:7002/v1/check?tenant_id=tenant-a&namespace=domain&value=api.example.com'
 ```
 
+Broad denies require an explicit blast-radius override:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rule \
+  --data-binary $'op_id=net-all\ntenant_id=tenant-a\nkind=ipv4_cidr\npattern=0.0.0.0/0\naction=deny\noverride_blast_radius=true\nreason_code=emergency_all_ipv4\n'
+```
+
 Delete/unblock with a higher sequence:
 
 ```sh
@@ -72,6 +88,20 @@ Inspect relay acknowledgements:
 
 ```sh
 curl -sS http://127.0.0.1:7001/v1/acks
+```
+
+Inspect snapshot archives and audit entries:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/snapshots
+curl -sS http://127.0.0.1:7000/v1/audit
+```
+
+Rollback to a listed snapshot by filename:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rollback \
+  --data-binary $'snapshot=<snapshot-from-v1-snapshots>\n'
 ```
 
 Commit a synthetic P0 canary manually:

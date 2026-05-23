@@ -13,6 +13,9 @@ pub const SNAPSHOT_MAGIC: &[u8; 4] = b"GACL";
 pub const MUTATION_MAGIC: &[u8; 4] = b"GMUT";
 pub const MUTATION_STREAM_MAGIC: &[u8; 4] = b"GLOG";
 pub const FORMAT_VERSION: u16 = 1;
+pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_SIGNATURE_KEY_ID: &str = "dev";
+pub const DEFAULT_SIGNATURE_SECRET: &str = "globacl-dev-secret";
 
 pub type Result<T> = std::result::Result<T, GlobAclError>;
 
@@ -645,6 +648,98 @@ impl SourceOfTruth {
             .collect()
     }
 
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        op_prefix: &str,
+    ) -> Result<Vec<Mutation>> {
+        if snapshot.shard_count != self.shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "rollback snapshot has shard_count {}, expected {}",
+                snapshot.shard_count, self.shard_count
+            )));
+        }
+        snapshot.validate()?;
+
+        let mut target_entries = HashMap::new();
+        for entry in snapshot.entries {
+            target_entries.insert(entry.acl_key(), entry);
+        }
+        let mut target_rules = HashMap::new();
+        for rule in snapshot.rules {
+            target_rules.insert(rule.rule_key(), rule);
+        }
+
+        let mut mutations = Vec::new();
+        let mut current_entries = self.entries.values().cloned().collect::<Vec<_>>();
+        current_entries.sort_by(compare_entries_by_key);
+        for entry in current_entries {
+            if !target_entries.contains_key(&entry.acl_key()) {
+                let mut delete = entry;
+                delete.action = Action::Delete;
+                delete.reason_code = "rollback_delete".to_owned();
+                delete.expires_at = 0;
+                delete.created_by = "globacl-rollback".to_owned();
+                mutations.push(self.commit_entry_direct(
+                    next_restore_op_id(&self.op_index, op_prefix, mutations.len()),
+                    delete,
+                )?);
+            }
+        }
+
+        let mut target_entry_values = target_entries.values().cloned().collect::<Vec<_>>();
+        target_entry_values.sort_by(compare_entries_by_key);
+        for entry in target_entry_values {
+            let key = entry.acl_key();
+            if self
+                .entries
+                .get(&key)
+                .map(|current| !entry_semantically_equal(current, &entry))
+                .unwrap_or(true)
+            {
+                mutations.push(self.commit_entry_direct(
+                    next_restore_op_id(&self.op_index, op_prefix, mutations.len()),
+                    entry,
+                )?);
+            }
+        }
+
+        let mut current_rules = self.rules.values().cloned().collect::<Vec<_>>();
+        current_rules.sort_by(compare_rules_by_key);
+        for rule in current_rules {
+            if !target_rules.contains_key(&rule.rule_key()) {
+                let mut delete = rule;
+                delete.action = Action::Delete;
+                delete.reason_code = "rollback_delete".to_owned();
+                delete.expires_at = 0;
+                delete.created_by = "globacl-rollback".to_owned();
+                mutations.push(self.commit_rule_direct(
+                    next_restore_op_id(&self.op_index, op_prefix, mutations.len()),
+                    delete,
+                )?);
+            }
+        }
+
+        let mut target_rule_values = target_rules.values().cloned().collect::<Vec<_>>();
+        target_rule_values.sort_by(compare_rules_by_key);
+        for rule in target_rule_values {
+            let key = rule.rule_key();
+            if self
+                .rules
+                .get(&key)
+                .map(|current| !rule_semantically_equal(current, &rule))
+                .unwrap_or(true)
+            {
+                mutations.push(self.commit_rule_direct(
+                    next_restore_op_id(&self.op_index, op_prefix, mutations.len()),
+                    rule,
+                )?);
+            }
+        }
+
+        Ok(mutations)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             shard_count: self.shard_count,
@@ -720,6 +815,68 @@ impl SourceOfTruth {
         self.watermarks[shard_id as usize] = mutation.commit_id.seq;
         Ok(())
     }
+
+    fn commit_entry_direct(&mut self, op_id: String, mut entry: DenyEntry) -> Result<Mutation> {
+        let shard_id = shard_for_hash(entry.key_hash, self.shard_count);
+        let seq = self.watermarks[shard_id as usize] + 1;
+        entry.shard_id = shard_id;
+        entry.commit_seq = seq;
+        let mutation = Mutation {
+            op_id,
+            commit_id: CommitId {
+                shard_id,
+                seq,
+                epoch: self.epoch,
+                source_region: self.source_region.clone(),
+            },
+            entry,
+            rule: None,
+            delivery_priority: DeliveryPriority::P0,
+            committed_at_unix: now_unix(),
+        };
+        self.apply_committed_mutation(&mutation)?;
+        self.op_index
+            .insert(mutation.op_id.clone(), mutation.clone());
+        self.mutations.push(mutation.clone());
+        Ok(mutation)
+    }
+
+    fn commit_rule_direct(&mut self, op_id: String, mut rule: RuleEntry) -> Result<Mutation> {
+        let shard_id = shard_for_hash(rule.rule_hash, self.shard_count);
+        let seq = self.watermarks[shard_id as usize] + 1;
+        rule.shard_id = shard_id;
+        rule.commit_seq = seq;
+        let entry = DenyEntry {
+            tenant_id: rule.tenant_id.clone(),
+            namespace: format!("__rule:{}", rule.kind.as_str()),
+            key_hash: rule.rule_hash,
+            action: rule.action,
+            priority: rule.priority,
+            reason_code: rule.reason_code.clone(),
+            expires_at: rule.expires_at,
+            created_by: rule.created_by.clone(),
+            commit_seq: seq,
+            shard_id,
+        };
+        let mutation = Mutation {
+            op_id,
+            commit_id: CommitId {
+                shard_id,
+                seq,
+                epoch: self.epoch,
+                source_region: self.source_region.clone(),
+            },
+            entry,
+            rule: Some(rule),
+            delivery_priority: DeliveryPriority::P0,
+            committed_at_unix: now_unix(),
+        };
+        self.apply_committed_mutation(&mutation)?;
+        self.op_index
+            .insert(mutation.op_id.clone(), mutation.clone());
+        self.mutations.push(mutation.clone());
+        Ok(mutation)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,6 +885,35 @@ pub struct Snapshot {
     pub watermarks: Vec<u64>,
     pub entries: Vec<DenyEntry>,
     pub rules: Vec<RuleEntry>,
+}
+
+impl Snapshot {
+    pub fn validate(&self) -> Result<()> {
+        if self.watermarks.len() != self.shard_count as usize {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot has {} watermarks for {} shards",
+                self.watermarks.len(),
+                self.shard_count
+            )));
+        }
+        for entry in &self.entries {
+            if entry.shard_id >= self.shard_count {
+                return Err(GlobAclError::InvalidData(format!(
+                    "entry shard {} is outside shard_count {}",
+                    entry.shard_id, self.shard_count
+                )));
+            }
+        }
+        for rule in &self.rules {
+            if rule.shard_id >= self.shard_count {
+                return Err(GlobAclError::InvalidData(format!(
+                    "rule shard {} is outside shard_count {}",
+                    rule.shard_id, self.shard_count
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -789,30 +975,7 @@ impl ActiveState {
     }
 
     pub fn from_snapshot(snapshot: Snapshot) -> Result<Self> {
-        if snapshot.watermarks.len() != snapshot.shard_count as usize {
-            return Err(GlobAclError::InvalidData(format!(
-                "snapshot has {} watermarks for {} shards",
-                snapshot.watermarks.len(),
-                snapshot.shard_count
-            )));
-        }
-
-        for entry in &snapshot.entries {
-            if entry.shard_id >= snapshot.shard_count {
-                return Err(GlobAclError::InvalidData(format!(
-                    "entry shard {} is outside shard_count {}",
-                    entry.shard_id, snapshot.shard_count
-                )));
-            }
-        }
-        for rule in &snapshot.rules {
-            if rule.shard_id >= snapshot.shard_count {
-                return Err(GlobAclError::InvalidData(format!(
-                    "rule shard {} is outside shard_count {}",
-                    rule.shard_id, snapshot.shard_count
-                )));
-            }
-        }
+        snapshot.validate()?;
 
         Ok(Self {
             shard_count: snapshot.shard_count,
@@ -1290,6 +1453,62 @@ pub fn stable_key_hash(tenant_id: &str, namespace: &str, raw_key: &str) -> u64 {
     hash
 }
 
+pub fn payload_signature_hex(key_id: &str, secret: &str, payload: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for chunk in [key_id.as_bytes(), secret.as_bytes(), payload] {
+        for byte in chunk {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn format_payload_signature(key_id: &str, secret: &str, payload: &[u8]) -> String {
+    format!(
+        "algorithm=fnv64-dev\nkey_id={}\nsignature={}\n",
+        key_id,
+        payload_signature_hex(key_id, secret, payload)
+    )
+}
+
+pub fn verify_payload_signature(
+    key_id: &str,
+    secret: &str,
+    payload: &[u8],
+    signature: &str,
+) -> bool {
+    payload_signature_hex(key_id, secret, payload) == signature.trim()
+}
+
+pub fn deny_requires_blast_radius_override(request: &DenyRequest) -> bool {
+    if request.action != Action::Deny {
+        return false;
+    }
+
+    let namespace = request.namespace.trim().to_ascii_lowercase();
+    let key = request.key.trim().to_ascii_lowercase();
+    matches!(namespace.as_str(), "*" | "all" | "global" | "tenant")
+        || matches!(key.as_str(), "*" | "all")
+}
+
+pub fn rule_requires_blast_radius_override(request: &RuleRequest) -> bool {
+    if request.action != Action::Deny {
+        return false;
+    }
+
+    match request.kind {
+        RuleKind::Ipv4Cidr => parse_ipv4_cidr(&request.pattern)
+            .map(|(_, prefix_len, _)| prefix_len == 0)
+            .unwrap_or(true),
+        RuleKind::DomainSuffix => canonicalize_domain(&request.pattern)
+            .map(|domain| domain.split('.').count() < 2)
+            .unwrap_or(true),
+    }
+}
+
 fn fingerprint_acl_key(key: &AclKey) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for chunk in [
@@ -1471,6 +1690,54 @@ fn compare_rules_for_match(left: &RuleEntry, right: &RuleEntry) -> Ordering {
         .cmp(&left.priority)
         .then_with(|| action_rank(right.action).cmp(&action_rank(left.action)))
         .then_with(|| right.commit_seq.cmp(&left.commit_seq))
+}
+
+fn compare_rules_by_key(left: &RuleEntry, right: &RuleEntry) -> Ordering {
+    left.tenant_id
+        .cmp(&right.tenant_id)
+        .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+        .then_with(|| left.rule_hash.cmp(&right.rule_hash))
+}
+
+fn entry_semantically_equal(left: &DenyEntry, right: &DenyEntry) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.namespace == right.namespace
+        && left.key_hash == right.key_hash
+        && left.action == right.action
+        && left.priority == right.priority
+        && left.reason_code == right.reason_code
+        && left.expires_at == right.expires_at
+        && left.created_by == right.created_by
+}
+
+fn rule_semantically_equal(left: &RuleEntry, right: &RuleEntry) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.kind == right.kind
+        && left.pattern == right.pattern
+        && left.rule_hash == right.rule_hash
+        && left.action == right.action
+        && left.priority == right.priority
+        && left.reason_code == right.reason_code
+        && left.expires_at == right.expires_at
+        && left.created_by == right.created_by
+        && left.ipv4_network == right.ipv4_network
+        && left.ipv4_prefix_len == right.ipv4_prefix_len
+        && left.domain_suffix == right.domain_suffix
+}
+
+fn next_restore_op_id(
+    op_index: &HashMap<String, Mutation>,
+    op_prefix: &str,
+    start_index: usize,
+) -> String {
+    let mut index = start_index;
+    loop {
+        let candidate = format!("{op_prefix}-{index:06}");
+        if !op_index.contains_key(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 fn action_rank(action: Action) -> u8 {
@@ -1860,6 +2127,11 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
                     .map_err(|err| GlobAclError::Parse(format!("invalid content-length: {err}")))?;
             }
         }
+    }
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(GlobAclError::Parse(format!(
+            "http body too large: {content_length} bytes exceeds {MAX_HTTP_BODY_BYTES}"
+        )));
     }
 
     let target_len = header_end + content_length;
@@ -2522,6 +2794,76 @@ mod tests {
             Decision::Allow
         );
         assert_eq!(active.stats().delta_rule_removes, 1);
+    }
+
+    #[test]
+    fn blast_radius_helpers_flag_broad_denies() {
+        let broad_point = DenyRequest {
+            namespace: "tenant".to_owned(),
+            key: "*".to_owned(),
+            ..request("op-1", "u1", Action::Deny)
+        };
+        assert!(deny_requires_blast_radius_override(&broad_point));
+        assert!(!deny_requires_blast_radius_override(&request(
+            "op-2",
+            "u1",
+            Action::Deny
+        )));
+
+        assert!(rule_requires_blast_radius_override(&rule_request(
+            "rule-1",
+            RuleKind::Ipv4Cidr,
+            "0.0.0.0/0",
+            Action::Deny,
+        )));
+        assert!(!rule_requires_blast_radius_override(&rule_request(
+            "rule-2",
+            RuleKind::Ipv4Cidr,
+            "10.0.0.0/8",
+            Action::Deny,
+        )));
+        assert!(rule_requires_blast_radius_override(&rule_request(
+            "rule-3",
+            RuleKind::DomainSuffix,
+            "com",
+            Action::Deny,
+        )));
+        assert!(!rule_requires_blast_radius_override(&rule_request(
+            "rule-4",
+            RuleKind::DomainSuffix,
+            "example.com",
+            Action::Deny,
+        )));
+    }
+
+    #[test]
+    fn restore_snapshot_generates_forward_rollback_mutations() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let empty = SourceOfTruth::new(16, "local").snapshot();
+
+        let mutations = source.restore_snapshot(empty, "rollback-test").unwrap();
+
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].entry.action, Action::Delete);
+        assert_eq!(
+            source.lookup("tenant-a", "user", "u1", now_unix()),
+            Decision::Allow
+        );
+        assert_eq!(source.mutations_len(), 2);
+    }
+
+    #[test]
+    fn payload_signature_verifies_exact_bytes() {
+        let payload = b"snapshot-bytes";
+        let signature = payload_signature_hex("dev", "secret", payload);
+
+        assert!(verify_payload_signature(
+            "dev", "secret", payload, &signature
+        ));
+        assert!(!verify_payload_signature(
+            "dev", "secret", b"changed", &signature
+        ));
     }
 
     #[test]

@@ -32,14 +32,22 @@ POST /v1/canary
 GET  /v1/canary/latest
 GET  /v1/mutations?shard=0&from_seq=0
 GET  /v1/mutations?shard=0&from_seq=0&delivery_priority=p0
+GET  /v1/mutations.sig?shard=0&from_seq=0
 GET  /v1/watermarks
 GET  /v1/delta_bundle?shard=0&from_seq=0&to_seq=10
+GET  /v1/delta_bundle.sig?shard=0&from_seq=0&to_seq=10
 GET  /v1/snapshot
+GET  /v1/snapshot.sig
+GET  /v1/snapshots
+POST /v1/rollback
+GET  /v1/audit
 GET  /v1/lookup?tenant_id=...&namespace=...&key=...
 GET  /v1/check?tenant_id=...&namespace=ip&value=...
 POST /v1/ack
 GET  /v1/acks
 ```
+
+Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
 ## Rule Authoring
 
@@ -63,6 +71,23 @@ priority=0
 reason_code=unspecified
 expires_at=0
 created_by=unknown
+```
+
+## Blast Radius Controls
+
+The control API rejects obviously broad deny requests unless an override flag is present:
+
+```text
+override_blast_radius=true
+```
+
+The current guard catches point-deny requests for tenant/global wildcards, IPv4 `0.0.0.0/0`, invalid broad rule patterns, and single-label domain suffixes such as `com`. Rejected requests are written to the audit log.
+
+Example broad rule requiring override:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rule \
+  --data-binary $'op_id=net-all\ntenant_id=tenant-a\nkind=ipv4_cidr\npattern=0.0.0.0/0\naction=deny\noverride_blast_radius=true\nreason_code=emergency_all_ipv4\n'
 ```
 
 IPv4 CIDR example:
@@ -124,6 +149,50 @@ GET /v1/delta_bundle?shard=7&from_seq=41&to_seq=42
 
 Agents try this repair path when they detect a sequence gap, then fall back to the latest snapshot if bundle repair cannot recover the missing range.
 
+## Snapshots And Rollback
+
+Control writes:
+
+```text
+data/control/snapshots/latest.gacl
+data/control/snapshots/latest.gacl.sig
+data/control/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl
+data/control/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl.sig
+```
+
+`GET /v1/snapshot.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return dependency-free keyed integrity seals:
+
+```text
+algorithm=fnv64-dev
+key_id=dev
+signature=...
+```
+
+Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_SECRET` on control and agents to change the local key. This is a development integrity check, not a substitute for production Ed25519/HSM-backed signing.
+
+List available rollback targets:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/snapshots
+```
+
+Rollback creates new P0 compensating mutations instead of moving watermarks backwards:
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/rollback \
+  --data-binary $'snapshot=epoch_00000000001760000000_shard_0007_seq_00000000000000000042.gacl\n'
+```
+
+Agents receive rollback as ordinary forward mutation stream entries.
+
+## Audit Log
+
+Control appends audit lines to `data/control/audit.log` for committed denies, committed rules, rejected broad updates, canaries, snapshot uploads, and rollbacks.
+
+```sh
+curl -sS http://127.0.0.1:7000/v1/audit
+```
+
 ## Watermarks
 
 `GET /v1/watermarks` returns the latest source-of-truth sequence for every shard:
@@ -142,11 +211,17 @@ Agents use this to avoid scanning every shard when nothing changed.
 Agent `/health` includes edge-state sizing and overlay counters:
 
 ```text
+status=ok|stale
 base_entries=...
 delta_adds=...
 delta_removes=...
 filter_bits=...
 estimated_state_bytes=...
+last_successful_poll_unix=...
+state_lag_secs=...
+poll_lag_secs=...
+stale_after_secs=...
+stale=true|false
 ```
 
 The steady-state lookup path checks the exact delta overlay first, then uses the immutable base filter as a negative accelerator before probing the sorted exact base index.

@@ -34,5 +34,27 @@ The core tests cover:
 - IPv4 CIDR rule compilation and matching
 - domain suffix rule compilation and matching
 - rule delete overlays
+- broad-deny blast-radius detection
+- snapshot rollback through forward compensating mutations
+- dependency-free payload signature verification
 
-For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, then commit a delete and confirm the agent returns `decision=allow`.
+For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, verify `/v1/audit`, list `/v1/snapshots`, then commit a delete and confirm the agent returns `decision=allow`.
+
+Rollback smoke test:
+
+```text
+1. Start control, relay, and agent.
+2. Commit a deny and wait for the agent to return decision=deny.
+3. Pick an older snapshot from GET /v1/snapshots.
+4. POST /v1/rollback with that snapshot filename.
+5. Confirm the agent receives forward rollback mutations and returns the snapshot's expected decision.
+```
+
+Stale-agent smoke test:
+
+```text
+1. Start the agent with stale_after_secs=2.
+2. Stop or block the relay.
+3. Wait more than 2 seconds.
+4. GET /health from the agent and confirm status=stale.
+```

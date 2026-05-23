@@ -1,7 +1,8 @@
 use globacl_core::{
     decode_mutation_stream, decode_snapshot, encode_snapshot, format_decision, http_get, now_unix,
     parse_form_lines, parse_query_path, parse_watermarks, read_http_request, read_snapshot_file,
-    write_http_response, write_snapshot_file, ActiveState, Decision, GlobAclError, PopAck, Result,
+    verify_payload_signature, write_http_response, write_snapshot_file, ActiveState, Decision,
+    GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -16,6 +17,9 @@ struct App {
     agent_id: String,
     relay_addr: String,
     snapshot_path: PathBuf,
+    stale_after_secs: u64,
+    signature_key_id: String,
+    signature_secret: String,
     state: RwLock<Arc<ActiveState>>,
     metrics: Mutex<AgentMetrics>,
 }
@@ -23,6 +27,7 @@ struct App {
 #[derive(Default)]
 struct AgentMetrics {
     last_sync_unix: u64,
+    last_successful_poll_unix: u64,
     applied_mutations: u64,
     repairs: u64,
     bundle_repairs: u64,
@@ -59,15 +64,34 @@ fn main() -> Result<()> {
                 .replace("]", "")
         )
     });
+    let stale_after_secs = args
+        .get(6)
+        .map(|value| parse_arg_u64(value, "stale_after_secs"))
+        .transpose()?
+        .unwrap_or(60);
+    let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
+    let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
 
-    let snapshot = load_or_fetch_snapshot(&relay_addr, &snapshot_path)?;
+    let snapshot = load_or_fetch_snapshot(
+        &relay_addr,
+        &snapshot_path,
+        &signature_key_id,
+        &signature_secret,
+    )?;
+    let started_at = now_unix();
     let app = Arc::new(App {
         agent_id,
         relay_addr,
         snapshot_path,
+        stale_after_secs,
+        signature_key_id,
+        signature_secret,
         state: RwLock::new(Arc::new(ActiveState::from_snapshot(snapshot)?)),
         metrics: Mutex::new(AgentMetrics {
-            last_sync_unix: now_unix(),
+            last_sync_unix: started_at,
+            last_successful_poll_unix: started_at,
             ..AgentMetrics::default()
         }),
     });
@@ -110,8 +134,13 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let metrics = lock_metrics(&app)?;
             let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
             let stats = state.stats();
+            let now = now_unix();
+            let poll_lag_secs = now.saturating_sub(metrics.last_successful_poll_unix);
+            let state_lag_secs = now.saturating_sub(metrics.last_sync_unix);
+            let stale = poll_lag_secs > app.stale_after_secs;
+            let status = if stale { "stale" } else { "ok" };
             let body = format!(
-                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nbase_rules={}\ndelta_rule_adds={}\ndelta_rule_removes={}\nfilter_bits={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
+                "status={status}\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nbase_rules={}\ndelta_rule_adds={}\ndelta_rule_removes={}\nfilter_bits={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\nlast_successful_poll_unix={}\nstate_lag_secs={}\npoll_lag_secs={}\nstale_after_secs={}\nstale={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
                 app.agent_id,
                 state.shard_count(),
                 state.entries_len(),
@@ -125,6 +154,11 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 stats.estimated_bytes,
                 max_seq,
                 metrics.last_sync_unix,
+                metrics.last_successful_poll_unix,
+                state_lag_secs,
+                poll_lag_secs,
+                app.stale_after_secs,
+                stale,
                 metrics.applied_mutations,
                 metrics.repairs,
                 metrics.bundle_repairs,
@@ -217,6 +251,14 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
                 response.status_code
             )));
         }
+        let signature_path = format!("/v1/mutations.sig?shard={shard_id}&from_seq={from_seq}");
+        verify_remote_payload_signature(
+            &app.relay_addr,
+            &signature_path,
+            &response.body,
+            &app.signature_key_id,
+            &app.signature_secret,
+        )?;
         let mutations = decode_mutation_stream(&response.body)?;
         if mutations.is_empty() {
             continue;
@@ -267,6 +309,7 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
     }
 
     check_canary(app)?;
+    lock_metrics(app)?.last_successful_poll_unix = now_unix();
     Ok(())
 }
 
@@ -286,6 +329,16 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
         let path = format!("/v1/delta_bundle?shard={shard_id}&from_seq={from_seq}&to_seq={to_seq}");
         let response = http_get(&app.relay_addr, &path)?;
         if response.status_code == 200 {
+            let signature_path = format!(
+                "/v1/delta_bundle.sig?shard={shard_id}&from_seq={from_seq}&to_seq={to_seq}"
+            );
+            verify_remote_payload_signature(
+                &app.relay_addr,
+                &signature_path,
+                &response.body,
+                &app.signature_key_id,
+                &app.signature_secret,
+            )?;
             let mutations = decode_mutation_stream(&response.body)?;
             if !mutations.is_empty() {
                 let current = current_state(app)?;
@@ -304,6 +357,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
                 send_ack(app, shard_id, seq, entries)?;
                 let mut metrics = lock_metrics(app)?;
                 metrics.last_sync_unix = now_unix();
+                metrics.last_successful_poll_unix = metrics.last_sync_unix;
                 metrics.repairs += 1;
                 metrics.bundle_repairs += 1;
                 return Ok(());
@@ -315,7 +369,11 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
 }
 
 fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
-    let snapshot = fetch_snapshot(&app.relay_addr)?;
+    let snapshot = fetch_snapshot(
+        &app.relay_addr,
+        &app.signature_key_id,
+        &app.signature_secret,
+    )?;
     write_snapshot_file(&app.snapshot_path, &snapshot)?;
     let mut ack_targets = Vec::new();
     let state = ActiveState::from_snapshot(snapshot)?;
@@ -330,6 +388,7 @@ fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
     }
     let mut metrics = lock_metrics(app)?;
     metrics.last_sync_unix = now_unix();
+    metrics.last_successful_poll_unix = metrics.last_sync_unix;
     metrics.repairs += 1;
     metrics.snapshot_repairs += 1;
     Ok(())
@@ -386,16 +445,23 @@ fn check_canary(app: &Arc<App>) -> Result<()> {
 fn load_or_fetch_snapshot(
     relay_addr: &str,
     snapshot_path: &Path,
+    signature_key_id: &str,
+    signature_secret: &str,
 ) -> Result<globacl_core::Snapshot> {
     if snapshot_path.exists() {
+        verify_local_snapshot(snapshot_path, signature_key_id, signature_secret)?;
         return read_snapshot_file(snapshot_path);
     }
-    let snapshot = fetch_snapshot(relay_addr)?;
+    let snapshot = fetch_snapshot(relay_addr, signature_key_id, signature_secret)?;
     write_snapshot_file(snapshot_path, &snapshot)?;
     Ok(snapshot)
 }
 
-fn fetch_snapshot(relay_addr: &str) -> Result<globacl_core::Snapshot> {
+fn fetch_snapshot(
+    relay_addr: &str,
+    signature_key_id: &str,
+    signature_secret: &str,
+) -> Result<globacl_core::Snapshot> {
     let response = http_get(relay_addr, "/v1/snapshot")?;
     if response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(
@@ -403,7 +469,73 @@ fn fetch_snapshot(relay_addr: &str) -> Result<globacl_core::Snapshot> {
             response.status_code
         )));
     }
+    verify_remote_payload_signature(
+        relay_addr,
+        "/v1/snapshot.sig",
+        &response.body,
+        signature_key_id,
+        signature_secret,
+    )?;
     decode_snapshot(&response.body)
+}
+
+fn verify_local_snapshot(
+    path: &Path,
+    signature_key_id: &str,
+    signature_secret: &str,
+) -> Result<()> {
+    let sig_path = signature_path(path);
+    if !sig_path.exists() {
+        return Ok(());
+    }
+    let payload = std::fs::read(path)?;
+    let signature = std::fs::read(sig_path)?;
+    verify_snapshot_signature(&payload, &signature, signature_key_id, signature_secret)
+}
+
+fn verify_remote_payload_signature(
+    relay_addr: &str,
+    signature_path: &str,
+    payload: &[u8],
+    signature_key_id: &str,
+    signature_secret: &str,
+) -> Result<()> {
+    let response = http_get(relay_addr, signature_path)?;
+    if response.status_code != 200 || response.body.is_empty() {
+        return Ok(());
+    }
+    verify_snapshot_signature(payload, &response.body, signature_key_id, signature_secret)
+}
+
+fn verify_snapshot_signature(
+    payload: &[u8],
+    signature_body: &[u8],
+    signature_key_id: &str,
+    signature_secret: &str,
+) -> Result<()> {
+    let form = parse_form_lines(signature_body)?;
+    let key_id = form
+        .get("key_id")
+        .map(String::as_str)
+        .ok_or_else(|| GlobAclError::InvalidData("snapshot signature missing key_id".to_owned()))?;
+    let signature = form.get("signature").map(String::as_str).ok_or_else(|| {
+        GlobAclError::InvalidData("snapshot signature missing signature".to_owned())
+    })?;
+    if key_id != signature_key_id {
+        return Err(GlobAclError::InvalidData(format!(
+            "snapshot signature key_id {key_id:?} does not match expected {signature_key_id:?}"
+        )));
+    }
+    if !verify_payload_signature(key_id, signature_secret, payload, signature) {
+        return Err(GlobAclError::InvalidData(
+            "snapshot signature verification failed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn signature_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.sig", path.display()))
 }
 
 fn current_state(app: &App) -> Result<Arc<ActiveState>> {
