@@ -53,6 +53,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Benchmark harness
+        run: cargo run -p globacl-bench --release --locked -- --ci
+
       - name: Build
         run: cargo build --workspace --locked
 

@@ -1204,6 +1204,15 @@ impl ActiveState {
         }
     }
 
+    /// Benchmark/observability probe for the immutable base negative filter.
+    ///
+    /// A `true` result is approximate and must never be treated as a deny decision
+    /// without the exact lookup verification performed by [`Self::lookup`].
+    pub fn base_filter_may_contain(&self, tenant_id: &str, namespace: &str, raw_key: &str) -> bool {
+        let key = AclKey::from_raw(tenant_id, namespace, raw_key);
+        self.base.filter.may_contain(&key)
+    }
+
     pub fn delta_entries_len(&self) -> usize {
         self.delta_adds.len()
             + self.delta_removes.len()
@@ -3359,6 +3368,15 @@ mod tests {
         assert!(active
             .lookup("tenant-a", "user", "u2", now_unix())
             .is_denied());
+    }
+
+    #[test]
+    fn active_state_exposes_base_filter_probe_for_benchmarks() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let active = ActiveState::from_snapshot(source.snapshot()).unwrap();
+
+        assert!(active.base_filter_may_contain("tenant-a", "user", "u1"));
     }
 
     #[test]
