@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-nats
+  namespace: globacl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: globacl-nats
+  template:
+    metadata:
+      labels:
+        app: globacl-nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.11-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["nats-server"]
+          args:
+            - "-js"
+            - "-sd"
+            - "/data/jetstream"
+          ports:
+            - containerPort: 4222
+              name: client
+          readinessProbe:
+            tcpSocket:
+              port: client
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-nats
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client

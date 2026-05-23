@@ -45,10 +45,11 @@ Run k3d-backed k3s smoke tests:
 
 ```sh
 ./deploy/k3s/local-smoke.sh
+./deploy/k3s/jetstream-smoke.sh
 ./deploy/k3s/global-smoke.sh
 ```
 
-The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
+The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The JetStream smoke uses the same local shape, adds NATS JetStream, enables commitd publishing, switches the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app observes a deny through the agent. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
 
 The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
 

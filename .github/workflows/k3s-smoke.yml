@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - local
+          - jetstream
           - global
           - all
 
@@ -40,6 +41,26 @@ jobs:
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
       - name: Run local k3s smoke
         run: ./deploy/k3s/local-smoke.sh
+
+  jetstream:
+    if: ${{ inputs.suite == 'jetstream' || inputs.suite == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+      - name: Run JetStream k3s smoke
+        run: ./deploy/k3s/jetstream-smoke.sh
 
   global:
     if: ${{ inputs.suite == 'global' || inputs.suite == 'all' }}

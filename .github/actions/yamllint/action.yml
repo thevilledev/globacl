@@ -17,6 +17,7 @@ inputs:
       .github/actions
       .github/workflows
       deploy/k8s/local.yaml
+      deploy/k8s/nats-jetstream.yaml
       deploy/k8s/global/central.yaml
       deploy/k8s/global/region.yaml.tpl
 
