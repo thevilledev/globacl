@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ pub const SNAPSHOT_MANIFEST_VERSION: u16 = 1;
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const DEFAULT_SIGNATURE_KEY_ID: &str = "dev-ed25519";
+pub const DEFAULT_SIGNATURE_KEY_VERSION: u64 = 1;
 pub const DEFAULT_SIGNATURE_PRIVATE_KEY: &str =
     "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 pub const DEFAULT_SIGNATURE_PUBLIC_KEY: &str =
@@ -972,6 +974,40 @@ pub struct SnapshotManifest {
     pub watermarks: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignatureEnvelope {
+    pub algorithm: String,
+    pub key_id: String,
+    pub key_version: u64,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignatureVerificationKey {
+    pub key_id: String,
+    pub key_version: u64,
+    pub public_key_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignatureVerifier {
+    keys: HashMap<String, SignatureVerificationKey>,
+    min_key_version: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignatureSigner {
+    key_id: String,
+    key_version: u64,
+    provider: SignatureProvider,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SignatureProvider {
+    Ed25519PrivateKey(String),
+    ExternalCommand(String),
+}
+
 impl Snapshot {
     pub fn validate(&self) -> Result<()> {
         if self.watermarks.len() != self.shard_count as usize {
@@ -1118,6 +1154,126 @@ impl SnapshotManifest {
             ));
         }
         Ok(())
+    }
+}
+
+impl SignatureVerificationKey {
+    pub fn new(
+        key_id: impl Into<String>,
+        key_version: u64,
+        public_key_hex: impl Into<String>,
+    ) -> Self {
+        Self {
+            key_id: key_id.into(),
+            key_version,
+            public_key_hex: public_key_hex.into(),
+        }
+    }
+}
+
+impl SignatureVerifier {
+    pub fn new(keys: Vec<SignatureVerificationKey>, min_key_version: u64) -> Result<Self> {
+        if keys.is_empty() {
+            return Err(GlobAclError::InvalidData(
+                "signature verifier requires at least one public key".to_owned(),
+            ));
+        }
+        let mut by_id = HashMap::new();
+        for key in keys {
+            if key.key_id.trim().is_empty() {
+                return Err(GlobAclError::InvalidData(
+                    "signature key_id cannot be empty".to_owned(),
+                ));
+            }
+            decode_hex_array::<32>(&key.public_key_hex, "ed25519 public key")?;
+            if by_id.insert(key.key_id.clone(), key).is_some() {
+                return Err(GlobAclError::InvalidData(
+                    "duplicate signature key_id in verifier".to_owned(),
+                ));
+            }
+        }
+        Ok(Self {
+            keys: by_id,
+            min_key_version,
+        })
+    }
+
+    pub fn single(
+        key_id: impl Into<String>,
+        key_version: u64,
+        public_key_hex: impl Into<String>,
+        min_key_version: u64,
+    ) -> Result<Self> {
+        Self::new(
+            vec![SignatureVerificationKey::new(
+                key_id,
+                key_version,
+                public_key_hex,
+            )],
+            min_key_version,
+        )
+    }
+
+    pub fn min_key_version(&self) -> u64 {
+        self.min_key_version
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+impl SignatureSigner {
+    pub fn ed25519_private_key(
+        key_id: impl Into<String>,
+        key_version: u64,
+        private_key_hex: impl Into<String>,
+    ) -> Result<Self> {
+        let private_key_hex = private_key_hex.into();
+        decode_hex_array::<32>(&private_key_hex, "ed25519 private key")?;
+        Ok(Self {
+            key_id: key_id.into(),
+            key_version,
+            provider: SignatureProvider::Ed25519PrivateKey(private_key_hex),
+        })
+    }
+
+    pub fn external_command(
+        key_id: impl Into<String>,
+        key_version: u64,
+        command: impl Into<String>,
+    ) -> Result<Self> {
+        let command = command.into();
+        if command.split_whitespace().next().is_none() {
+            return Err(GlobAclError::InvalidData(
+                "signature external command cannot be empty".to_owned(),
+            ));
+        }
+        Ok(Self {
+            key_id: key_id.into(),
+            key_version,
+            provider: SignatureProvider::ExternalCommand(command),
+        })
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn key_version(&self) -> u64 {
+        self.key_version
+    }
+
+    pub fn sign_payload(&self, payload: &[u8]) -> Result<String> {
+        let signature = match &self.provider {
+            SignatureProvider::Ed25519PrivateKey(private_key_hex) => {
+                payload_signature_hex(private_key_hex, payload)?
+            }
+            SignatureProvider::ExternalCommand(command) => {
+                external_payload_signature_hex(command, &self.key_id, self.key_version, payload)?
+            }
+        };
+        format_payload_signature_from_hex(&self.key_id, self.key_version, &signature)
     }
 }
 
@@ -1898,10 +2054,32 @@ pub fn format_payload_signature(
     private_key_hex: &str,
     payload: &[u8],
 ) -> Result<String> {
-    Ok(format!(
-        "algorithm={SIGNATURE_ALGORITHM}\nkey_id={}\nsignature={}\n",
+    format_payload_signature_with_version(
         key_id,
-        payload_signature_hex(private_key_hex, payload)?
+        DEFAULT_SIGNATURE_KEY_VERSION,
+        private_key_hex,
+        payload,
+    )
+}
+
+pub fn format_payload_signature_with_version(
+    key_id: &str,
+    key_version: u64,
+    private_key_hex: &str,
+    payload: &[u8],
+) -> Result<String> {
+    let signature = payload_signature_hex(private_key_hex, payload)?;
+    format_payload_signature_from_hex(key_id, key_version, &signature)
+}
+
+pub fn format_payload_signature_from_hex(
+    key_id: &str,
+    key_version: u64,
+    signature_hex: &str,
+) -> Result<String> {
+    let signature = hex_encode(&decode_hex_array::<64>(signature_hex, "ed25519 signature")?);
+    Ok(format!(
+        "algorithm={SIGNATURE_ALGORITHM}\nkey_id={key_id}\nkey_version={key_version}\nsignature={signature}\n"
     ))
 }
 
@@ -1916,6 +2094,146 @@ pub fn verify_payload_signature(
         .map_err(|err| GlobAclError::InvalidData(format!("invalid ed25519 public key: {err}")))?;
     let signature = Signature::from_bytes(&signature);
     Ok(verifying_key.verify_strict(payload, &signature).is_ok())
+}
+
+pub fn parse_payload_signature(body: &[u8]) -> Result<SignatureEnvelope> {
+    let form = parse_form_lines(body)?;
+    let algorithm = required(&form, "algorithm")?;
+    let key_id = required(&form, "key_id")?;
+    let key_version = parse_u64(
+        form.get("key_version").map(String::as_str),
+        0,
+        "key_version",
+    )?;
+    let signature = required(&form, "signature")?;
+    Ok(SignatureEnvelope {
+        algorithm,
+        key_id,
+        key_version,
+        signature,
+    })
+}
+
+pub fn verify_payload_signature_with_verifier(
+    verifier: &SignatureVerifier,
+    payload: &[u8],
+    signature_body: &[u8],
+) -> Result<()> {
+    let envelope = parse_payload_signature(signature_body)?;
+    if envelope.algorithm != SIGNATURE_ALGORITHM {
+        return Err(GlobAclError::InvalidData(format!(
+            "signature algorithm {:?} is not supported",
+            envelope.algorithm
+        )));
+    }
+    if envelope.key_version < verifier.min_key_version {
+        return Err(GlobAclError::InvalidData(format!(
+            "signature key version {} is below required minimum {}",
+            envelope.key_version, verifier.min_key_version
+        )));
+    }
+    let key = verifier.keys.get(&envelope.key_id).ok_or_else(|| {
+        GlobAclError::InvalidData(format!(
+            "signature key_id {:?} is not trusted",
+            envelope.key_id
+        ))
+    })?;
+    if envelope.key_version != 0 && key.key_version != 0 && envelope.key_version != key.key_version
+    {
+        return Err(GlobAclError::InvalidData(format!(
+            "signature key version {} does not match trusted key {} version {}",
+            envelope.key_version, key.key_id, key.key_version
+        )));
+    }
+    if !verify_payload_signature(&key.public_key_hex, payload, &envelope.signature)? {
+        return Err(GlobAclError::InvalidData(
+            "payload signature verification failed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn parse_signature_public_keys(value: &str) -> Result<Vec<SignatureVerificationKey>> {
+    let mut keys = Vec::new();
+    for raw_part in value
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (key_id, rest) = raw_part.split_once(':').ok_or_else(|| {
+            GlobAclError::Parse(format!(
+                "signature public key entry must be key_id:public_key or key_id:key_version:public_key, got {raw_part:?}"
+            ))
+        })?;
+        let (key_version, public_key) =
+            if let Some((maybe_version, public_key)) = rest.split_once(':') {
+                match maybe_version.parse::<u64>() {
+                    Ok(key_version) => (key_version, public_key),
+                    Err(_) => (DEFAULT_SIGNATURE_KEY_VERSION, rest),
+                }
+            } else {
+                (DEFAULT_SIGNATURE_KEY_VERSION, rest)
+            };
+        let key =
+            SignatureVerificationKey::new(key_id.to_owned(), key_version, public_key.to_owned());
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+fn external_payload_signature_hex(
+    command: &str,
+    key_id: &str,
+    key_version: u64,
+    payload: &[u8],
+) -> Result<String> {
+    let mut parts = command.split_whitespace();
+    let program = parts.next().ok_or_else(|| {
+        GlobAclError::InvalidData("signature external command cannot be empty".to_owned())
+    })?;
+    let args = parts.collect::<Vec<_>>();
+    let mut child = Command::new(program)
+        .args(args)
+        .env("GLOBACL_SIGNATURE_ALGORITHM", SIGNATURE_ALGORITHM)
+        .env("GLOBACL_SIGNATURE_KEY_ID", key_id)
+        .env("GLOBACL_SIGNATURE_KEY_VERSION", key_version.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            GlobAclError::Io(io::Error::new(
+                err.kind(),
+                format!("failed to spawn signature external command {program:?}: {err}"),
+            ))
+        })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            GlobAclError::InvalidData("signature external command stdin unavailable".to_owned())
+        })?
+        .write_all(payload)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(GlobAclError::InvalidData(format!(
+            "signature external command exited with status {}",
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|err| {
+        GlobAclError::InvalidData(format!(
+            "signature external command output is not utf8: {err}"
+        ))
+    })?;
+    let signature = stdout.split_whitespace().next().ok_or_else(|| {
+        GlobAclError::InvalidData(
+            "signature external command did not return a signature".to_owned(),
+        )
+    })?;
+    Ok(hex_encode(&decode_hex_array::<64>(
+        signature,
+        "ed25519 signature",
+    )?))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -4107,6 +4425,7 @@ mod tests {
         .unwrap();
         assert!(formatted.contains("algorithm=ed25519"));
         assert!(formatted.contains("key_id=dev-ed25519"));
+        assert!(formatted.contains("key_version=1"));
     }
 
     #[test]
@@ -4130,7 +4449,58 @@ mod tests {
         let formatted = format_payload_signature("custom-ed25519", private_key, &payload).unwrap();
         assert!(formatted.contains("algorithm=ed25519"));
         assert!(formatted.contains("key_id=custom-ed25519"));
+        assert!(formatted.contains("key_version=1"));
         assert!(formatted.contains(expected_signature));
+    }
+
+    #[test]
+    fn signature_verifier_rejects_key_version_downgrade() {
+        let payload = b"snapshot-bytes";
+        let signer = SignatureSigner::ed25519_private_key(
+            DEFAULT_SIGNATURE_KEY_ID,
+            1,
+            DEFAULT_SIGNATURE_PRIVATE_KEY,
+        )
+        .unwrap();
+        let signature = signer.sign_payload(payload).unwrap();
+        let verifier =
+            SignatureVerifier::single(DEFAULT_SIGNATURE_KEY_ID, 1, DEFAULT_SIGNATURE_PUBLIC_KEY, 1)
+                .unwrap();
+        verify_payload_signature_with_verifier(&verifier, payload, signature.as_bytes()).unwrap();
+
+        let strict_verifier =
+            SignatureVerifier::single(DEFAULT_SIGNATURE_KEY_ID, 1, DEFAULT_SIGNATURE_PUBLIC_KEY, 2)
+                .unwrap();
+        assert!(verify_payload_signature_with_verifier(
+            &strict_verifier,
+            payload,
+            signature.as_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signature_public_keyring_parses_key_versions() {
+        let value = format!(
+            "{}:{}:{}\n",
+            DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PUBLIC_KEY
+        );
+        let keys = parse_signature_public_keys(&value).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, DEFAULT_SIGNATURE_KEY_ID);
+        assert_eq!(keys[0].key_version, DEFAULT_SIGNATURE_KEY_VERSION);
+        assert_eq!(keys[0].public_key_hex, DEFAULT_SIGNATURE_PUBLIC_KEY);
+
+        let prefixed = format!(
+            "{}:hex:{}",
+            DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PUBLIC_KEY
+        );
+        let keys = parse_signature_public_keys(&prefixed).unwrap();
+        assert_eq!(keys[0].key_version, DEFAULT_SIGNATURE_KEY_VERSION);
+        assert_eq!(
+            keys[0].public_key_hex,
+            format!("hex:{DEFAULT_SIGNATURE_PUBLIC_KEY}")
+        );
     }
 
     #[test]

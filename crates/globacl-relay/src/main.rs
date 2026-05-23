@@ -1,14 +1,15 @@
 use globacl_core::{
     decode_mutation, decode_mutation_stream, decode_snapshot, encode_mutation_stream,
-    format_payload_signature, format_watermarks, http_get, http_post, nats_ack,
-    nats_jetstream_consumer_info, nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream,
-    nats_jetstream_pull, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
-    read_http_request, write_http_response, DeliveryPriority, GlobAclError, HttpResponse, Mutation,
-    PopAck, PropagationAck, Result, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
+    format_watermarks, http_get, http_post, nats_ack, nats_jetstream_consumer_info,
+    nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream, nats_jetstream_pull, now_unix,
+    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, write_http_response,
+    DeliveryPriority, GlobAclError, HttpResponse, Mutation, PopAck, PropagationAck, Result,
+    SignatureSigner, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION,
     DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -51,8 +52,7 @@ struct JetStreamSource {
     stream: String,
     durable: String,
     batch: usize,
-    signature_key_id: String,
-    signature_private_key: String,
+    signature_signer: SignatureSigner,
     cache: Mutex<RelayCache>,
     status: Mutex<JetStreamStatus>,
 }
@@ -270,10 +270,7 @@ impl JetStreamSource {
             )?;
             nats_jetstream_ensure_consumer(&nats_addr, &stream, &durable, &filter_subject)?;
         }
-        let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
-            .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-        let signature_private_key = env::var("GLOBACL_SIGNATURE_PRIVATE_KEY")
-            .unwrap_or_else(|_| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
+        let signature_signer = signature_signer_from_env()?;
         let cache = bootstrap_cache(&bootstrap_addr)?;
         Ok(Self {
             bootstrap_addr,
@@ -281,8 +278,7 @@ impl JetStreamSource {
             stream,
             durable,
             batch,
-            signature_key_id,
-            signature_private_key,
+            signature_signer,
             cache: Mutex::new(cache),
             status: Mutex::new(JetStreamStatus {
                 last_pull_unix: 0,
@@ -400,12 +396,7 @@ impl JetStreamSource {
         let payload = encode_mutation_stream(&mutations);
         Ok(HttpResponse {
             status_code: 200,
-            body: format_payload_signature(
-                &self.signature_key_id,
-                &self.signature_private_key,
-                &payload,
-            )?
-            .into_bytes(),
+            body: self.signature_signer.sign_payload(&payload)?.into_bytes(),
         })
     }
 
@@ -731,6 +722,44 @@ fn content_type_for(path: &str) -> &'static str {
     } else {
         "text/plain"
     }
+}
+
+fn signature_signer_from_env() -> Result<SignatureSigner> {
+    let key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
+    let key_version = env::var("GLOBACL_SIGNATURE_KEY_VERSION")
+        .ok()
+        .map(|value| parse_env_u64(&value, "GLOBACL_SIGNATURE_KEY_VERSION"))
+        .transpose()?
+        .unwrap_or(DEFAULT_SIGNATURE_KEY_VERSION);
+    if let Ok(command) = env::var("GLOBACL_SIGNATURE_SIGN_COMMAND")
+        .or_else(|_| env::var("GLOBACL_SIGNATURE_SIGNER_COMMAND"))
+    {
+        if !command.trim().is_empty() {
+            return SignatureSigner::external_command(key_id, key_version, command);
+        }
+    }
+
+    let private_key = env_text_or_file(
+        "GLOBACL_SIGNATURE_PRIVATE_KEY",
+        "GLOBACL_SIGNATURE_PRIVATE_KEY_FILE",
+    )?
+    .unwrap_or_else(|| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
+    SignatureSigner::ed25519_private_key(key_id, key_version, private_key.trim().to_owned())
+}
+
+fn env_text_or_file(value_env: &str, file_env: &str) -> Result<Option<String>> {
+    if let Ok(value) = env::var(value_env) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    if let Ok(path) = env::var(file_env) {
+        if !path.trim().is_empty() {
+            return Ok(Some(fs::read_to_string(path.trim())?));
+        }
+    }
+    Ok(None)
 }
 
 fn lock_acks(app: &App) -> Result<std::sync::MutexGuard<'_, HashMap<String, PropagationAck>>> {

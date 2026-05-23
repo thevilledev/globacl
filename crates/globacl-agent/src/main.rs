@@ -1,11 +1,14 @@
 use globacl_core::{
     decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, encode_snapshot,
-    format_decision, http_get, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
-    read_http_request, read_snapshot_file, verify_payload_signature, write_http_response,
-    write_snapshot_file, ActiveState, ActiveStateHandle, Decision, GlobAclError, PopAck, Result,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PUBLIC_KEY,
+    format_decision, http_get, now_unix, parse_form_lines, parse_query_path,
+    parse_signature_public_keys, parse_watermarks, read_http_request, read_snapshot_file,
+    verify_payload_signature_with_verifier, write_http_response, write_snapshot_file, ActiveState,
+    ActiveStateHandle, Decision, GlobAclError, PopAck, Result, SignatureVerificationKey,
+    SignatureVerifier, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION,
+    DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
 use std::env;
+use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,8 +22,7 @@ struct App {
     relay_addr: String,
     snapshot_path: PathBuf,
     stale_after_secs: u64,
-    signature_key_id: String,
-    signature_public_key: String,
+    signature_verifier: SignatureVerifier,
     state: ActiveStateHandle,
     metrics: Mutex<AgentMetrics>,
 }
@@ -70,25 +72,16 @@ fn main() -> Result<()> {
         .map(|value| parse_arg_u64(value, "stale_after_secs"))
         .transpose()?
         .unwrap_or(60);
-    let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-    let signature_public_key = env::var("GLOBACL_SIGNATURE_PUBLIC_KEY")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_PUBLIC_KEY.to_owned());
+    let signature_verifier = signature_verifier_from_env()?;
 
-    let snapshot = load_or_fetch_snapshot(
-        &relay_addr,
-        &snapshot_path,
-        &signature_key_id,
-        &signature_public_key,
-    )?;
+    let snapshot = load_or_fetch_snapshot(&relay_addr, &snapshot_path, &signature_verifier)?;
     let started_at = now_unix();
     let app = Arc::new(App {
         agent_id,
         relay_addr,
         snapshot_path,
         stale_after_secs,
-        signature_key_id,
-        signature_public_key,
+        signature_verifier,
         state: ActiveStateHandle::from_snapshot(snapshot)?,
         metrics: Mutex::new(AgentMetrics {
             last_sync_unix: started_at,
@@ -258,8 +251,7 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
             &app.relay_addr,
             &signature_path,
             &response.body,
-            &app.signature_key_id,
-            &app.signature_public_key,
+            &app.signature_verifier,
         )?;
         let mutations = decode_mutation_stream(&response.body)?;
         if mutations.is_empty() {
@@ -338,8 +330,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
                 &app.relay_addr,
                 &signature_path,
                 &response.body,
-                &app.signature_key_id,
-                &app.signature_public_key,
+                &app.signature_verifier,
             )?;
             let mutations = decode_mutation_stream(&response.body)?;
             if !mutations.is_empty() {
@@ -371,11 +362,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
 }
 
 fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
-    let snapshot = fetch_snapshot(
-        &app.relay_addr,
-        &app.signature_key_id,
-        &app.signature_public_key,
-    )?;
+    let snapshot = fetch_snapshot(&app.relay_addr, &app.signature_verifier)?;
     write_snapshot_file(&app.snapshot_path, &snapshot)?;
     let mut ack_targets = Vec::new();
     let state = ActiveState::from_snapshot(snapshot)?;
@@ -447,24 +434,22 @@ fn check_canary(app: &Arc<App>) -> Result<()> {
 fn load_or_fetch_snapshot(
     relay_addr: &str,
     snapshot_path: &Path,
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<globacl_core::Snapshot> {
     if snapshot_path.exists() {
-        verify_local_snapshot(snapshot_path, signature_key_id, signature_public_key)?;
+        verify_local_snapshot(snapshot_path, signature_verifier)?;
         return read_snapshot_file(snapshot_path);
     }
-    let snapshot = fetch_snapshot(relay_addr, signature_key_id, signature_public_key)?;
+    let snapshot = fetch_snapshot(relay_addr, signature_verifier)?;
     write_snapshot_file(snapshot_path, &snapshot)?;
     Ok(snapshot)
 }
 
 fn fetch_snapshot(
     relay_addr: &str,
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<globacl_core::Snapshot> {
-    match fetch_snapshot_from_manifest(relay_addr, signature_key_id, signature_public_key) {
+    match fetch_snapshot_from_manifest(relay_addr, signature_verifier) {
         Ok(snapshot) => return Ok(snapshot),
         Err(err) => {
             eprintln!("snapshot manifest fetch failed, falling back to legacy snapshot: {err}")
@@ -482,16 +467,14 @@ fn fetch_snapshot(
         relay_addr,
         "/v1/snapshot.sig",
         &response.body,
-        signature_key_id,
-        signature_public_key,
+        signature_verifier,
     )?;
     decode_snapshot(&response.body)
 }
 
 fn fetch_snapshot_from_manifest(
     relay_addr: &str,
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<globacl_core::Snapshot> {
     let manifest_response = http_get(relay_addr, "/v1/snapshot_manifest")?;
     if manifest_response.status_code != 200 {
@@ -504,8 +487,7 @@ fn fetch_snapshot_from_manifest(
         relay_addr,
         "/v1/snapshot_manifest.sig",
         &manifest_response.body,
-        signature_key_id,
-        signature_public_key,
+        signature_verifier,
     )?;
     let manifest = decode_snapshot_manifest(&manifest_response.body)?;
 
@@ -525,8 +507,7 @@ fn fetch_snapshot_from_manifest(
         relay_addr,
         &artifact_signature_path,
         &artifact_response.body,
-        signature_key_id,
-        signature_public_key,
+        signature_verifier,
     )?;
     manifest.validate_artifact(&artifact_response.body)?;
     let snapshot = decode_snapshot(&artifact_response.body)?;
@@ -534,45 +515,34 @@ fn fetch_snapshot_from_manifest(
     Ok(snapshot)
 }
 
-fn verify_local_snapshot(
-    path: &Path,
-    signature_key_id: &str,
-    signature_public_key: &str,
-) -> Result<()> {
+fn verify_local_snapshot(path: &Path, signature_verifier: &SignatureVerifier) -> Result<()> {
     let sig_path = signature_path(path);
     if !sig_path.exists() {
         return Ok(());
     }
-    let payload = std::fs::read(path)?;
-    let signature = std::fs::read(sig_path)?;
-    verify_snapshot_signature(&payload, &signature, signature_key_id, signature_public_key)
+    let payload = fs::read(path)?;
+    let signature = fs::read(sig_path)?;
+    verify_snapshot_signature(&payload, &signature, signature_verifier)
 }
 
 fn verify_remote_payload_signature(
     relay_addr: &str,
     signature_path: &str,
     payload: &[u8],
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<()> {
     let response = http_get(relay_addr, signature_path)?;
     if response.status_code != 200 || response.body.is_empty() {
         return Ok(());
     }
-    verify_snapshot_signature(
-        payload,
-        &response.body,
-        signature_key_id,
-        signature_public_key,
-    )
+    verify_snapshot_signature(payload, &response.body, signature_verifier)
 }
 
 fn verify_required_remote_payload_signature(
     relay_addr: &str,
     signature_path: &str,
     payload: &[u8],
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<()> {
     let response = http_get(relay_addr, signature_path)?;
     if response.status_code != 200 || response.body.is_empty() {
@@ -580,51 +550,77 @@ fn verify_required_remote_payload_signature(
             "required signature missing at {signature_path}"
         )));
     }
-    verify_snapshot_signature(
-        payload,
-        &response.body,
-        signature_key_id,
-        signature_public_key,
-    )
+    verify_snapshot_signature(payload, &response.body, signature_verifier)
 }
 
 fn verify_snapshot_signature(
     payload: &[u8],
     signature_body: &[u8],
-    signature_key_id: &str,
-    signature_public_key: &str,
+    signature_verifier: &SignatureVerifier,
 ) -> Result<()> {
-    let form = parse_form_lines(signature_body)?;
-    let key_id = form
-        .get("key_id")
-        .map(String::as_str)
-        .ok_or_else(|| GlobAclError::InvalidData("snapshot signature missing key_id".to_owned()))?;
-    let signature = form.get("signature").map(String::as_str).ok_or_else(|| {
-        GlobAclError::InvalidData("snapshot signature missing signature".to_owned())
-    })?;
-    if key_id != signature_key_id {
-        return Err(GlobAclError::InvalidData(format!(
-            "snapshot signature key_id {key_id:?} does not match expected {signature_key_id:?}"
-        )));
-    }
-    let algorithm = form.get("algorithm").map(String::as_str).ok_or_else(|| {
-        GlobAclError::InvalidData("snapshot signature missing algorithm".to_owned())
-    })?;
-    if algorithm != globacl_core::SIGNATURE_ALGORITHM {
-        return Err(GlobAclError::InvalidData(format!(
-            "snapshot signature algorithm {algorithm:?} is not supported"
-        )));
-    }
-    if !verify_payload_signature(signature_public_key, payload, signature)? {
-        return Err(GlobAclError::InvalidData(
-            "snapshot signature verification failed".to_owned(),
-        ));
-    }
-    Ok(())
+    verify_payload_signature_with_verifier(signature_verifier, payload, signature_body)
 }
 
 fn signature_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sig", path.display()))
+}
+
+fn signature_verifier_from_env() -> Result<SignatureVerifier> {
+    let min_key_version = env::var("GLOBACL_SIGNATURE_MIN_KEY_VERSION")
+        .ok()
+        .map(|value| parse_arg_u64(&value, "GLOBACL_SIGNATURE_MIN_KEY_VERSION"))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut keys = Vec::new();
+    if let Some(public_keys) = env_text_or_file(
+        "GLOBACL_SIGNATURE_PUBLIC_KEYS",
+        "GLOBACL_SIGNATURE_PUBLIC_KEYS_FILE",
+    )? {
+        keys.extend(parse_signature_public_keys(&public_keys)?);
+    }
+
+    let explicit_public_key = env_text_or_file(
+        "GLOBACL_SIGNATURE_PUBLIC_KEY",
+        "GLOBACL_SIGNATURE_PUBLIC_KEY_FILE",
+    )?;
+    if keys.is_empty() || explicit_public_key.is_some() {
+        let key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
+            .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
+        let key_version = env::var("GLOBACL_SIGNATURE_KEY_VERSION")
+            .ok()
+            .map(|value| parse_arg_u64(&value, "GLOBACL_SIGNATURE_KEY_VERSION"))
+            .transpose()?
+            .unwrap_or(DEFAULT_SIGNATURE_KEY_VERSION);
+        let public_key =
+            explicit_public_key.unwrap_or_else(|| DEFAULT_SIGNATURE_PUBLIC_KEY.to_owned());
+        if keys.iter().any(|key| key.key_id == key_id) {
+            return Err(GlobAclError::InvalidData(format!(
+                "duplicate signature key_id {key_id:?} in keyring and single-key configuration"
+            )));
+        }
+        keys.push(SignatureVerificationKey::new(
+            key_id,
+            key_version,
+            public_key.trim().to_owned(),
+        ));
+    }
+
+    SignatureVerifier::new(keys, min_key_version)
+}
+
+fn env_text_or_file(value_env: &str, file_env: &str) -> Result<Option<String>> {
+    if let Ok(value) = env::var(value_env) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    if let Ok(path) = env::var(file_env) {
+        if !path.trim().is_empty() {
+            return Ok(Some(fs::read_to_string(path.trim())?));
+        }
+    }
+    Ok(None)
 }
 
 fn current_state(app: &App) -> Arc<ActiveState> {

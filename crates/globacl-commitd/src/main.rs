@@ -1,15 +1,14 @@
 use globacl_core::{
     append_mutation_to_log, decode_mutation, decode_mutation_stream, decode_snapshot,
     deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
-    encode_snapshot_manifest, format_commit_outcome, format_decision, format_payload_signature,
-    format_watermarks, http_get, http_post, immutable_snapshot_object_name,
-    is_safe_snapshot_object_name, load_all_logs, nats_jetstream_ensure_stream,
-    nats_jetstream_publish, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
-    read_http_request, rule_requires_blast_radius_override, snapshot_artifact_sha256_hex,
-    write_delta_bundle_file, write_http_response, Action, ApplyStatus, DeliveryPriority,
-    DenyRequest, GlobAclError, Mutation, PropagationAck, Result, RuleRequest, Snapshot,
-    SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
-    DEFAULT_SIGNATURE_PRIVATE_KEY,
+    encode_snapshot_manifest, format_commit_outcome, format_decision, format_watermarks, http_get,
+    http_post, immutable_snapshot_object_name, is_safe_snapshot_object_name, load_all_logs,
+    nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix, parse_form_lines,
+    parse_query_path, parse_watermarks, read_http_request, rule_requires_blast_radius_override,
+    snapshot_artifact_sha256_hex, write_delta_bundle_file, write_http_response, Action,
+    ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError, Mutation, PropagationAck, Result,
+    RuleRequest, SignatureSigner, Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -35,8 +34,7 @@ struct App {
     audit_path: PathBuf,
     publisher_offsets_path: PathBuf,
     propagation_acks_path: PathBuf,
-    signature_key_id: String,
-    signature_private_key: String,
+    signature_signer: SignatureSigner,
     latest_canary: Mutex<Option<CanaryStatus>>,
     replication: ReplicationConfig,
     consensus: Mutex<ConsensusState>,
@@ -169,10 +167,7 @@ fn main() -> Result<()> {
     let audit_path = data_dir.join("audit.log");
     let publisher_offsets_path = data_dir.join("publisher_offsets.state");
     let propagation_acks_path = data_dir.join("propagation_acks.log");
-    let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-    let signature_private_key = env::var("GLOBACL_SIGNATURE_PRIVATE_KEY")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
+    let signature_signer = signature_signer_from_env()?;
     let replication = replication_config(bind_addr)?;
     let publisher = publisher_config()?;
     if let Some(publisher) = &publisher {
@@ -188,19 +183,13 @@ fn main() -> Result<()> {
     let mutations = load_all_logs(&log_dir, shard_count)?;
     let state = SourceOfTruth::from_mutations(shard_count, &replication.cluster_id, mutations)?;
     let startup_snapshot = state.snapshot();
-    write_signed_snapshot_file(
-        &snapshot_path,
-        &startup_snapshot,
-        &signature_key_id,
-        &signature_private_key,
-    )?;
+    write_signed_snapshot_file(&snapshot_path, &startup_snapshot, &signature_signer)?;
     write_snapshot_manifest_publication(
         &snapshot_object_dir,
         &snapshot_manifest_dir,
         &snapshot_manifest_path,
         &startup_snapshot,
-        &signature_key_id,
-        &signature_private_key,
+        &signature_signer,
     )?;
 
     let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
@@ -219,8 +208,7 @@ fn main() -> Result<()> {
         audit_path,
         publisher_offsets_path,
         propagation_acks_path,
-        signature_key_id,
-        signature_private_key,
+        signature_signer,
         latest_canary: Mutex::new(None),
         replication,
         consensus: Mutex::new(consensus),
@@ -522,12 +510,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let body = match fs::read(signature_path(&app.snapshot_path)) {
                 Ok(body) => body,
                 Err(_) => match fs::read(&app.snapshot_path) {
-                    Ok(bytes) => format_payload_signature(
-                        &app.signature_key_id,
-                        &app.signature_private_key,
-                        &bytes,
-                    )?
-                    .into_bytes(),
+                    Ok(bytes) => app.signature_signer.sign_payload(&bytes)?.into_bytes(),
                     Err(_) => Vec::new(),
                 },
             };
@@ -737,7 +720,7 @@ fn delta_bundle_for_query(
 }
 
 fn sign_payload(app: &App, payload: &[u8]) -> Result<String> {
-    format_payload_signature(&app.signature_key_id, &app.signature_private_key, payload)
+    app.signature_signer.sign_payload(payload)
 }
 
 fn ensure_latest_snapshot_manifest(app: &App) -> Result<()> {
@@ -971,24 +954,14 @@ fn persist_mutation(app: &App, mutation: &Mutation) -> Result<()> {
 }
 
 fn persist_latest_snapshot(app: &App, snapshot: &Snapshot) -> Result<()> {
-    write_signed_snapshot_file(
-        &app.snapshot_path,
-        snapshot,
-        &app.signature_key_id,
-        &app.signature_private_key,
-    )?;
+    write_signed_snapshot_file(&app.snapshot_path, snapshot, &app.signature_signer)?;
     persist_snapshot_manifest(app, snapshot)?;
     Ok(())
 }
 
 fn persist_archived_snapshot(app: &App, snapshot: &Snapshot, name: &str) -> Result<()> {
     let path = app.snapshot_dir.join(format!("{name}.gacl"));
-    write_signed_snapshot_file(
-        path,
-        snapshot,
-        &app.signature_key_id,
-        &app.signature_private_key,
-    )?;
+    write_signed_snapshot_file(path, snapshot, &app.signature_signer)?;
     persist_snapshot_manifest(app, snapshot)?;
     Ok(())
 }
@@ -996,11 +969,10 @@ fn persist_archived_snapshot(app: &App, snapshot: &Snapshot, name: &str) -> Resu
 fn write_signed_snapshot_file(
     path: impl AsRef<Path>,
     snapshot: &Snapshot,
-    key_id: &str,
-    private_key: &str,
+    signer: &SignatureSigner,
 ) -> Result<()> {
     let payload = encode_snapshot(snapshot);
-    write_signed_payload_file(path, &payload, key_id, private_key)
+    write_signed_payload_file(path, &payload, signer)
 }
 
 fn persist_snapshot_manifest(app: &App, snapshot: &Snapshot) -> Result<SnapshotManifest> {
@@ -1009,8 +981,7 @@ fn persist_snapshot_manifest(app: &App, snapshot: &Snapshot) -> Result<SnapshotM
         &app.snapshot_manifest_dir,
         &app.snapshot_manifest_path,
         snapshot,
-        &app.signature_key_id,
-        &app.signature_private_key,
+        &app.signature_signer,
     )
 }
 
@@ -1019,14 +990,13 @@ fn write_snapshot_manifest_publication(
     manifest_dir: &Path,
     latest_manifest_path: &Path,
     snapshot: &Snapshot,
-    key_id: &str,
-    private_key: &str,
+    signer: &SignatureSigner,
 ) -> Result<SnapshotManifest> {
     let payload = encode_snapshot(snapshot);
     let artifact_sha256 = snapshot_artifact_sha256_hex(&payload);
     let artifact_object = immutable_snapshot_object_name(snapshot, &artifact_sha256);
     let artifact_path = object_dir.join(&artifact_object);
-    write_signed_payload_file(&artifact_path, &payload, key_id, private_key)?;
+    write_signed_payload_file(&artifact_path, &payload, signer)?;
 
     let manifest = SnapshotManifest::for_snapshot(
         snapshot,
@@ -1042,24 +1012,18 @@ fn write_snapshot_manifest_publication(
         manifest.max_seq,
         &manifest.artifact_sha256[..16]
     ));
-    write_signed_payload_file(
-        &immutable_manifest_path,
-        &manifest_payload,
-        key_id,
-        private_key,
-    )?;
-    write_signed_payload_file(latest_manifest_path, &manifest_payload, key_id, private_key)?;
+    write_signed_payload_file(&immutable_manifest_path, &manifest_payload, signer)?;
+    write_signed_payload_file(latest_manifest_path, &manifest_payload, signer)?;
     Ok(manifest)
 }
 
 fn write_signed_payload_file(
     path: impl AsRef<Path>,
     payload: &[u8],
-    key_id: &str,
-    private_key: &str,
+    signer: &SignatureSigner,
 ) -> Result<()> {
     write_payload_file(&path, payload)?;
-    let signature = format_payload_signature(key_id, private_key, payload)?;
+    let signature = signer.sign_payload(payload)?;
     let sig_path = signature_path(path.as_ref());
     write_payload_file(sig_path, signature.as_bytes())
 }
@@ -1943,6 +1907,44 @@ fn current_leader_addr(app: &App) -> Result<Option<String>> {
             .peer_addr(&node_id)
             .map(|addr| addr.to_owned())
     }))
+}
+
+fn signature_signer_from_env() -> Result<SignatureSigner> {
+    let key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
+    let key_version = env::var("GLOBACL_SIGNATURE_KEY_VERSION")
+        .ok()
+        .map(|value| parse_env_u64(&value, "GLOBACL_SIGNATURE_KEY_VERSION"))
+        .transpose()?
+        .unwrap_or(DEFAULT_SIGNATURE_KEY_VERSION);
+    if let Ok(command) = env::var("GLOBACL_SIGNATURE_SIGN_COMMAND")
+        .or_else(|_| env::var("GLOBACL_SIGNATURE_SIGNER_COMMAND"))
+    {
+        if !command.trim().is_empty() {
+            return SignatureSigner::external_command(key_id, key_version, command);
+        }
+    }
+
+    let private_key = env_text_or_file(
+        "GLOBACL_SIGNATURE_PRIVATE_KEY",
+        "GLOBACL_SIGNATURE_PRIVATE_KEY_FILE",
+    )?
+    .unwrap_or_else(|| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
+    SignatureSigner::ed25519_private_key(key_id, key_version, private_key.trim().to_owned())
+}
+
+fn env_text_or_file(value_env: &str, file_env: &str) -> Result<Option<String>> {
+    if let Ok(value) = env::var(value_env) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    if let Ok(path) = env::var(file_env) {
+        if !path.trim().is_empty() {
+            return Ok(Some(fs::read_to_string(path.trim())?));
+        }
+    }
+    Ok(None)
 }
 
 fn publisher_config() -> Result<Option<PublisherConfig>> {

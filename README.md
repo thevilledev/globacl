@@ -31,7 +31,7 @@ The relay can run in the default HTTP pull-proxy mode or in NATS JetStream mode.
 
 The propagation path also records per-agent acknowledgements, forwards them into a central propagation status view, writes per-mutation delta bundles for repair, tags updates as P0/P1/P2 delivery priority, and supports synthetic canaries for measuring propagation.
 
-The control plane includes production-oriented safety hooks around that path: broad-deny blast-radius gates, an append-only audit log, Ed25519 signatures for snapshots and update payloads, archived snapshot artifacts, forward-only rollback via new mutations, bounded request bodies, and stale-agent health reporting.
+The control plane includes production-oriented safety hooks around that path: broad-deny blast-radius gates, an append-only audit log, versioned Ed25519 signatures with verifier keyrings, archived snapshot artifacts, forward-only rollback via new mutations, bounded request bodies, and stale-agent health reporting.
 
 ## Architecture
 

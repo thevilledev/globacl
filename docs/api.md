@@ -248,10 +248,15 @@ The manifest is a signed, object-store-compatible pointer to an immutable snapsh
 ```text
 algorithm=ed25519
 key_id=dev-ed25519
+key_version=1
 signature=<hex-encoded 64-byte signature>
 ```
 
-Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_PRIVATE_KEY` on commitd and JetStream-backed relays. Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_PUBLIC_KEY` on agents. The demo manifests use a public RFC 8032 test key; production deployments should use managed key material and rotate key IDs deliberately.
+Set `GLOBACL_SIGNATURE_KEY_ID`, `GLOBACL_SIGNATURE_KEY_VERSION`, and `GLOBACL_SIGNATURE_PRIVATE_KEY` on commitd and JetStream-backed relays. `GLOBACL_SIGNATURE_PRIVATE_KEY_FILE` can point to key material on disk, or `GLOBACL_SIGNATURE_SIGN_COMMAND` can point to an external signer that reads the payload from stdin and writes a hex Ed25519 signature to stdout.
+
+Agents accept either a single key through `GLOBACL_SIGNATURE_KEY_ID`, `GLOBACL_SIGNATURE_KEY_VERSION`, and `GLOBACL_SIGNATURE_PUBLIC_KEY`, or a keyring through `GLOBACL_SIGNATURE_PUBLIC_KEYS` / `GLOBACL_SIGNATURE_PUBLIC_KEYS_FILE`. Keyring entries use `key_id:key_version:public_key_hex`. Set `GLOBACL_SIGNATURE_MIN_KEY_VERSION` to reject older signed payloads during rotation.
+
+The demo manifests use a public RFC 8032 test key; production deployments should use managed key material and rotate key IDs deliberately.
 
 List available rollback targets:
 

@@ -12,11 +12,14 @@ Optional Ed25519 signing keys can be set on commitd, relays, and agents:
 
 ```sh
 export GLOBACL_SIGNATURE_KEY_ID=dev-ed25519
+export GLOBACL_SIGNATURE_KEY_VERSION=1
 export GLOBACL_SIGNATURE_PRIVATE_KEY=9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
 export GLOBACL_SIGNATURE_PUBLIC_KEY=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
 
 `globacl-commitd` and JetStream-backed relays need the private key to sign payloads. `globacl-agent` needs only the public key to verify payloads.
+
+For rotation tests, agents can trust multiple public keys with `GLOBACL_SIGNATURE_PUBLIC_KEYS='dev-ed25519:1:<public_key>,next-ed25519:2:<public_key>'` and reject old payloads with `GLOBACL_SIGNATURE_MIN_KEY_VERSION=2`. Commitd and JetStream relays can read private keys from `GLOBACL_SIGNATURE_PRIVATE_KEY_FILE` or call an external signer through `GLOBACL_SIGNATURE_SIGN_COMMAND`.
 
 Start the public control API gateway:
 
