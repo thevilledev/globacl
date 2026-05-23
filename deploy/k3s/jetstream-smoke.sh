@@ -6,16 +6,22 @@ CLUSTER="${CLUSTER:-globacl-jetstream}"
 IMAGE="${IMAGE:-globacl:ci}"
 NAMESPACE="${NAMESPACE:-globacl}"
 CONTROL_PORT="${CONTROL_PORT:-17100}"
+RELAY_PORT="${RELAY_PORT:-17101}"
 DEMO_PORT="${DEMO_PORT:-18180}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 
 CONTROL_PF_PID=""
+RELAY_PF_PID=""
 DEMO_PF_PID=""
 
 cleanup() {
   if [[ -n "${CONTROL_PF_PID}" ]]; then
     kill "${CONTROL_PF_PID}" 2>/dev/null || true
     wait "${CONTROL_PF_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${RELAY_PF_PID}" ]]; then
+    kill "${RELAY_PF_PID}" 2>/dev/null || true
+    wait "${RELAY_PF_PID}" 2>/dev/null || true
   fi
   if [[ -n "${DEMO_PF_PID}" ]]; then
     kill "${DEMO_PF_PID}" 2>/dev/null || true
@@ -85,9 +91,18 @@ k -n "${NAMESPACE}" port-forward svc/globacl-control "${CONTROL_PORT}:7000" >/tm
 CONTROL_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${CONTROL_PORT}/health"
 
+k -n "${NAMESPACE}" port-forward svc/globacl-relay "${RELAY_PORT}:7001" >/tmp/globacl-jetstream-relay-pf.log 2>&1 &
+RELAY_PF_PID="$!"
+wait_for_http "http://127.0.0.1:${RELAY_PORT}/health"
+
 k -n "${NAMESPACE}" port-forward svc/globacl-demo "${DEMO_PORT}:8080" >/tmp/globacl-jetstream-demo-pf.log 2>&1 &
 DEMO_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
+
+relay_health="$(curl -fsS "http://127.0.0.1:${RELAY_PORT}/health")"
+grep -q "source_lag_max=" <<<"${relay_health}"
+grep -q "consumer_num_pending=" <<<"${relay_health}"
+grep -q "consumer_num_ack_pending=" <<<"${relay_health}"
 
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/v1/deny" \
   --data-binary $'op_id=ci-jetstream-user\ntenant_id=tenant-a\nnamespace=user\nkey=user-js-ci\naction=deny\ndelivery_priority=p0\nreason_code=ci_jetstream_smoke\ncreated_by=ci\n' >/tmp/globacl-jetstream-commit.out

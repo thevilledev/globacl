@@ -1,10 +1,10 @@
 use globacl_core::{
     decode_mutation, decode_mutation_stream, decode_snapshot, encode_mutation_stream,
     format_payload_signature, format_watermarks, http_get, http_post, nats_ack,
-    nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream, nats_jetstream_pull, now_unix,
-    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, write_http_response,
-    DeliveryPriority, GlobAclError, HttpResponse, Mutation, PopAck, Result, DEFAULT_SHARD_COUNT,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
+    nats_jetstream_consumer_info, nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream,
+    nats_jetstream_pull, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
+    read_http_request, write_http_response, DeliveryPriority, GlobAclError, HttpResponse, Mutation,
+    PopAck, Result, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
 };
 use std::collections::HashMap;
 use std::env;
@@ -63,6 +63,13 @@ struct JetStreamStatus {
     duplicate_messages: u64,
     gap_repairs: u64,
     errors: u64,
+    source_lag_max: u64,
+    source_lag_sum: u64,
+    lagging_shards: usize,
+    consumer_num_pending: u64,
+    consumer_num_ack_pending: u64,
+    consumer_num_redelivered: u64,
+    consumer_num_waiting: u64,
 }
 
 fn main() -> Result<()> {
@@ -258,6 +265,13 @@ impl JetStreamSource {
                 duplicate_messages: 0,
                 gap_repairs: 0,
                 errors: 0,
+                source_lag_max: 0,
+                source_lag_sum: 0,
+                lagging_shards: 0,
+                consumer_num_pending: 0,
+                consumer_num_ack_pending: 0,
+                consumer_num_redelivered: 0,
+                consumer_num_waiting: 0,
             }),
         })
     }
@@ -285,6 +299,9 @@ impl JetStreamSource {
         }
         if count > 0 {
             lock_jetstream_status(self)?.last_pull_unix = now_unix();
+        }
+        if let Err(err) = self.refresh_source_lag() {
+            eprintln!("JetStream source lag refresh failed: {err}");
         }
         Ok(count)
     }
@@ -366,6 +383,47 @@ impl JetStreamSource {
             .into_bytes(),
         }
     }
+
+    fn refresh_source_lag(&self) -> Result<()> {
+        let response = http_get(&self.bootstrap_addr, "/v1/watermarks")?;
+        if response.status_code != 200 {
+            return Err(GlobAclError::InvalidData(format!(
+                "bootstrap returned status {} for watermarks",
+                response.status_code
+            )));
+        }
+        let source_watermarks = parse_watermarks(&response.body)?;
+        let cache = lock_cache(self)?;
+        let mut source_lag_max = 0u64;
+        let mut source_lag_sum = 0u64;
+        let mut lagging_shards = 0usize;
+        for (shard_id, source_seq) in source_watermarks.iter().copied().enumerate() {
+            let local_seq = cache.watermarks.get(shard_id).copied().unwrap_or(0);
+            let lag = source_seq.saturating_sub(local_seq);
+            if lag > 0 {
+                lagging_shards += 1;
+                source_lag_sum = source_lag_sum.saturating_add(lag);
+                source_lag_max = source_lag_max.max(lag);
+            }
+        }
+        drop(cache);
+
+        let mut status = lock_jetstream_status(self)?;
+        status.source_lag_max = source_lag_max;
+        status.source_lag_sum = source_lag_sum;
+        status.lagging_shards = lagging_shards;
+        Ok(())
+    }
+
+    fn refresh_consumer_lag(&self) -> Result<()> {
+        let info = nats_jetstream_consumer_info(&self.nats_addr, &self.stream, &self.durable)?;
+        let mut status = lock_jetstream_status(self)?;
+        status.consumer_num_pending = info.num_pending;
+        status.consumer_num_ack_pending = info.num_ack_pending;
+        status.consumer_num_redelivered = info.num_redelivered;
+        status.consumer_num_waiting = info.num_waiting;
+        Ok(())
+    }
 }
 
 impl RelaySource for JetStreamSource {
@@ -378,17 +436,35 @@ impl RelaySource for JetStreamSource {
     }
 
     fn health(&self) -> Result<SourceHealth> {
+        if let Err(err) = self.refresh_source_lag() {
+            eprintln!("JetStream source lag refresh failed: {err}");
+        }
+        if let Err(err) = self.refresh_consumer_lag() {
+            eprintln!("JetStream consumer lag refresh failed: {err}");
+        }
         let status = lock_jetstream_status(self)?.clone();
         let bootstrap_status = http_get(&self.bootstrap_addr, "/health")
             .map(|response| response.status_code)
             .unwrap_or(503);
+        let cache = lock_cache(self)?;
+        let max_cached_seq = cache.watermarks.iter().copied().max().unwrap_or(0);
+        let cached_mutations = cache.mutations.iter().map(Vec::len).sum::<usize>();
+        let shard_count = cache.watermarks.len();
+        drop(cache);
         Ok(SourceHealth {
             ok: status.errors == 0 || status.last_pull_unix > 0,
             details: format!(
-                "nats_addr={}\nstream={}\nconsumer={}\nbootstrap_status={bootstrap_status}\nlast_pull_unix={}\napplied_messages={}\nduplicate_messages={}\ngap_repairs={}\njetstream_errors={}\n",
+                "nats_addr={}\nstream={}\nconsumer={}\nbootstrap_status={bootstrap_status}\nshard_count={shard_count}\nmax_cached_seq={max_cached_seq}\ncached_mutations={cached_mutations}\nsource_lag_max={}\nsource_lag_sum={}\nlagging_shards={}\nconsumer_num_pending={}\nconsumer_num_ack_pending={}\nconsumer_num_redelivered={}\nconsumer_num_waiting={}\nlast_pull_unix={}\napplied_messages={}\nduplicate_messages={}\ngap_repairs={}\njetstream_errors={}\n",
                 self.nats_addr,
                 self.stream,
                 self.durable,
+                status.source_lag_max,
+                status.source_lag_sum,
+                status.lagging_shards,
+                status.consumer_num_pending,
+                status.consumer_num_ack_pending,
+                status.consumer_num_redelivered,
+                status.consumer_num_waiting,
                 status.last_pull_unix,
                 status.applied_messages,
                 status.duplicate_messages,

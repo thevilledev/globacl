@@ -27,6 +27,7 @@ struct App {
     snapshot_dir: PathBuf,
     snapshot_path: PathBuf,
     audit_path: PathBuf,
+    publisher_offsets_path: PathBuf,
     signature_key_id: String,
     signature_secret: String,
     latest_canary: Mutex<Option<CanaryStatus>>,
@@ -155,6 +156,7 @@ fn main() -> Result<()> {
     let snapshot_dir = data_dir.join("snapshots");
     let snapshot_path = snapshot_dir.join("latest.gacl");
     let audit_path = data_dir.join("audit.log");
+    let publisher_offsets_path = data_dir.join("publisher_offsets.state");
     let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
         .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
     let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
@@ -180,6 +182,7 @@ fn main() -> Result<()> {
         &signature_secret,
     )?;
 
+    let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
     let app = Arc::new(App {
         state: Mutex::new(state),
         log_dir,
@@ -189,6 +192,7 @@ fn main() -> Result<()> {
         snapshot_dir,
         snapshot_path,
         audit_path,
+        publisher_offsets_path,
         signature_key_id,
         signature_secret,
         latest_canary: Mutex::new(None),
@@ -200,7 +204,7 @@ fn main() -> Result<()> {
         }),
         publisher,
         publisher_status: Mutex::new(PublisherStatus {
-            last_published: vec![0; shard_count as usize],
+            last_published,
             last_publish_unix: 0,
             publish_errors: 0,
         }),
@@ -272,8 +276,14 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let consensus = lock_consensus(&app)?.clone();
             let sync_status = lock_sync_status(&app)?.clone();
             let publisher_status = lock_publisher_status(&app)?.clone();
+            let max_published_seq = publisher_status
+                .last_published
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
             let body = format!(
-                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
+                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nmax_published_seq={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
                 consensus.role.as_str(),
                 app.replication.node_id,
                 app.replication.cluster_id,
@@ -287,6 +297,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.entries_len(),
                 state.mutations_len(),
                 app.publisher.is_some(),
+                max_published_seq,
                 publisher_status.last_publish_unix,
                 publisher_status.publish_errors,
                 sync_status.last_peer_sync_unix,
@@ -1337,6 +1348,7 @@ fn publish_committed_mutations(app: &App) -> Result<()> {
     }
 
     let mut status = lock_publisher_status(app)?;
+    persist_publisher_offsets(&app.publisher_offsets_path, &next_published)?;
     status.last_published = next_published;
     status.last_publish_unix = now_unix();
     Ok(())
@@ -1349,6 +1361,43 @@ fn mutation_subject(prefix: &str, mutation: &Mutation) -> String {
         mutation.delivery_priority.as_str(),
         mutation.commit_id.shard_id
     )
+}
+
+fn load_publisher_offsets(path: &Path, shard_count: u16) -> Result<Vec<u64>> {
+    let mut offsets = vec![0; shard_count as usize];
+    if !path.exists() {
+        return Ok(offsets);
+    }
+    let bytes = fs::read(path)?;
+    let form = parse_form_lines(&bytes)?;
+    for (shard_id, offset) in offsets.iter_mut().enumerate() {
+        let key = format!("shard_{shard_id:04}");
+        if let Some(value) = form.get(&key) {
+            *offset = parse_query_u64(value, &key)?;
+        }
+    }
+    Ok(offsets)
+}
+
+fn persist_publisher_offsets(path: &Path, offsets: &[u64]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        writeln!(file, "shard_count={}", offsets.len())?;
+        for (shard_id, seq) in offsets.iter().enumerate() {
+            writeln!(file, "shard_{shard_id:04}={seq}")?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn canary_loop(app: Arc<App>, interval: Duration) {
@@ -1783,4 +1832,31 @@ fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) -> boo
     form.get(key)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publisher_offsets_round_trip() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-offsets-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let path = root.join("publisher_offsets.state");
+        let offsets = vec![1, 0, 42, u64::MAX - 1];
+
+        persist_publisher_offsets(&path, &offsets).expect("persist offsets");
+
+        let loaded = load_publisher_offsets(&path, offsets.len() as u16).expect("load offsets");
+        assert_eq!(loaded, offsets);
+
+        let expanded = load_publisher_offsets(&path, 6).expect("load expanded offsets");
+        assert_eq!(&expanded[..4], offsets.as_slice());
+        assert_eq!(&expanded[4..], &[0, 0]);
+
+        std::fs::remove_dir_all(root).expect("remove temp offset dir");
+    }
 }

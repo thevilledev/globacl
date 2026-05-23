@@ -95,3 +95,5 @@ This workspace intentionally has no third-party crate dependencies yet, so it ca
 - [API](docs/api.md)
 - [Deployment](docs/deployment.md)
 - [Testing](docs/testing.md)
+- [Architecture gaps](docs/architecture-gaps.md)
+- [Research sources](docs/research.md)

@@ -2102,6 +2102,14 @@ pub struct NatsMessage {
     pub status: Option<u16>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JetStreamConsumerInfo {
+    pub num_pending: u64,
+    pub num_ack_pending: u64,
+    pub num_redelivered: u64,
+    pub num_waiting: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PopAck {
     pub agent_id: String,
@@ -2337,6 +2345,32 @@ pub fn nats_jetstream_ensure_consumer(
         }
     }
     Ok(())
+}
+
+pub fn nats_jetstream_consumer_info(
+    addr: &str,
+    stream: &str,
+    durable: &str,
+) -> Result<JetStreamConsumerInfo> {
+    let info_subject = format!("$JS.API.CONSUMER.INFO.{stream}.{durable}");
+    let messages = nats_request(addr, &info_subject, b"", 1, 5_000)?;
+    let message = messages.first().ok_or_else(|| {
+        GlobAclError::InvalidData(format!(
+            "JetStream consumer info returned no response: {stream}.{durable}"
+        ))
+    })?;
+    if json_payload_has_error(&message.payload) {
+        return Err(GlobAclError::InvalidData(format!(
+            "JetStream consumer info failed: {}",
+            String::from_utf8_lossy(&message.payload)
+        )));
+    }
+    Ok(JetStreamConsumerInfo {
+        num_pending: json_u64_field(&message.payload, "num_pending").unwrap_or(0),
+        num_ack_pending: json_u64_field(&message.payload, "num_ack_pending").unwrap_or(0),
+        num_redelivered: json_u64_field(&message.payload, "num_redelivered").unwrap_or(0),
+        num_waiting: json_u64_field(&message.payload, "num_waiting").unwrap_or(0),
+    })
 }
 
 pub fn nats_jetstream_pull(
@@ -2738,6 +2772,23 @@ fn parse_nats_header_status(headers: &[u8]) -> Option<u16> {
 
 fn json_payload_has_error(payload: &[u8]) -> bool {
     String::from_utf8_lossy(payload).contains("\"error\"")
+}
+
+fn json_u64_field(payload: &[u8], field: &str) -> Option<u64> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let needle = format!("\"{field}\"");
+    let start = text.find(&needle)? + needle.len();
+    let rest = text[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let digit_count = rest
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        return None;
+    }
+    rest[..digit_count].parse::<u64>().ok()
 }
 
 fn json_escape(value: &str) -> String {
@@ -3472,6 +3523,17 @@ mod tests {
         assert_eq!(ack.shard_id, 7);
         assert_eq!(ack.seq, 42);
         assert!(ack.to_form_body().contains("agent_id=pop-a"));
+    }
+
+    #[test]
+    fn json_u64_field_parses_jetstream_counters() {
+        let payload = br#"{"type":"io.nats.jetstream.api.v1.consumer_info_response","num_ack_pending":2,"num_pending":17,"num_redelivered":1,"num_waiting":0}"#;
+
+        assert_eq!(json_u64_field(payload, "num_pending"), Some(17));
+        assert_eq!(json_u64_field(payload, "num_ack_pending"), Some(2));
+        assert_eq!(json_u64_field(payload, "num_redelivered"), Some(1));
+        assert_eq!(json_u64_field(payload, "num_waiting"), Some(0));
+        assert_eq!(json_u64_field(payload, "missing"), None);
     }
 
     #[test]
