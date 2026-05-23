@@ -57,6 +57,23 @@ wait_for_http() {
   return 1
 }
 
+wait_for_propagation_ack() {
+  local expected_agents="$1"
+  local status
+  local agent_count
+  for _ in $(seq 1 120); do
+    status="$(curl -sS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/propagation/status")"
+    agent_count="$(awk -F= '$1 == "agent_count" {print $2}' <<<"${status}")"
+    if [[ "${agent_count:-0}" -ge "${expected_agents}" ]] && grep -q "max_seq_lag=0" <<<"${status}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for central propagation ack" >&2
+  curl -sS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/propagation/status" >&2 || true
+  return 1
+}
+
 render_region() {
   local region="$1"
   sed \
@@ -69,6 +86,7 @@ require_cmd docker
 require_cmd k3d
 require_cmd kubectl
 require_cmd curl
+require_cmd awk
 
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
@@ -137,4 +155,5 @@ for region in "${REGIONS[@]}"; do
   index="$((index + 1))"
 done
 
+wait_for_propagation_ack "${#REGIONS[@]}"
 echo "global smoke passed"

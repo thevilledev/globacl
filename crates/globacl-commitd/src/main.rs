@@ -6,9 +6,10 @@ use globacl_core::{
     parse_form_lines, parse_query_path, parse_watermarks, read_http_request,
     rule_requires_blast_radius_override, write_delta_bundle_file, write_http_response,
     write_snapshot_file, Action, ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError,
-    Mutation, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
+    Mutation, PropagationAck, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
     DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
 };
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -28,6 +29,7 @@ struct App {
     snapshot_path: PathBuf,
     audit_path: PathBuf,
     publisher_offsets_path: PathBuf,
+    propagation_acks_path: PathBuf,
     signature_key_id: String,
     signature_secret: String,
     latest_canary: Mutex<Option<CanaryStatus>>,
@@ -36,6 +38,7 @@ struct App {
     sync_status: Mutex<SyncStatus>,
     publisher: Option<PublisherConfig>,
     publisher_status: Mutex<PublisherStatus>,
+    propagation_acks: Mutex<HashMap<String, PropagationAck>>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +160,7 @@ fn main() -> Result<()> {
     let snapshot_path = snapshot_dir.join("latest.gacl");
     let audit_path = data_dir.join("audit.log");
     let publisher_offsets_path = data_dir.join("publisher_offsets.state");
+    let propagation_acks_path = data_dir.join("propagation_acks.log");
     let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
         .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
     let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
@@ -183,6 +187,7 @@ fn main() -> Result<()> {
     )?;
 
     let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
+    let propagation_acks = load_propagation_acks(&propagation_acks_path)?;
     let app = Arc::new(App {
         state: Mutex::new(state),
         log_dir,
@@ -193,6 +198,7 @@ fn main() -> Result<()> {
         snapshot_path,
         audit_path,
         publisher_offsets_path,
+        propagation_acks_path,
         signature_key_id,
         signature_secret,
         latest_canary: Mutex::new(None),
@@ -208,6 +214,7 @@ fn main() -> Result<()> {
             last_publish_unix: 0,
             publish_errors: 0,
         }),
+        propagation_acks: Mutex::new(propagation_acks),
     });
 
     if canary_interval_secs > 0 {
@@ -276,6 +283,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let consensus = lock_consensus(&app)?.clone();
             let sync_status = lock_sync_status(&app)?.clone();
             let publisher_status = lock_publisher_status(&app)?.clone();
+            let central_ack_count = lock_propagation_acks(&app)?.len();
             let max_published_seq = publisher_status
                 .last_published
                 .iter()
@@ -283,7 +291,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 .max()
                 .unwrap_or(0);
             let body = format!(
-                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nmax_published_seq={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
+                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nmax_published_seq={}\ncentral_ack_count={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
                 consensus.role.as_str(),
                 app.replication.node_id,
                 app.replication.cluster_id,
@@ -298,12 +306,27 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.mutations_len(),
                 app.publisher.is_some(),
                 max_published_seq,
+                central_ack_count,
                 publisher_status.last_publish_unix,
                 publisher_status.publish_errors,
                 sync_status.last_peer_sync_unix,
                 sync_status.sync_errors
             );
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
+        ("GET", "/v1/propagation/status") => {
+            if app.replication.is_clustered() && !is_write_leader(&app)? {
+                proxy_get_to_leader(&mut stream, &app, &request.path)?;
+                return Ok(());
+            }
+            let body = format_propagation_status(&app)?;
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
+        ("POST", "/v1/ack") => {
+            let form = parse_form_lines(&request.body)?;
+            let ack = PropagationAck::from_form(&form)?;
+            record_propagation_ack(&app, ack)?;
+            write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
         }
         ("POST", "/internal/raft/request_vote") => {
             let form = parse_form_lines(&request.body)?;
@@ -1400,6 +1423,200 @@ fn persist_publisher_offsets(path: &Path, offsets: &[u64]) -> Result<()> {
     Ok(())
 }
 
+fn record_propagation_ack(app: &App, ack: PropagationAck) -> Result<()> {
+    let key = ack.key();
+    let mut acks = lock_propagation_acks(app)?;
+    if acks
+        .get(&key)
+        .map(|existing| existing.seq > ack.seq)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    append_propagation_ack(&app.propagation_acks_path, &ack)?;
+    acks.insert(key, ack);
+    Ok(())
+}
+
+fn load_propagation_acks(path: &Path) -> Result<HashMap<String, PropagationAck>> {
+    let mut acks = HashMap::new();
+    if !path.exists() {
+        return Ok(acks);
+    }
+    let text = String::from_utf8(fs::read(path)?)
+        .map_err(|err| GlobAclError::Parse(format!("ack log is not utf8: {err}")))?;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let ack = parse_propagation_ack_log_line(line)?;
+        let key = ack.key();
+        if acks
+            .get(&key)
+            .map(|existing| existing.seq <= ack.seq)
+            .unwrap_or(true)
+        {
+            acks.insert(key, ack);
+        }
+    }
+    Ok(acks)
+}
+
+fn append_propagation_ack(path: &Path, ack: &PropagationAck) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(
+        file,
+        "relay_id={}\tlocation={}\tagent_id={}\tshard_id={}\tseq={}\tentries={}\tapplied_at_unix={}\trelay_received_at_unix={}",
+        encode_ack_field(&ack.relay_id),
+        encode_ack_field(&ack.location),
+        encode_ack_field(&ack.agent_id),
+        ack.shard_id,
+        ack.seq,
+        ack.entries,
+        ack.applied_at_unix,
+        ack.relay_received_at_unix
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn parse_propagation_ack_log_line(line: &str) -> Result<PropagationAck> {
+    let mut form = HashMap::new();
+    for part in line.split('\t') {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| GlobAclError::Parse(format!("invalid ack log field {part:?}")))?;
+        form.insert(key.to_owned(), decode_ack_field(value)?);
+    }
+    PropagationAck::from_form(&form)
+}
+
+fn format_propagation_status(app: &App) -> Result<String> {
+    let watermarks = {
+        let state = lock_state(app)?;
+        state.watermarks().to_vec()
+    };
+    let now = now_unix();
+    let mut acks = lock_propagation_acks(app)?
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    acks.sort_by(|left, right| {
+        left.relay_id
+            .cmp(&right.relay_id)
+            .then(left.agent_id.cmp(&right.agent_id))
+            .then(left.shard_id.cmp(&right.shard_id))
+    });
+
+    let source_max_seq = watermarks.iter().copied().max().unwrap_or(0);
+    let ack_count = acks.len();
+    let relay_count = acks
+        .iter()
+        .map(|ack| ack.relay_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let agent_count = acks
+        .iter()
+        .map(|ack| ack.agent_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let acked_shards = acks
+        .iter()
+        .map(|ack| ack.shard_id)
+        .collect::<HashSet<_>>()
+        .len();
+    let min_ack_seq = acks.iter().map(|ack| ack.seq).min().unwrap_or(0);
+    let max_ack_seq = acks.iter().map(|ack| ack.seq).max().unwrap_or(0);
+    let mut max_seq_lag = 0u64;
+    let mut lagging_ack_count = 0usize;
+    let mut max_ack_age_secs = 0u64;
+    for ack in &acks {
+        let source_seq = watermarks
+            .get(ack.shard_id as usize)
+            .copied()
+            .unwrap_or_default();
+        let seq_lag = source_seq.saturating_sub(ack.seq);
+        if seq_lag > 0 {
+            lagging_ack_count += 1;
+            max_seq_lag = max_seq_lag.max(seq_lag);
+        }
+        max_ack_age_secs = max_ack_age_secs.max(now.saturating_sub(ack.applied_at_unix));
+    }
+    let status = if source_max_seq > 0 && (ack_count == 0 || lagging_ack_count > 0) {
+        "degraded"
+    } else {
+        "ok"
+    };
+
+    let mut body = format!(
+        "status={status}\nshard_count={}\nsource_max_seq={source_max_seq}\nack_count={ack_count}\nrelay_count={relay_count}\nagent_count={agent_count}\nacked_shards={acked_shards}\nmin_ack_seq={min_ack_seq}\nmax_ack_seq={max_ack_seq}\nmax_seq_lag={max_seq_lag}\nlagging_ack_count={lagging_ack_count}\nmax_ack_age_secs={max_ack_age_secs}\n",
+        watermarks.len()
+    );
+    for ack in acks {
+        let source_seq = watermarks
+            .get(ack.shard_id as usize)
+            .copied()
+            .unwrap_or_default();
+        let seq_lag = source_seq.saturating_sub(ack.seq);
+        let ack_age_secs = now.saturating_sub(ack.applied_at_unix);
+        body.push_str(&format!(
+            "ack relay_id={} location={} agent_id={} shard_id={} seq={} source_seq={} seq_lag={} entries={} applied_at_unix={} relay_received_at_unix={} ack_age_secs={}\n",
+            ack.relay_id,
+            ack.location,
+            ack.agent_id,
+            ack.shard_id,
+            ack.seq,
+            source_seq,
+            seq_lag,
+            ack.entries,
+            ack.applied_at_unix,
+            ack.relay_received_at_unix,
+            ack_age_secs
+        ));
+    }
+    Ok(body)
+}
+
+fn encode_ack_field(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+fn decode_ack_field(value: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or_else(|| GlobAclError::Parse("dangling ack field escape".to_owned()))?;
+        match escaped {
+            '\\' => out.push('\\'),
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            other => {
+                return Err(GlobAclError::Parse(format!(
+                    "unknown ack field escape \\{other}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn canary_loop(app: Arc<App>, interval: Duration) {
     loop {
         if let Err(err) = commit_canary(&app) {
@@ -1480,6 +1697,14 @@ fn lock_publisher_status(app: &App) -> Result<std::sync::MutexGuard<'_, Publishe
         .map_err(|_| GlobAclError::InvalidData("publisher status lock poisoned".to_owned()))
 }
 
+fn lock_propagation_acks(
+    app: &App,
+) -> Result<std::sync::MutexGuard<'_, HashMap<String, PropagationAck>>> {
+    app.propagation_acks
+        .lock()
+        .map_err(|_| GlobAclError::InvalidData("propagation ack lock poisoned".to_owned()))
+}
+
 fn requires_leader(method: &str, route: &str) -> bool {
     method == "POST"
         && matches!(
@@ -1490,7 +1715,29 @@ fn requires_leader(method: &str, route: &str) -> bool {
                 | "/v1/canary"
                 | "/v1/snapshot"
                 | "/v1/rollback"
+                | "/v1/ack"
         )
+}
+
+fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, path: &str) -> Result<()> {
+    let Some(leader_addr) = current_leader_addr(app)? else {
+        write_http_response(
+            stream,
+            503,
+            "text/plain",
+            b"status=unavailable\nreason=leader_not_configured\n",
+        )?;
+        return Ok(());
+    };
+    match http_get(&leader_addr, path) {
+        Ok(response) => {
+            write_http_response(stream, response.status_code, "text/plain", &response.body)
+        }
+        Err(err) => {
+            let body = format!("status=unavailable\nreason=leader_proxy_failed\nerror={err}\n");
+            write_http_response(stream, 503, "text/plain", body.as_bytes())
+        }
+    }
 }
 
 fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, path: &str, body: &[u8]) -> Result<()> {
@@ -1858,5 +2105,41 @@ mod tests {
         assert_eq!(&expanded[4..], &[0, 0]);
 
         std::fs::remove_dir_all(root).expect("remove temp offset dir");
+    }
+
+    #[test]
+    fn propagation_ack_log_replays_latest_ack() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-acks-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let path = root.join("propagation_acks.log");
+        let first = PropagationAck {
+            relay_id: "relay-a".to_owned(),
+            location: "region-a".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            shard_id: 7,
+            seq: 41,
+            entries: 10,
+            applied_at_unix: 1000,
+            relay_received_at_unix: 1001,
+        };
+        let second = PropagationAck {
+            seq: 42,
+            entries: 11,
+            applied_at_unix: 1002,
+            relay_received_at_unix: 1003,
+            ..first.clone()
+        };
+
+        append_propagation_ack(&path, &first).expect("append first ack");
+        append_propagation_ack(&path, &second).expect("append second ack");
+
+        let loaded = load_propagation_acks(&path).expect("load propagation acks");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&second.key()).expect("ack").seq, 42);
+
+        std::fs::remove_dir_all(root).expect("remove temp ack dir");
     }
 }

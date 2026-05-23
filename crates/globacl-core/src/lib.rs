@@ -2153,6 +2153,88 @@ impl PopAck {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropagationAck {
+    pub relay_id: String,
+    pub location: String,
+    pub agent_id: String,
+    pub shard_id: u16,
+    pub seq: u64,
+    pub entries: usize,
+    pub applied_at_unix: u64,
+    pub relay_received_at_unix: u64,
+}
+
+impl PropagationAck {
+    pub fn from_pop_ack(
+        relay_id: &str,
+        location: &str,
+        ack: PopAck,
+        relay_received_at_unix: u64,
+    ) -> Self {
+        Self {
+            relay_id: relay_id.to_owned(),
+            location: location.to_owned(),
+            agent_id: ack.agent_id,
+            shard_id: ack.shard_id,
+            seq: ack.seq,
+            entries: ack.entries,
+            applied_at_unix: ack.applied_at_unix,
+            relay_received_at_unix,
+        }
+    }
+
+    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            relay_id: required(form, "relay_id")?,
+            location: required(form, "location")?,
+            agent_id: required(form, "agent_id")?,
+            shard_id: parse_u16(
+                form.get("shard_id")
+                    .or_else(|| form.get("shard"))
+                    .map(String::as_str),
+                "shard_id",
+            )?,
+            seq: parse_u64(
+                form.get("seq")
+                    .or_else(|| form.get("watermark"))
+                    .map(String::as_str),
+                0,
+                "seq",
+            )?,
+            entries: parse_usize(form.get("entries").map(String::as_str), 0, "entries")?,
+            applied_at_unix: parse_u64(
+                form.get("applied_at_unix").map(String::as_str),
+                now_unix(),
+                "applied_at_unix",
+            )?,
+            relay_received_at_unix: parse_u64(
+                form.get("relay_received_at_unix").map(String::as_str),
+                now_unix(),
+                "relay_received_at_unix",
+            )?,
+        })
+    }
+
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.relay_id, self.agent_id, self.shard_id)
+    }
+
+    pub fn to_form_body(&self) -> String {
+        format!(
+            "relay_id={}\nlocation={}\nagent_id={}\nshard_id={}\nseq={}\nentries={}\napplied_at_unix={}\nrelay_received_at_unix={}\n",
+            self.relay_id,
+            self.location,
+            self.agent_id,
+            self.shard_id,
+            self.seq,
+            self.entries,
+            self.applied_at_unix,
+            self.relay_received_at_unix
+        )
+    }
+}
+
 pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut buffer = Vec::new();
@@ -3523,6 +3605,23 @@ mod tests {
         assert_eq!(ack.shard_id, 7);
         assert_eq!(ack.seq, 42);
         assert!(ack.to_form_body().contains("agent_id=pop-a"));
+    }
+
+    #[test]
+    fn propagation_ack_parses_and_formats() {
+        let form = parse_form_lines(
+            b"relay_id=relay-a\nlocation=region-a\nagent_id=pop-a\nshard_id=7\nseq=42\nentries=12\napplied_at_unix=1000\nrelay_received_at_unix=1001\n",
+        )
+        .unwrap();
+        let ack = PropagationAck::from_form(&form).unwrap();
+
+        assert_eq!(ack.relay_id, "relay-a");
+        assert_eq!(ack.location, "region-a");
+        assert_eq!(ack.agent_id, "pop-a");
+        assert_eq!(ack.shard_id, 7);
+        assert_eq!(ack.seq, 42);
+        assert_eq!(ack.key(), "relay-a:pop-a:7");
+        assert!(ack.to_form_body().contains("relay_id=relay-a"));
     }
 
     #[test]

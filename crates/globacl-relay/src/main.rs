@@ -4,7 +4,8 @@ use globacl_core::{
     nats_jetstream_consumer_info, nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream,
     nats_jetstream_pull, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
     read_http_request, write_http_response, DeliveryPriority, GlobAclError, HttpResponse, Mutation,
-    PopAck, Result, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
+    PopAck, PropagationAck, Result, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
+    DEFAULT_SIGNATURE_SECRET,
 };
 use std::collections::HashMap;
 use std::env;
@@ -17,12 +18,19 @@ struct App {
     source: Arc<dyn RelaySource>,
     relay_id: String,
     location: String,
-    acks: Mutex<HashMap<String, PopAck>>,
+    acks: Mutex<HashMap<String, PropagationAck>>,
+    ack_forward_status: Mutex<AckForwardStatus>,
 }
 
 struct SourceHealth {
     ok: bool,
     details: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AckForwardStatus {
+    last_ack_forward_unix: u64,
+    ack_forward_errors: u64,
 }
 
 trait RelaySource: Send + Sync {
@@ -90,7 +98,18 @@ fn main() -> Result<()> {
         relay_id,
         location,
         acks: Mutex::new(HashMap::new()),
+        ack_forward_status: Mutex::new(AckForwardStatus::default()),
     });
+
+    {
+        let app = Arc::clone(&app);
+        let interval_ms = env::var("GLOBACL_ACK_FORWARD_MS")
+            .ok()
+            .map(|value| parse_env_u64(&value, "GLOBACL_ACK_FORWARD_MS"))
+            .transpose()?
+            .unwrap_or(5_000);
+        thread::spawn(move || ack_forward_loop(app, Duration::from_millis(interval_ms)));
+    }
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
@@ -143,14 +162,17 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         "GET" if request.path == "/health" => {
             let health = app.source.health()?;
             let ack_count = lock_acks(&app)?.len();
+            let ack_forward_status = lock_ack_forward_status(&app)?.clone();
             let status = if health.ok { "ok" } else { "degraded" };
             let upstream = if health.ok { "ok" } else { "bad" };
             let body = format!(
-                "status={status}\nrole=relay\nrelay_id={}\nlocation={}\nsource={}\nupstream={upstream}\nupstream_addr={}\nack_count={ack_count}\n{}\n",
+                "status={status}\nrole=relay\nrelay_id={}\nlocation={}\nsource={}\nupstream={upstream}\nupstream_addr={}\nack_count={ack_count}\nlast_ack_forward_unix={}\nack_forward_errors={}\n{}\n",
                 app.relay_id,
                 app.location,
                 app.source.kind(),
                 app.source.upstream_addr(),
+                ack_forward_status.last_ack_forward_unix,
+                ack_forward_status.ack_forward_errors,
                 health.details.trim_end()
             );
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
@@ -161,9 +183,12 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         "POST" if request.path == "/v1/ack" => {
             let form = parse_form_lines(&request.body)?;
-            let ack = PopAck::from_form(&form)?;
-            let key = format!("{}:{}", ack.agent_id, ack.shard_id);
-            lock_acks(&app)?.insert(key, ack);
+            let ack = propagation_ack_from_form(&app, &form)?;
+            lock_acks(&app)?.insert(ack.key(), ack.clone());
+            if let Err(err) = forward_ack(&app, &ack) {
+                eprintln!("central ack forward failed: {err}");
+                lock_ack_forward_status(&app)?.ack_forward_errors += 1;
+            }
             write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
         }
         "GET" => {
@@ -621,6 +646,56 @@ fn jetstream_pull_loop(source: Arc<JetStreamSource>) {
     }
 }
 
+fn ack_forward_loop(app: Arc<App>, interval: Duration) {
+    loop {
+        if let Err(err) = forward_all_acks(&app) {
+            eprintln!("central ack forward loop failed: {err}");
+            if let Ok(mut status) = lock_ack_forward_status(&app) {
+                status.ack_forward_errors += 1;
+            }
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn forward_all_acks(app: &App) -> Result<()> {
+    let acks = lock_acks(app)?.values().cloned().collect::<Vec<_>>();
+    for ack in acks {
+        forward_ack(app, &ack)?;
+    }
+    Ok(())
+}
+
+fn forward_ack(app: &App, ack: &PropagationAck) -> Result<()> {
+    let response = http_post(
+        app.source.upstream_addr(),
+        "/v1/ack",
+        ack.to_form_body().as_bytes(),
+    )?;
+    if response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "upstream returned status {} for propagation ack",
+            response.status_code
+        )));
+    }
+    let mut status = lock_ack_forward_status(app)?;
+    status.last_ack_forward_unix = now_unix();
+    Ok(())
+}
+
+fn propagation_ack_from_form(app: &App, form: &HashMap<String, String>) -> Result<PropagationAck> {
+    if form.contains_key("relay_id") {
+        return PropagationAck::from_form(form);
+    }
+    let ack = PopAck::from_form(form)?;
+    Ok(PropagationAck::from_pop_ack(
+        &app.relay_id,
+        &app.location,
+        ack,
+        now_unix(),
+    ))
+}
+
 fn bootstrap_cache(bootstrap_addr: &str) -> Result<RelayCache> {
     let snapshot_response = http_get(bootstrap_addr, "/v1/snapshot");
     if let Ok(response) = snapshot_response {
@@ -658,10 +733,16 @@ fn content_type_for(path: &str) -> &'static str {
     }
 }
 
-fn lock_acks(app: &App) -> Result<std::sync::MutexGuard<'_, HashMap<String, PopAck>>> {
+fn lock_acks(app: &App) -> Result<std::sync::MutexGuard<'_, HashMap<String, PropagationAck>>> {
     app.acks
         .lock()
         .map_err(|_| GlobAclError::InvalidData("ack lock poisoned".to_owned()))
+}
+
+fn lock_ack_forward_status(app: &App) -> Result<std::sync::MutexGuard<'_, AckForwardStatus>> {
+    app.ack_forward_status
+        .lock()
+        .map_err(|_| GlobAclError::InvalidData("ack forward status lock poisoned".to_owned()))
 }
 
 fn lock_cache(source: &JetStreamSource) -> Result<std::sync::MutexGuard<'_, RelayCache>> {
@@ -698,8 +779,16 @@ fn format_acks(app: &App) -> Result<String> {
     for ack in acks {
         let lag_secs = now.saturating_sub(ack.applied_at_unix);
         body.push_str(&format!(
-            "ack agent_id={} shard_id={} seq={} entries={} applied_at_unix={} lag_secs={}\n",
-            ack.agent_id, ack.shard_id, ack.seq, ack.entries, ack.applied_at_unix, lag_secs
+            "ack relay_id={} location={} agent_id={} shard_id={} seq={} entries={} applied_at_unix={} relay_received_at_unix={} lag_secs={}\n",
+            ack.relay_id,
+            ack.location,
+            ack.agent_id,
+            ack.shard_id,
+            ack.seq,
+            ack.entries,
+            ack.applied_at_unix,
+            ack.relay_received_at_unix,
+            lag_secs
         ));
     }
     Ok(body)
@@ -724,6 +813,12 @@ fn parse_query_u64(value: &str, field: &str) -> Result<u64> {
 fn parse_env_usize(value: &str, field: &str) -> Result<usize> {
     value
         .parse::<usize>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
+}
+
+fn parse_env_u64(value: &str, field: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
         .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
 }
 

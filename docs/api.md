@@ -187,6 +187,29 @@ applied_at_unix=1760000000
 
 Relays expose the current in-memory ack table at `GET /v1/acks`.
 
+Relays also enrich those acks with relay metadata and forward them upstream. The control plane stores the latest ack per `{relay_id, agent_id, shard_id}` in commitd's durable ack log.
+
+```text
+GET /v1/propagation/status
+```
+
+The central status endpoint returns aggregate propagation coverage:
+
+```text
+status=ok
+shard_count=64
+source_max_seq=42
+ack_count=3
+relay_count=3
+agent_count=3
+acked_shards=1
+max_seq_lag=0
+lagging_ack_count=0
+ack relay_id=relay-region-a location=region-a agent_id=agent-region-a shard_id=7 seq=42 source_seq=42 seq_lag=0 ...
+```
+
+In clustered commitd deployments, ack writes and propagation-status reads are routed to the current commit leader.
+
 ## Delta Bundles
 
 Commitd writes per-mutation delta bundle files under its data directory and also serves bundle ranges through the control gateway:
