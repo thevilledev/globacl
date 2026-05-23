@@ -28,6 +28,13 @@ name = "globacl-core"
 version = "0.1.0"
 
 [[package]]
+name = "globacl-demo-app"
+version = "0.1.0"
+dependencies = [
+ "globacl-core",
+]
+
+[[package]]
 name = "globacl-relay"
 version = "0.1.0"
 dependencies = [

@@ -49,6 +49,16 @@ GET  /v1/acks
 
 Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
+The demo consumer app exposes:
+
+```text
+GET /health
+GET /access?tenant_id=...&namespace=...&key=...
+GET /check?tenant_id=...&namespace=ip&value=...
+```
+
+It calls the local agent and maps deny decisions to `HTTP 403` with `access=denied`.
+
 ## Rule Authoring
 
 `POST /v1/rule` compiles non-point policies into specialized edge indices.

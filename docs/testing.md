@@ -40,6 +40,15 @@ The core tests cover:
 
 For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, verify `/v1/audit`, list `/v1/snapshots`, then commit a delete and confirm the agent returns `decision=allow`.
 
+Run k3d-backed k3s smoke tests:
+
+```sh
+./deploy/k3s/local-smoke.sh
+./deploy/k3s/global-smoke.sh
+```
+
+The local smoke deploys one control, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys central control in one k3s cluster plus three regional k3s clusters with HA relays and demo apps.
+
 Rollback smoke test:
 
 ```text

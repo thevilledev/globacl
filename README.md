@@ -26,6 +26,52 @@ The propagation path also records per-agent acknowledgements, writes per-mutatio
 
 The control plane now includes production-hardening hooks around that path: broad-deny blast-radius gates, an append-only audit log, keyed integrity seals for snapshots and update payloads, archived snapshot artifacts, forward-only rollback via new mutations, bounded request bodies, and stale-agent health reporting.
 
+## Architecture
+
+```text
+                 +---------------------+
+                 | ACL Authoring/API   |
+                 | validation + audit  |
+                 +----------+----------+
+                            |
+                            | linearizable commit
+                            v
+                 +---------------------+
+                 | Source of Truth     |
+                 | Raft/etcd/FDB/      |
+                 | Spanner-like DB     |
+                 +----------+----------+
+                            |
+                            | append-only per-shard log
+                            v
+                 +---------------------+
+                 | Regional Log Bus    |
+                 | Kafka/Pulsar/NATS   |
+                 +----------+----------+
+                            |
+              +-------------+-------------+
+              |                           |
+              v                           v
+      +---------------+           +---------------+
+      | Region Relay  |           | Region Relay  |
+      +-------+-------+           +-------+-------+
+              | location-aware tree       |
+              v                           v
+      +---------------+           +---------------+
+      | PoP Relay     |           | PoP Relay     |
+      +-------+-------+           +-------+-------+
+              | local fanout              |
+              v                           v
+      +-------------------------------------------+
+      | Edge ACL Engine                           |
+      | immutable base + mutable delta overlay    |
+      | lock-free/RCU lookup                      |
+      +-------------------------------------------+
+
+ CDN/object store:
+   immutable snapshots, delta bundles, manifests, repair path
+```
+
 ## Components
 
 This workspace intentionally has no third-party crate dependencies yet, so it can build in restricted environments.
@@ -36,10 +82,12 @@ This workspace intentionally has no third-party crate dependencies yet, so it ca
 | `globacl-control` | ACL authoring and source of truth | Accepts deny/rule writes, assigns shard sequences, persists mutation logs, writes snapshot archives, applies blast-radius checks, records audit entries, and performs rollback through forward mutations. |
 | `globacl-relay` | Distribution fanout layer | Proxies mutations, watermarks, snapshots, and delta bundles from an upstream control/relay; records PoP acknowledgements; can be chained into a relay tree. |
 | `globacl-agent` | PoP edge updater and lookup service | Boots from snapshots, verifies integrity seals, polls/apply deltas, repairs gaps, sends acks, checks canaries, reports stale health, and serves local lookups. |
+| `globacl-demo-app` | Example consumer service | Calls the local agent for request-time ACL decisions and returns `access=allowed` or `access=denied`. |
 | `globacl-bench` | Local benchmark tool | Measures edge-state build time, positive lookups, negative lookups, and memory estimates without external dependencies. |
 
 ## Docs
 
 - [Getting started](docs/getting-started.md)
 - [API](docs/api.md)
+- [Deployment](docs/deployment.md)
 - [Testing](docs/testing.md)

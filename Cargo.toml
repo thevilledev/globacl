@@ -4,6 +4,7 @@ members = [
     "crates/globacl-bench",
     "crates/globacl-control",
     "crates/globacl-core",
+    "crates/globacl-demo-app",
     "crates/globacl-relay",
 ]
 resolver = "2"

@@ -1,0 +1,52 @@
+name: k3s smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Smoke suite to run
+        required: true
+        default: local
+        type: choice
+        options:
+          - local
+          - global
+          - all
+
+permissions:
+  contents: read
+
+jobs:
+  local:
+    if: ${{ inputs.suite == 'local' || inputs.suite == 'all' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      - name: Run local k3s smoke
+        run: ./deploy/k3s/local-smoke.sh
+
+  global:
+    if: ${{ inputs.suite == 'global' || inputs.suite == 'all' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+      - name: Run global k3s smoke
+        run: ./deploy/k3s/global-smoke.sh

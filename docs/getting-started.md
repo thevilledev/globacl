@@ -31,6 +31,14 @@ cargo run -p globacl-agent -- 127.0.0.1:7001 127.0.0.1:7002 data/agent/latest.ga
 
 The final argument is `stale_after_secs`; the agent reports `status=stale` if it cannot successfully poll the relay within that window.
 
+Start the demo consumer app:
+
+```sh
+cargo run -p globacl-demo-app -- 127.0.0.1:7002 127.0.0.1:8080
+```
+
+The demo app calls the local agent on every request. It does not call control.
+
 Commit a deny mutation:
 
 ```sh
@@ -42,6 +50,12 @@ Query the agent:
 
 ```sh
 curl -sS 'http://127.0.0.1:7002/v1/lookup?tenant_id=tenant-a&namespace=user&key=user-123'
+```
+
+Query through the demo app:
+
+```sh
+curl -sS 'http://127.0.0.1:8080/access?tenant_id=tenant-a&namespace=user&key=user-123'
 ```
 
 Commit an IPv4 CIDR rule:
