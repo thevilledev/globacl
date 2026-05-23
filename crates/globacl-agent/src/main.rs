@@ -1,9 +1,9 @@
 use globacl_core::{
-    decode_mutation_stream, decode_snapshot, encode_snapshot, format_decision, http_get, now_unix,
-    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, read_snapshot_file,
-    verify_payload_signature, write_http_response, write_snapshot_file, ActiveState,
-    ActiveStateHandle, Decision, GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID,
-    DEFAULT_SIGNATURE_PUBLIC_KEY,
+    decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, encode_snapshot,
+    format_decision, http_get, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
+    read_http_request, read_snapshot_file, verify_payload_signature, write_http_response,
+    write_snapshot_file, ActiveState, ActiveStateHandle, Decision, GlobAclError, PopAck, Result,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -464,6 +464,13 @@ fn fetch_snapshot(
     signature_key_id: &str,
     signature_public_key: &str,
 ) -> Result<globacl_core::Snapshot> {
+    match fetch_snapshot_from_manifest(relay_addr, signature_key_id, signature_public_key) {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(err) => {
+            eprintln!("snapshot manifest fetch failed, falling back to legacy snapshot: {err}")
+        }
+    }
+
     let response = http_get(relay_addr, "/v1/snapshot")?;
     if response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(
@@ -479,6 +486,52 @@ fn fetch_snapshot(
         signature_public_key,
     )?;
     decode_snapshot(&response.body)
+}
+
+fn fetch_snapshot_from_manifest(
+    relay_addr: &str,
+    signature_key_id: &str,
+    signature_public_key: &str,
+) -> Result<globacl_core::Snapshot> {
+    let manifest_response = http_get(relay_addr, "/v1/snapshot_manifest")?;
+    if manifest_response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "relay returned status {} for snapshot manifest",
+            manifest_response.status_code
+        )));
+    }
+    verify_required_remote_payload_signature(
+        relay_addr,
+        "/v1/snapshot_manifest.sig",
+        &manifest_response.body,
+        signature_key_id,
+        signature_public_key,
+    )?;
+    let manifest = decode_snapshot_manifest(&manifest_response.body)?;
+
+    let artifact_path = format!("/v1/snapshot_artifact?object={}", manifest.artifact_object);
+    let artifact_response = http_get(relay_addr, &artifact_path)?;
+    if artifact_response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "relay returned status {} for snapshot artifact {}",
+            artifact_response.status_code, manifest.artifact_object
+        )));
+    }
+    let artifact_signature_path = format!(
+        "/v1/snapshot_artifact.sig?object={}",
+        manifest.artifact_object
+    );
+    verify_required_remote_payload_signature(
+        relay_addr,
+        &artifact_signature_path,
+        &artifact_response.body,
+        signature_key_id,
+        signature_public_key,
+    )?;
+    manifest.validate_artifact(&artifact_response.body)?;
+    let snapshot = decode_snapshot(&artifact_response.body)?;
+    manifest.validate_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 fn verify_local_snapshot(
@@ -505,6 +558,27 @@ fn verify_remote_payload_signature(
     let response = http_get(relay_addr, signature_path)?;
     if response.status_code != 200 || response.body.is_empty() {
         return Ok(());
+    }
+    verify_snapshot_signature(
+        payload,
+        &response.body,
+        signature_key_id,
+        signature_public_key,
+    )
+}
+
+fn verify_required_remote_payload_signature(
+    relay_addr: &str,
+    signature_path: &str,
+    payload: &[u8],
+    signature_key_id: &str,
+    signature_public_key: &str,
+) -> Result<()> {
+    let response = http_get(relay_addr, signature_path)?;
+    if response.status_code != 200 || response.body.is_empty() {
+        return Err(GlobAclError::InvalidData(format!(
+            "required signature missing at {signature_path}"
+        )));
     }
     verify_snapshot_signature(
         payload,

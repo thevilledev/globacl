@@ -1,13 +1,15 @@
 use globacl_core::{
     append_mutation_to_log, decode_mutation, decode_mutation_stream, decode_snapshot,
     deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
-    format_commit_outcome, format_decision, format_payload_signature, format_watermarks, http_get,
-    http_post, load_all_logs, nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix,
-    parse_form_lines, parse_query_path, parse_watermarks, read_http_request,
-    rule_requires_blast_radius_override, write_delta_bundle_file, write_http_response,
-    write_snapshot_file, Action, ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError,
-    Mutation, PropagationAck, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PRIVATE_KEY,
+    encode_snapshot_manifest, format_commit_outcome, format_decision, format_payload_signature,
+    format_watermarks, http_get, http_post, immutable_snapshot_object_name,
+    is_safe_snapshot_object_name, load_all_logs, nats_jetstream_ensure_stream,
+    nats_jetstream_publish, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
+    read_http_request, rule_requires_blast_radius_override, snapshot_artifact_sha256_hex,
+    write_delta_bundle_file, write_http_response, Action, ApplyStatus, DeliveryPriority,
+    DenyRequest, GlobAclError, Mutation, PropagationAck, Result, RuleRequest, Snapshot,
+    SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
+    DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -26,7 +28,10 @@ struct App {
     pending_dir: PathBuf,
     bundle_dir: PathBuf,
     snapshot_dir: PathBuf,
+    snapshot_object_dir: PathBuf,
+    snapshot_manifest_dir: PathBuf,
     snapshot_path: PathBuf,
+    snapshot_manifest_path: PathBuf,
     audit_path: PathBuf,
     publisher_offsets_path: PathBuf,
     propagation_acks_path: PathBuf,
@@ -157,7 +162,10 @@ fn main() -> Result<()> {
     let pending_dir = data_dir.join("pending");
     let bundle_dir = data_dir.join("bundles");
     let snapshot_dir = data_dir.join("snapshots");
+    let snapshot_object_dir = snapshot_dir.join("objects");
+    let snapshot_manifest_dir = snapshot_dir.join("manifests");
     let snapshot_path = snapshot_dir.join("latest.gacl");
+    let snapshot_manifest_path = snapshot_manifest_dir.join("latest.manifest");
     let audit_path = data_dir.join("audit.log");
     let publisher_offsets_path = data_dir.join("publisher_offsets.state");
     let propagation_acks_path = data_dir.join("propagation_acks.log");
@@ -179,9 +187,18 @@ fn main() -> Result<()> {
     let consensus = load_consensus_state(&consensus_path, &replication)?;
     let mutations = load_all_logs(&log_dir, shard_count)?;
     let state = SourceOfTruth::from_mutations(shard_count, &replication.cluster_id, mutations)?;
+    let startup_snapshot = state.snapshot();
     write_signed_snapshot_file(
         &snapshot_path,
-        &state.snapshot(),
+        &startup_snapshot,
+        &signature_key_id,
+        &signature_private_key,
+    )?;
+    write_snapshot_manifest_publication(
+        &snapshot_object_dir,
+        &snapshot_manifest_dir,
+        &snapshot_manifest_path,
+        &startup_snapshot,
         &signature_key_id,
         &signature_private_key,
     )?;
@@ -195,7 +212,10 @@ fn main() -> Result<()> {
         pending_dir,
         bundle_dir,
         snapshot_dir,
+        snapshot_object_dir,
+        snapshot_manifest_dir,
         snapshot_path,
+        snapshot_manifest_path,
         audit_path,
         publisher_offsets_path,
         propagation_acks_path,
@@ -513,6 +533,44 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             };
             write_http_response(&mut stream, 200, "text/plain", &body)?;
         }
+        ("GET", "/v1/snapshot_manifest") => {
+            ensure_latest_snapshot_manifest(&app)?;
+            let body = fs::read(&app.snapshot_manifest_path)?;
+            write_http_response(&mut stream, 200, "text/plain", &body)?;
+        }
+        ("GET", "/v1/snapshot_manifest.sig") => {
+            ensure_latest_snapshot_manifest(&app)?;
+            let body = fs::read(signature_path(&app.snapshot_manifest_path))?;
+            write_http_response(&mut stream, 200, "text/plain", &body)?;
+        }
+        ("GET", "/v1/snapshot_artifact") => {
+            let object = required_query(&query, "object")?;
+            if !is_safe_snapshot_object_name(object) {
+                write_http_response(
+                    &mut stream,
+                    400,
+                    "text/plain",
+                    b"status=rejected\nreason=invalid_snapshot_object\n",
+                )?;
+                return Ok(());
+            }
+            let body = fs::read(app.snapshot_object_dir.join(object))?;
+            write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
+        }
+        ("GET", "/v1/snapshot_artifact.sig") => {
+            let object = required_query(&query, "object")?;
+            if !is_safe_snapshot_object_name(object) {
+                write_http_response(
+                    &mut stream,
+                    400,
+                    "text/plain",
+                    b"status=rejected\nreason=invalid_snapshot_object\n",
+                )?;
+                return Ok(());
+            }
+            let body = fs::read(signature_path(app.snapshot_object_dir.join(object)))?;
+            write_http_response(&mut stream, 200, "text/plain", &body)?;
+        }
         ("GET", "/v1/snapshots") => {
             let body = format_snapshot_list(&app.snapshot_dir)?;
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
@@ -680,6 +738,17 @@ fn delta_bundle_for_query(
 
 fn sign_payload(app: &App, payload: &[u8]) -> Result<String> {
     format_payload_signature(&app.signature_key_id, &app.signature_private_key, payload)
+}
+
+fn ensure_latest_snapshot_manifest(app: &App) -> Result<()> {
+    if app.snapshot_manifest_path.exists() && signature_path(&app.snapshot_manifest_path).exists() {
+        return Ok(());
+    }
+    let snapshot = {
+        let state = lock_state(app)?;
+        state.snapshot()
+    };
+    persist_latest_snapshot(app, &snapshot)
 }
 
 fn commit_request(app: &App, deny_request: DenyRequest) -> Result<globacl_core::CommitOutcome> {
@@ -907,7 +976,9 @@ fn persist_latest_snapshot(app: &App, snapshot: &Snapshot) -> Result<()> {
         snapshot,
         &app.signature_key_id,
         &app.signature_private_key,
-    )
+    )?;
+    persist_snapshot_manifest(app, snapshot)?;
+    Ok(())
 }
 
 fn persist_archived_snapshot(app: &App, snapshot: &Snapshot, name: &str) -> Result<()> {
@@ -917,7 +988,9 @@ fn persist_archived_snapshot(app: &App, snapshot: &Snapshot, name: &str) -> Resu
         snapshot,
         &app.signature_key_id,
         &app.signature_private_key,
-    )
+    )?;
+    persist_snapshot_manifest(app, snapshot)?;
+    Ok(())
 }
 
 fn write_signed_snapshot_file(
@@ -926,14 +999,86 @@ fn write_signed_snapshot_file(
     key_id: &str,
     private_key: &str,
 ) -> Result<()> {
-    write_snapshot_file(&path, snapshot)?;
-    let payload = fs::read(path.as_ref())?;
-    let signature = format_payload_signature(key_id, private_key, &payload)?;
+    let payload = encode_snapshot(snapshot);
+    write_signed_payload_file(path, &payload, key_id, private_key)
+}
+
+fn persist_snapshot_manifest(app: &App, snapshot: &Snapshot) -> Result<SnapshotManifest> {
+    write_snapshot_manifest_publication(
+        &app.snapshot_object_dir,
+        &app.snapshot_manifest_dir,
+        &app.snapshot_manifest_path,
+        snapshot,
+        &app.signature_key_id,
+        &app.signature_private_key,
+    )
+}
+
+fn write_snapshot_manifest_publication(
+    object_dir: &Path,
+    manifest_dir: &Path,
+    latest_manifest_path: &Path,
+    snapshot: &Snapshot,
+    key_id: &str,
+    private_key: &str,
+) -> Result<SnapshotManifest> {
+    let payload = encode_snapshot(snapshot);
+    let artifact_sha256 = snapshot_artifact_sha256_hex(&payload);
+    let artifact_object = immutable_snapshot_object_name(snapshot, &artifact_sha256);
+    let artifact_path = object_dir.join(&artifact_object);
+    write_signed_payload_file(&artifact_path, &payload, key_id, private_key)?;
+
+    let manifest = SnapshotManifest::for_snapshot(
+        snapshot,
+        now_unix(),
+        artifact_object,
+        payload.len() as u64,
+        artifact_sha256,
+    );
+    let manifest_payload = encode_snapshot_manifest(&manifest);
+    let immutable_manifest_path = manifest_dir.join(format!(
+        "epoch_{:020}_seq_{:020}_sha256_{}.manifest",
+        manifest.created_at_unix,
+        manifest.max_seq,
+        &manifest.artifact_sha256[..16]
+    ));
+    write_signed_payload_file(
+        &immutable_manifest_path,
+        &manifest_payload,
+        key_id,
+        private_key,
+    )?;
+    write_signed_payload_file(latest_manifest_path, &manifest_payload, key_id, private_key)?;
+    Ok(manifest)
+}
+
+fn write_signed_payload_file(
+    path: impl AsRef<Path>,
+    payload: &[u8],
+    key_id: &str,
+    private_key: &str,
+) -> Result<()> {
+    write_payload_file(&path, payload)?;
+    let signature = format_payload_signature(key_id, private_key, payload)?;
     let sig_path = signature_path(path.as_ref());
-    if let Some(parent) = sig_path.parent() {
+    write_payload_file(sig_path, signature.as_bytes())
+}
+
+fn write_payload_file(path: impl AsRef<Path>, payload: &[u8]) -> Result<()> {
+    if let Some(parent) = path.as_ref().parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(sig_path, signature)?;
+    let tmp = path.as_ref().with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -1003,10 +1148,26 @@ fn format_snapshot_list(snapshot_dir: &Path) -> Result<String> {
             }
         }
     }
+    let mut manifests = Vec::new();
+    let manifest_dir = snapshot_dir.join("manifests");
+    if manifest_dir.exists() {
+        for entry in fs::read_dir(manifest_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".manifest") {
+                manifests.push(name);
+            }
+        }
+    }
     names.sort();
+    manifests.sort();
     let mut body = format!("snapshot_count={}\n", names.len());
     for name in names {
         body.push_str(&format!("snapshot={name}\n"));
+    }
+    body.push_str(&format!("manifest_count={}\n", manifests.len()));
+    for name in manifests {
+        body.push_str(&format!("manifest={name}\n"));
     }
     Ok(body)
 }

@@ -721,7 +721,7 @@ fn bootstrap_cache(bootstrap_addr: &str) -> Result<RelayCache> {
 }
 
 fn content_type_for(path: &str) -> &'static str {
-    if path.ends_with(".sig") {
+    if path.ends_with(".sig") || path.starts_with("/v1/snapshot_manifest") {
         "text/plain"
     } else if path.starts_with("/v1/mutations")
         || path.starts_with("/v1/snapshot")

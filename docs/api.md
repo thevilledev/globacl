@@ -38,6 +38,10 @@ GET  /v1/delta_bundle?shard=0&from_seq=0&to_seq=10
 GET  /v1/delta_bundle.sig?shard=0&from_seq=0&to_seq=10
 GET  /v1/snapshot
 GET  /v1/snapshot.sig
+GET  /v1/snapshot_manifest
+GET  /v1/snapshot_manifest.sig
+GET  /v1/snapshot_artifact?object=snapshots/max_seq_...
+GET  /v1/snapshot_artifact.sig?object=snapshots/max_seq_...
 GET  /v1/snapshots
 POST /v1/rollback
 GET  /v1/audit
@@ -229,9 +233,17 @@ data/commitd/snapshots/latest.gacl
 data/commitd/snapshots/latest.gacl.sig
 data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl
 data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl.sig
+data/commitd/snapshots/objects/snapshots/max_seq_<seq>_sha256_<hash>.gacl
+data/commitd/snapshots/objects/snapshots/max_seq_<seq>_sha256_<hash>.gacl.sig
+data/commitd/snapshots/manifests/latest.manifest
+data/commitd/snapshots/manifests/latest.manifest.sig
+data/commitd/snapshots/manifests/epoch_<time>_seq_<seq>_sha256_<hash-prefix>.manifest
+data/commitd/snapshots/manifests/epoch_<time>_seq_<seq>_sha256_<hash-prefix>.manifest.sig
 ```
 
-`GET /v1/snapshot.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return Ed25519 signature envelopes:
+The manifest is a signed, object-store-compatible pointer to an immutable snapshot artifact. It includes the artifact object name, byte length, SHA-256, schema version, entry/rule counts, and per-shard watermarks. Agents prefer the manifest/artifact path for bootstrap and snapshot repair, then fall back to `GET /v1/snapshot` for compatibility.
+
+`GET /v1/snapshot.sig`, `GET /v1/snapshot_manifest.sig`, `GET /v1/snapshot_artifact.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return Ed25519 signature envelopes:
 
 ```text
 algorithm=ed25519

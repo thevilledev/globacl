@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -15,6 +16,7 @@ pub const SNAPSHOT_MAGIC: &[u8; 4] = b"GACL";
 pub const MUTATION_MAGIC: &[u8; 4] = b"GMUT";
 pub const MUTATION_STREAM_MAGIC: &[u8; 4] = b"GLOG";
 pub const FORMAT_VERSION: u16 = 1;
+pub const SNAPSHOT_MANIFEST_VERSION: u16 = 1;
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const DEFAULT_SIGNATURE_KEY_ID: &str = "dev-ed25519";
@@ -954,6 +956,22 @@ pub struct Snapshot {
     pub rules: Vec<RuleEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotManifest {
+    pub manifest_version: u16,
+    pub format_version: u16,
+    pub created_at_unix: u64,
+    pub artifact_object: String,
+    pub artifact_signature_object: String,
+    pub artifact_bytes: u64,
+    pub artifact_sha256: String,
+    pub shard_count: u16,
+    pub entry_count: u64,
+    pub rule_count: u64,
+    pub max_seq: u64,
+    pub watermarks: Vec<u64>,
+}
+
 impl Snapshot {
     pub fn validate(&self) -> Result<()> {
         if self.watermarks.len() != self.shard_count as usize {
@@ -978,6 +996,126 @@ impl Snapshot {
                     rule.shard_id, self.shard_count
                 )));
             }
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotManifest {
+    pub fn for_snapshot(
+        snapshot: &Snapshot,
+        created_at_unix: u64,
+        artifact_object: String,
+        artifact_bytes: u64,
+        artifact_sha256: String,
+    ) -> Self {
+        let max_seq = snapshot.watermarks.iter().copied().max().unwrap_or(0);
+        Self {
+            manifest_version: SNAPSHOT_MANIFEST_VERSION,
+            format_version: FORMAT_VERSION,
+            created_at_unix,
+            artifact_signature_object: format!("{artifact_object}.sig"),
+            artifact_object,
+            artifact_bytes,
+            artifact_sha256,
+            shard_count: snapshot.shard_count,
+            entry_count: snapshot.entries.len() as u64,
+            rule_count: snapshot.rules.len() as u64,
+            max_seq,
+            watermarks: snapshot.watermarks.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.manifest_version != SNAPSHOT_MANIFEST_VERSION {
+            return Err(GlobAclError::InvalidData(format!(
+                "unsupported snapshot manifest version {}",
+                self.manifest_version
+            )));
+        }
+        if self.format_version != FORMAT_VERSION {
+            return Err(GlobAclError::InvalidData(format!(
+                "unsupported snapshot format version {}",
+                self.format_version
+            )));
+        }
+        if self.watermarks.len() != self.shard_count as usize {
+            return Err(GlobAclError::InvalidData(format!(
+                "manifest has {} watermarks for {} shards",
+                self.watermarks.len(),
+                self.shard_count
+            )));
+        }
+        if !is_safe_snapshot_object_name(&self.artifact_object) {
+            return Err(GlobAclError::InvalidData(format!(
+                "unsafe snapshot artifact object {:?}",
+                self.artifact_object
+            )));
+        }
+        if self.artifact_signature_object != format!("{}.sig", self.artifact_object) {
+            return Err(GlobAclError::InvalidData(
+                "snapshot artifact signature object does not match artifact object".to_owned(),
+            ));
+        }
+        if self.artifact_sha256.len() != 64
+            || !self
+                .artifact_sha256
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        {
+            return Err(GlobAclError::InvalidData(
+                "snapshot artifact sha256 must be 64 hex characters".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_artifact(&self, artifact: &[u8]) -> Result<()> {
+        self.validate()?;
+        if artifact.len() as u64 != self.artifact_bytes {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot artifact has {} bytes, manifest expected {}",
+                artifact.len(),
+                self.artifact_bytes
+            )));
+        }
+        let actual_sha256 = snapshot_artifact_sha256_hex(artifact);
+        if actual_sha256 != self.artifact_sha256 {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot artifact sha256 mismatch: expected {}, got {}",
+                self.artifact_sha256, actual_sha256
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        self.validate()?;
+        snapshot.validate()?;
+        if snapshot.shard_count != self.shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot shard_count {} does not match manifest {}",
+                snapshot.shard_count, self.shard_count
+            )));
+        }
+        if snapshot.entries.len() as u64 != self.entry_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot entry_count {} does not match manifest {}",
+                snapshot.entries.len(),
+                self.entry_count
+            )));
+        }
+        if snapshot.rules.len() as u64 != self.rule_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot rule_count {} does not match manifest {}",
+                snapshot.rules.len(),
+                self.rule_count
+            )));
+        }
+        if snapshot.watermarks != self.watermarks {
+            return Err(GlobAclError::InvalidData(
+                "snapshot watermarks do not match manifest".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -2175,6 +2313,96 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
         entries,
         rules,
     })
+}
+
+pub fn snapshot_artifact_sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+pub fn immutable_snapshot_object_name(snapshot: &Snapshot, artifact_sha256: &str) -> String {
+    let max_seq = snapshot.watermarks.iter().copied().max().unwrap_or(0);
+    format!(
+        "snapshots/max_seq_{max_seq:020}_sha256_{}.gacl",
+        artifact_sha256
+    )
+}
+
+pub fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(&format!("manifest_version={}\n", manifest.manifest_version));
+    out.push_str(&format!("format_version={}\n", manifest.format_version));
+    out.push_str(&format!("created_at_unix={}\n", manifest.created_at_unix));
+    out.push_str(&format!("artifact_object={}\n", manifest.artifact_object));
+    out.push_str(&format!(
+        "artifact_signature_object={}\n",
+        manifest.artifact_signature_object
+    ));
+    out.push_str(&format!("artifact_bytes={}\n", manifest.artifact_bytes));
+    out.push_str(&format!("artifact_sha256={}\n", manifest.artifact_sha256));
+    out.push_str(&format!("shard_count={}\n", manifest.shard_count));
+    out.push_str(&format!("entry_count={}\n", manifest.entry_count));
+    out.push_str(&format!("rule_count={}\n", manifest.rule_count));
+    out.push_str(&format!("max_seq={}\n", manifest.max_seq));
+    for (shard_id, seq) in manifest.watermarks.iter().enumerate() {
+        out.push_str(&format!("shard_{shard_id:04}={seq}\n"));
+    }
+    out.into_bytes()
+}
+
+pub fn decode_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest> {
+    let form = parse_form_lines(bytes)?;
+    let shard_count = parse_u16_manifest(&form, "shard_count")?;
+    let mut watermarks = Vec::with_capacity(shard_count as usize);
+    for shard_id in 0..shard_count {
+        let key = format!("shard_{shard_id:04}");
+        watermarks.push(parse_u64(form.get(&key).map(String::as_str), 0, &key)?);
+    }
+    let manifest = SnapshotManifest {
+        manifest_version: parse_u16_manifest(&form, "manifest_version")?,
+        format_version: parse_u16_manifest(&form, "format_version")?,
+        created_at_unix: parse_u64(
+            form.get("created_at_unix").map(String::as_str),
+            0,
+            "created_at_unix",
+        )?,
+        artifact_object: required(&form, "artifact_object")?,
+        artifact_signature_object: required(&form, "artifact_signature_object")?,
+        artifact_bytes: parse_u64(
+            form.get("artifact_bytes").map(String::as_str),
+            0,
+            "artifact_bytes",
+        )?,
+        artifact_sha256: required(&form, "artifact_sha256")?,
+        shard_count,
+        entry_count: parse_u64(
+            form.get("entry_count").map(String::as_str),
+            0,
+            "entry_count",
+        )?,
+        rule_count: parse_u64(form.get("rule_count").map(String::as_str), 0, "rule_count")?,
+        max_seq: parse_u64(form.get("max_seq").map(String::as_str), 0, "max_seq")?,
+        watermarks,
+    };
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+pub fn is_safe_snapshot_object_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains("//")
+        && name.ends_with(".gacl")
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+}
+
+fn parse_u16_manifest(form: &HashMap<String, String>, key: &str) -> Result<u16> {
+    let value = parse_u64(form.get(key).map(String::as_str), 0, key)?;
+    u16::try_from(value)
+        .map_err(|_| GlobAclError::Parse(format!("{key} must fit in u16, got {value}")))
 }
 
 pub fn write_snapshot_file(path: impl AsRef<Path>, snapshot: &Snapshot) -> Result<()> {
@@ -3667,6 +3895,31 @@ mod tests {
         assert!(active
             .check("tenant-a", "ip", "10.1.2.3", now_unix())
             .is_denied());
+    }
+
+    #[test]
+    fn snapshot_manifest_round_trips_and_validates_artifact() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let snapshot = source.snapshot();
+        let payload = encode_snapshot(&snapshot);
+        let sha256 = snapshot_artifact_sha256_hex(&payload);
+        let object = immutable_snapshot_object_name(&snapshot, &sha256);
+        let manifest = SnapshotManifest::for_snapshot(
+            &snapshot,
+            1234,
+            object.clone(),
+            payload.len() as u64,
+            sha256,
+        );
+
+        assert!(is_safe_snapshot_object_name(&object));
+        let decoded = decode_snapshot_manifest(&encode_snapshot_manifest(&manifest)).unwrap();
+
+        assert_eq!(decoded, manifest);
+        decoded.validate_artifact(&payload).unwrap();
+        decoded.validate_snapshot(&snapshot).unwrap();
+        assert!(decoded.validate_artifact(b"changed").is_err());
     }
 
     #[test]

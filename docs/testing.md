@@ -33,6 +33,7 @@ The core tests cover:
 - prepared commits remaining invisible until replicated application
 - exact add/delete lookup behavior
 - binary snapshot roundtrip
+- snapshot manifest roundtrip and artifact validation
 - binary mutation-stream roundtrip
 - delivery-priority roundtrip
 - gap detection for out-of-order mutation apply
