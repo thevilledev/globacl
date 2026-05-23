@@ -5,7 +5,7 @@ use globacl_core::{
     nats_jetstream_pull, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
     read_http_request, write_http_response, DeliveryPriority, GlobAclError, HttpResponse, Mutation,
     PopAck, PropagationAck, Result, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
-    DEFAULT_SIGNATURE_SECRET,
+    DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::HashMap;
 use std::env;
@@ -52,7 +52,7 @@ struct JetStreamSource {
     durable: String,
     batch: usize,
     signature_key_id: String,
-    signature_secret: String,
+    signature_private_key: String,
     cache: Mutex<RelayCache>,
     status: Mutex<JetStreamStatus>,
 }
@@ -272,8 +272,8 @@ impl JetStreamSource {
         }
         let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
             .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-        let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
-            .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
+        let signature_private_key = env::var("GLOBACL_SIGNATURE_PRIVATE_KEY")
+            .unwrap_or_else(|_| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
         let cache = bootstrap_cache(&bootstrap_addr)?;
         Ok(Self {
             bootstrap_addr,
@@ -282,7 +282,7 @@ impl JetStreamSource {
             durable,
             batch,
             signature_key_id,
-            signature_secret,
+            signature_private_key,
             cache: Mutex::new(cache),
             status: Mutex::new(JetStreamStatus {
                 last_pull_unix: 0,
@@ -396,17 +396,17 @@ impl JetStreamSource {
         cache.delta_bundle(shard_id, from_seq, to_seq)
     }
 
-    fn signed_stream_response(&self, mutations: Vec<Mutation>) -> HttpResponse {
+    fn signed_stream_response(&self, mutations: Vec<Mutation>) -> Result<HttpResponse> {
         let payload = encode_mutation_stream(&mutations);
-        HttpResponse {
+        Ok(HttpResponse {
             status_code: 200,
             body: format_payload_signature(
                 &self.signature_key_id,
-                &self.signature_secret,
+                &self.signature_private_key,
                 &payload,
-            )
+            )?
             .into_bytes(),
-        }
+        })
     }
 
     fn refresh_source_lag(&self) -> Result<()> {
@@ -521,7 +521,7 @@ impl RelaySource for JetStreamSource {
             }
             "/v1/mutations.sig" | "/v1/delta_bundle.sig" => {
                 if let Some(mutations) = self.local_mutations_for_path(path)? {
-                    Ok(self.signed_stream_response(mutations))
+                    self.signed_stream_response(mutations)
                 } else {
                     http_get(&self.bootstrap_addr, path)
                 }

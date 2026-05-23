@@ -10,8 +10,9 @@ metadata:
   namespace: globacl
 type: Opaque
 stringData:
-  key_id: dev
-  secret: globacl-dev-secret
+  key_id: dev-ed25519
+  private_key: 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+  public_key: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -42,6 +43,17 @@ spec:
             - "0.0.0.0:7001"
             - "relay-__REGION_NAME__"
             - "__REGION_NAME__"
+          env:
+            - name: GLOBACL_SIGNATURE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: key_id
+            - name: GLOBACL_SIGNATURE_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: private_key
           ports:
             - containerPort: 7001
               name: http
@@ -100,11 +112,11 @@ spec:
                 secretKeyRef:
                   name: globacl-signature
                   key: key_id
-            - name: GLOBACL_SIGNATURE_SECRET
+            - name: GLOBACL_SIGNATURE_PUBLIC_KEY
               valueFrom:
                 secretKeyRef:
                   name: globacl-signature
-                  key: secret
+                  key: public_key
           ports:
             - containerPort: 7002
               name: http

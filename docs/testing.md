@@ -37,7 +37,7 @@ The core tests cover:
 - rule delete overlays
 - broad-deny blast-radius detection
 - snapshot rollback through forward compensating mutations
-- dependency-free payload signature verification
+- Ed25519 payload signature verification
 
 For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, verify `/v1/audit`, list `/v1/snapshots`, then commit a delete and confirm the agent returns `decision=allow`.
 

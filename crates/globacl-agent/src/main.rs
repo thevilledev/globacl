@@ -2,7 +2,7 @@ use globacl_core::{
     decode_mutation_stream, decode_snapshot, encode_snapshot, format_decision, http_get, now_unix,
     parse_form_lines, parse_query_path, parse_watermarks, read_http_request, read_snapshot_file,
     verify_payload_signature, write_http_response, write_snapshot_file, ActiveState, Decision,
-    GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
+    GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +19,7 @@ struct App {
     snapshot_path: PathBuf,
     stale_after_secs: u64,
     signature_key_id: String,
-    signature_secret: String,
+    signature_public_key: String,
     state: RwLock<Arc<ActiveState>>,
     metrics: Mutex<AgentMetrics>,
 }
@@ -71,14 +71,14 @@ fn main() -> Result<()> {
         .unwrap_or(60);
     let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
         .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-    let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
+    let signature_public_key = env::var("GLOBACL_SIGNATURE_PUBLIC_KEY")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_PUBLIC_KEY.to_owned());
 
     let snapshot = load_or_fetch_snapshot(
         &relay_addr,
         &snapshot_path,
         &signature_key_id,
-        &signature_secret,
+        &signature_public_key,
     )?;
     let started_at = now_unix();
     let app = Arc::new(App {
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         snapshot_path,
         stale_after_secs,
         signature_key_id,
-        signature_secret,
+        signature_public_key,
         state: RwLock::new(Arc::new(ActiveState::from_snapshot(snapshot)?)),
         metrics: Mutex::new(AgentMetrics {
             last_sync_unix: started_at,
@@ -257,7 +257,7 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
             &signature_path,
             &response.body,
             &app.signature_key_id,
-            &app.signature_secret,
+            &app.signature_public_key,
         )?;
         let mutations = decode_mutation_stream(&response.body)?;
         if mutations.is_empty() {
@@ -337,7 +337,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
                 &signature_path,
                 &response.body,
                 &app.signature_key_id,
-                &app.signature_secret,
+                &app.signature_public_key,
             )?;
             let mutations = decode_mutation_stream(&response.body)?;
             if !mutations.is_empty() {
@@ -372,7 +372,7 @@ fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
     let snapshot = fetch_snapshot(
         &app.relay_addr,
         &app.signature_key_id,
-        &app.signature_secret,
+        &app.signature_public_key,
     )?;
     write_snapshot_file(&app.snapshot_path, &snapshot)?;
     let mut ack_targets = Vec::new();
@@ -446,13 +446,13 @@ fn load_or_fetch_snapshot(
     relay_addr: &str,
     snapshot_path: &Path,
     signature_key_id: &str,
-    signature_secret: &str,
+    signature_public_key: &str,
 ) -> Result<globacl_core::Snapshot> {
     if snapshot_path.exists() {
-        verify_local_snapshot(snapshot_path, signature_key_id, signature_secret)?;
+        verify_local_snapshot(snapshot_path, signature_key_id, signature_public_key)?;
         return read_snapshot_file(snapshot_path);
     }
-    let snapshot = fetch_snapshot(relay_addr, signature_key_id, signature_secret)?;
+    let snapshot = fetch_snapshot(relay_addr, signature_key_id, signature_public_key)?;
     write_snapshot_file(snapshot_path, &snapshot)?;
     Ok(snapshot)
 }
@@ -460,7 +460,7 @@ fn load_or_fetch_snapshot(
 fn fetch_snapshot(
     relay_addr: &str,
     signature_key_id: &str,
-    signature_secret: &str,
+    signature_public_key: &str,
 ) -> Result<globacl_core::Snapshot> {
     let response = http_get(relay_addr, "/v1/snapshot")?;
     if response.status_code != 200 {
@@ -474,7 +474,7 @@ fn fetch_snapshot(
         "/v1/snapshot.sig",
         &response.body,
         signature_key_id,
-        signature_secret,
+        signature_public_key,
     )?;
     decode_snapshot(&response.body)
 }
@@ -482,7 +482,7 @@ fn fetch_snapshot(
 fn verify_local_snapshot(
     path: &Path,
     signature_key_id: &str,
-    signature_secret: &str,
+    signature_public_key: &str,
 ) -> Result<()> {
     let sig_path = signature_path(path);
     if !sig_path.exists() {
@@ -490,7 +490,7 @@ fn verify_local_snapshot(
     }
     let payload = std::fs::read(path)?;
     let signature = std::fs::read(sig_path)?;
-    verify_snapshot_signature(&payload, &signature, signature_key_id, signature_secret)
+    verify_snapshot_signature(&payload, &signature, signature_key_id, signature_public_key)
 }
 
 fn verify_remote_payload_signature(
@@ -498,20 +498,25 @@ fn verify_remote_payload_signature(
     signature_path: &str,
     payload: &[u8],
     signature_key_id: &str,
-    signature_secret: &str,
+    signature_public_key: &str,
 ) -> Result<()> {
     let response = http_get(relay_addr, signature_path)?;
     if response.status_code != 200 || response.body.is_empty() {
         return Ok(());
     }
-    verify_snapshot_signature(payload, &response.body, signature_key_id, signature_secret)
+    verify_snapshot_signature(
+        payload,
+        &response.body,
+        signature_key_id,
+        signature_public_key,
+    )
 }
 
 fn verify_snapshot_signature(
     payload: &[u8],
     signature_body: &[u8],
     signature_key_id: &str,
-    signature_secret: &str,
+    signature_public_key: &str,
 ) -> Result<()> {
     let form = parse_form_lines(signature_body)?;
     let key_id = form
@@ -526,7 +531,15 @@ fn verify_snapshot_signature(
             "snapshot signature key_id {key_id:?} does not match expected {signature_key_id:?}"
         )));
     }
-    if !verify_payload_signature(key_id, signature_secret, payload, signature) {
+    let algorithm = form.get("algorithm").map(String::as_str).ok_or_else(|| {
+        GlobAclError::InvalidData("snapshot signature missing algorithm".to_owned())
+    })?;
+    if algorithm != globacl_core::SIGNATURE_ALGORITHM {
+        return Err(GlobAclError::InvalidData(format!(
+            "snapshot signature algorithm {algorithm:?} is not supported"
+        )));
+    }
+    if !verify_payload_signature(signature_public_key, payload, signature)? {
         return Err(GlobAclError::InvalidData(
             "snapshot signature verification failed".to_owned(),
         ));

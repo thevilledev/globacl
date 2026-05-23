@@ -191,7 +191,7 @@ logs: HTTP pull-proxy for simple deployments, NATS JetStream in this repo, or Ka
 snapshots: durable object storage
 relays: regional/PoP relay pools with autoscaling
 agents: one per node or service workload depending latency needs
-signing: replace fnv64-dev seal with Ed25519/HSM-backed signatures
+signing: Ed25519 signatures are implemented; use HSM/KMS-backed key handling and rotation for production
 ```
 
 The included commitd consensus layer is intentionally ACL-specific rather than a general KV store. It owns term/vote persistence, leader heartbeats, majority election, idempotent mutation application, durable peer replication, and follower catch-up for the committed mutation log.

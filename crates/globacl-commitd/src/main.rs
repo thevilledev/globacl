@@ -7,7 +7,7 @@ use globacl_core::{
     rule_requires_blast_radius_override, write_delta_bundle_file, write_http_response,
     write_snapshot_file, Action, ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError,
     Mutation, PropagationAck, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,7 +31,7 @@ struct App {
     publisher_offsets_path: PathBuf,
     propagation_acks_path: PathBuf,
     signature_key_id: String,
-    signature_secret: String,
+    signature_private_key: String,
     latest_canary: Mutex<Option<CanaryStatus>>,
     replication: ReplicationConfig,
     consensus: Mutex<ConsensusState>,
@@ -163,8 +163,8 @@ fn main() -> Result<()> {
     let propagation_acks_path = data_dir.join("propagation_acks.log");
     let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
         .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
-    let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
-        .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
+    let signature_private_key = env::var("GLOBACL_SIGNATURE_PRIVATE_KEY")
+        .unwrap_or_else(|_| DEFAULT_SIGNATURE_PRIVATE_KEY.to_owned());
     let replication = replication_config(bind_addr)?;
     let publisher = publisher_config()?;
     if let Some(publisher) = &publisher {
@@ -183,7 +183,7 @@ fn main() -> Result<()> {
         &snapshot_path,
         &state.snapshot(),
         &signature_key_id,
-        &signature_secret,
+        &signature_private_key,
     )?;
 
     let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
@@ -200,7 +200,7 @@ fn main() -> Result<()> {
         publisher_offsets_path,
         propagation_acks_path,
         signature_key_id,
-        signature_secret,
+        signature_private_key,
         latest_canary: Mutex::new(None),
         replication,
         consensus: Mutex::new(consensus),
@@ -467,7 +467,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         ("GET", "/v1/mutations.sig") => {
             let mutations = mutations_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
-            let body = sign_payload(&app, &payload);
+            let body = sign_payload(&app, &payload)?;
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("GET", "/v1/watermarks") => {
@@ -485,7 +485,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         ("GET", "/v1/delta_bundle.sig") => {
             let mutations = delta_bundle_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
-            let body = sign_payload(&app, &payload);
+            let body = sign_payload(&app, &payload)?;
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("GET", "/v1/snapshot") => {
@@ -499,17 +499,18 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         ("GET", "/v1/snapshot.sig") => {
-            let body = fs::read(signature_path(&app.snapshot_path)).unwrap_or_else(|_| {
-                match fs::read(&app.snapshot_path) {
+            let body = match fs::read(signature_path(&app.snapshot_path)) {
+                Ok(body) => body,
+                Err(_) => match fs::read(&app.snapshot_path) {
                     Ok(bytes) => format_payload_signature(
                         &app.signature_key_id,
-                        &app.signature_secret,
+                        &app.signature_private_key,
                         &bytes,
-                    )
+                    )?
                     .into_bytes(),
                     Err(_) => Vec::new(),
-                }
-            });
+                },
+            };
             write_http_response(&mut stream, 200, "text/plain", &body)?;
         }
         ("GET", "/v1/snapshots") => {
@@ -677,8 +678,8 @@ fn delta_bundle_for_query(
         .collect::<Vec<_>>())
 }
 
-fn sign_payload(app: &App, payload: &[u8]) -> String {
-    format_payload_signature(&app.signature_key_id, &app.signature_secret, payload)
+fn sign_payload(app: &App, payload: &[u8]) -> Result<String> {
+    format_payload_signature(&app.signature_key_id, &app.signature_private_key, payload)
 }
 
 fn commit_request(app: &App, deny_request: DenyRequest) -> Result<globacl_core::CommitOutcome> {
@@ -905,24 +906,29 @@ fn persist_latest_snapshot(app: &App, snapshot: &Snapshot) -> Result<()> {
         &app.snapshot_path,
         snapshot,
         &app.signature_key_id,
-        &app.signature_secret,
+        &app.signature_private_key,
     )
 }
 
 fn persist_archived_snapshot(app: &App, snapshot: &Snapshot, name: &str) -> Result<()> {
     let path = app.snapshot_dir.join(format!("{name}.gacl"));
-    write_signed_snapshot_file(path, snapshot, &app.signature_key_id, &app.signature_secret)
+    write_signed_snapshot_file(
+        path,
+        snapshot,
+        &app.signature_key_id,
+        &app.signature_private_key,
+    )
 }
 
 fn write_signed_snapshot_file(
     path: impl AsRef<Path>,
     snapshot: &Snapshot,
     key_id: &str,
-    secret: &str,
+    private_key: &str,
 ) -> Result<()> {
     write_snapshot_file(&path, snapshot)?;
     let payload = fs::read(path.as_ref())?;
-    let signature = format_payload_signature(key_id, secret, &payload);
+    let signature = format_payload_signature(key_id, private_key, &payload)?;
     let sig_path = signature_path(path.as_ref());
     if let Some(parent) = sig_path.parent() {
         fs::create_dir_all(parent)?;

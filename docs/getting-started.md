@@ -8,12 +8,15 @@ cargo run -p globacl-commitd -- data/commitd 127.0.0.1:7003 4096 0
 
 The final argument is the synthetic canary interval in seconds. Use `0` to disable automatic canaries, or a positive value such as `60` to inject a P0 canary every minute.
 
-Optional snapshot integrity keys can be set on commitd and agents:
+Optional Ed25519 signing keys can be set on commitd, relays, and agents:
 
 ```sh
-export GLOBACL_SIGNATURE_KEY_ID=dev
-export GLOBACL_SIGNATURE_SECRET=globacl-dev-secret
+export GLOBACL_SIGNATURE_KEY_ID=dev-ed25519
+export GLOBACL_SIGNATURE_PRIVATE_KEY=9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+export GLOBACL_SIGNATURE_PUBLIC_KEY=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
+
+`globacl-commitd` and JetStream-backed relays need the private key to sign payloads. `globacl-agent` needs only the public key to verify payloads.
 
 Start the public control API gateway:
 

@@ -1,3 +1,4 @@
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -14,8 +15,12 @@ pub const MUTATION_MAGIC: &[u8; 4] = b"GMUT";
 pub const MUTATION_STREAM_MAGIC: &[u8; 4] = b"GLOG";
 pub const FORMAT_VERSION: u16 = 1;
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
-pub const DEFAULT_SIGNATURE_KEY_ID: &str = "dev";
-pub const DEFAULT_SIGNATURE_SECRET: &str = "globacl-dev-secret";
+pub const SIGNATURE_ALGORITHM: &str = "ed25519";
+pub const DEFAULT_SIGNATURE_KEY_ID: &str = "dev-ed25519";
+pub const DEFAULT_SIGNATURE_PRIVATE_KEY: &str =
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+pub const DEFAULT_SIGNATURE_PUBLIC_KEY: &str =
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 
 pub type Result<T> = std::result::Result<T, GlobAclError>;
 
@@ -1512,34 +1517,79 @@ pub fn stable_key_hash(tenant_id: &str, namespace: &str, raw_key: &str) -> u64 {
     hash
 }
 
-pub fn payload_signature_hex(key_id: &str, secret: &str, payload: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for chunk in [key_id.as_bytes(), secret.as_bytes(), payload] {
-        for byte in chunk {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+pub fn payload_signature_hex(private_key_hex: &str, payload: &[u8]) -> Result<String> {
+    let private_key = decode_hex_array::<32>(private_key_hex, "ed25519 private key")?;
+    let signing_key = SigningKey::from_bytes(&private_key);
+    let signature: Signature = signing_key.sign(payload);
+    Ok(hex_encode(&signature.to_bytes()))
 }
 
-pub fn format_payload_signature(key_id: &str, secret: &str, payload: &[u8]) -> String {
-    format!(
-        "algorithm=fnv64-dev\nkey_id={}\nsignature={}\n",
+pub fn format_payload_signature(
+    key_id: &str,
+    private_key_hex: &str,
+    payload: &[u8],
+) -> Result<String> {
+    Ok(format!(
+        "algorithm={SIGNATURE_ALGORITHM}\nkey_id={}\nsignature={}\n",
         key_id,
-        payload_signature_hex(key_id, secret, payload)
-    )
+        payload_signature_hex(private_key_hex, payload)?
+    ))
 }
 
 pub fn verify_payload_signature(
-    key_id: &str,
-    secret: &str,
+    public_key_hex: &str,
     payload: &[u8],
-    signature: &str,
-) -> bool {
-    payload_signature_hex(key_id, secret, payload) == signature.trim()
+    signature_hex: &str,
+) -> Result<bool> {
+    let public_key = decode_hex_array::<32>(public_key_hex, "ed25519 public key")?;
+    let signature = decode_hex_array::<64>(signature_hex.trim(), "ed25519 signature")?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|err| GlobAclError::InvalidData(format!("invalid ed25519 public key: {err}")))?;
+    let signature = Signature::from_bytes(&signature);
+    Ok(verifying_key.verify_strict(payload, &signature).is_ok())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N]> {
+    let trimmed = value
+        .trim()
+        .strip_prefix("hex:")
+        .unwrap_or_else(|| value.trim());
+    if trimmed.len() != N * 2 {
+        return Err(GlobAclError::Parse(format!(
+            "{field} must be {} hex characters, got {}",
+            N * 2,
+            trimmed.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let offset = index * 2;
+        let high = hex_nibble(trimmed.as_bytes()[offset], field)?;
+        let low = hex_nibble(trimmed.as_bytes()[offset + 1], field)?;
+        *slot = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8, field: &str) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(GlobAclError::Parse(format!(
+            "{field} contains non-hex byte 0x{byte:02x}"
+        ))),
+    }
 }
 
 pub fn deny_requires_blast_radius_override(request: &DenyRequest) -> bool {
@@ -3511,14 +3561,24 @@ mod tests {
     #[test]
     fn payload_signature_verifies_exact_bytes() {
         let payload = b"snapshot-bytes";
-        let signature = payload_signature_hex("dev", "secret", payload);
+        let signature = payload_signature_hex(DEFAULT_SIGNATURE_PRIVATE_KEY, payload).unwrap();
 
-        assert!(verify_payload_signature(
-            "dev", "secret", payload, &signature
-        ));
-        assert!(!verify_payload_signature(
-            "dev", "secret", b"changed", &signature
-        ));
+        assert!(
+            verify_payload_signature(DEFAULT_SIGNATURE_PUBLIC_KEY, payload, &signature).unwrap()
+        );
+        assert!(
+            !verify_payload_signature(DEFAULT_SIGNATURE_PUBLIC_KEY, b"changed", &signature)
+                .unwrap()
+        );
+
+        let formatted = format_payload_signature(
+            DEFAULT_SIGNATURE_KEY_ID,
+            DEFAULT_SIGNATURE_PRIVATE_KEY,
+            payload,
+        )
+        .unwrap();
+        assert!(formatted.contains("algorithm=ed25519"));
+        assert!(formatted.contains("key_id=dev-ed25519"));
     }
 
     #[test]

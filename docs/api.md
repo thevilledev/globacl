@@ -231,15 +231,15 @@ data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl
 data/commitd/snapshots/epoch_<time>_shard_<id>_seq_<seq>.gacl.sig
 ```
 
-`GET /v1/snapshot.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return dependency-free keyed integrity seals:
+`GET /v1/snapshot.sig`, `GET /v1/mutations.sig`, and `GET /v1/delta_bundle.sig` return Ed25519 signature envelopes:
 
 ```text
-algorithm=fnv64-dev
-key_id=dev
-signature=...
+algorithm=ed25519
+key_id=dev-ed25519
+signature=<hex-encoded 64-byte signature>
 ```
 
-Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_SECRET` on control and agents to change the local key. This is a development integrity check, not a substitute for production Ed25519/HSM-backed signing.
+Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_PRIVATE_KEY` on commitd and JetStream-backed relays. Set `GLOBACL_SIGNATURE_KEY_ID` and `GLOBACL_SIGNATURE_PUBLIC_KEY` on agents. The demo manifests use a public RFC 8032 test key; production deployments should use managed key material and rotate key IDs deliberately.
 
 List available rollback targets:
 
