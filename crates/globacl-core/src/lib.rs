@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SHARD_COUNT: u16 = 4096;
@@ -480,8 +482,31 @@ pub struct Snapshot {
 #[derive(Clone, Debug)]
 pub struct ActiveState {
     shard_count: u16,
-    entries: HashMap<AclKey, DenyEntry>,
+    base: Arc<ImmutableBase>,
+    delta_adds: HashMap<AclKey, DenyEntry>,
+    delta_removes: HashMap<AclKey, u64>,
     watermarks: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ImmutableBase {
+    entries: Vec<DenyEntry>,
+    filter: NegativeFilter,
+}
+
+#[derive(Clone, Debug)]
+struct NegativeFilter {
+    bits: Vec<u64>,
+    bit_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveStateStats {
+    pub base_entries: usize,
+    pub delta_adds: usize,
+    pub delta_removes: usize,
+    pub filter_bits: usize,
+    pub estimated_bytes: usize,
 }
 
 impl ActiveState {
@@ -489,7 +514,9 @@ impl ActiveState {
         let shard_count = shard_count.max(1);
         Self {
             shard_count,
-            entries: HashMap::new(),
+            base: Arc::new(ImmutableBase::from_entries(Vec::new())),
+            delta_adds: HashMap::new(),
+            delta_removes: HashMap::new(),
             watermarks: vec![0; shard_count as usize],
         }
     }
@@ -503,20 +530,20 @@ impl ActiveState {
             )));
         }
 
-        let mut entries = HashMap::with_capacity(snapshot.entries.len());
-        for entry in snapshot.entries {
+        for entry in &snapshot.entries {
             if entry.shard_id >= snapshot.shard_count {
                 return Err(GlobAclError::InvalidData(format!(
                     "entry shard {} is outside shard_count {}",
                     entry.shard_id, snapshot.shard_count
                 )));
             }
-            entries.insert(entry.acl_key(), entry);
         }
 
         Ok(Self {
             shard_count: snapshot.shard_count,
-            entries,
+            base: Arc::new(ImmutableBase::from_entries(snapshot.entries)),
+            delta_adds: HashMap::new(),
+            delta_removes: HashMap::new(),
             watermarks: snapshot.watermarks,
         })
     }
@@ -547,10 +574,12 @@ impl ActiveState {
         let key = mutation.entry.acl_key();
         match mutation.entry.action {
             Action::Delete => {
-                self.entries.remove(&key);
+                self.delta_adds.remove(&key);
+                self.delta_removes.insert(key, mutation.commit_id.seq);
             }
             Action::Deny | Action::AllowOverride => {
-                self.entries.insert(key, mutation.entry.clone());
+                self.delta_removes.remove(&key);
+                self.delta_adds.insert(key, mutation.entry.clone());
             }
         }
         self.watermarks[shard_id as usize] = mutation.commit_id.seq;
@@ -565,14 +594,23 @@ impl ActiveState {
         now_unix: u64,
     ) -> Decision {
         let key = AclKey::from_raw(tenant_id, namespace, raw_key);
-        decision_for_entry(self.entries.get(&key), now_unix)
+        if let Some(entry) = self.delta_adds.get(&key) {
+            return decision_for_entry(Some(entry), now_unix);
+        }
+
+        if self.delta_removes.contains_key(&key) {
+            return Decision::Allow;
+        }
+
+        decision_for_entry(self.base.lookup(&key), now_unix)
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        let entries = self.materialized_entries();
         Snapshot {
             shard_count: self.shard_count,
             watermarks: self.watermarks.clone(),
-            entries: self.entries.values().cloned().collect(),
+            entries,
         }
     }
 
@@ -581,11 +619,161 @@ impl ActiveState {
     }
 
     pub fn entries_len(&self) -> usize {
-        self.entries.len()
+        let mut len = self.base.entries.len();
+        for key in self.delta_removes.keys() {
+            if self.base.contains_key(key) && !self.delta_adds.contains_key(key) {
+                len = len.saturating_sub(1);
+            }
+        }
+        for key in self.delta_adds.keys() {
+            if !self.base.contains_key(key) {
+                len += 1;
+            }
+        }
+        len
     }
 
     pub fn watermarks(&self) -> &[u64] {
         &self.watermarks
+    }
+
+    pub fn stats(&self) -> ActiveStateStats {
+        let base_bytes = self.base.entries.len() * std::mem::size_of::<DenyEntry>();
+        let filter_bytes = self.base.filter.bits.len() * std::mem::size_of::<u64>();
+        let overlay_bytes = (self.delta_adds.len() * std::mem::size_of::<(AclKey, DenyEntry)>())
+            + (self.delta_removes.len() * std::mem::size_of::<(AclKey, u64)>());
+
+        ActiveStateStats {
+            base_entries: self.base.entries.len(),
+            delta_adds: self.delta_adds.len(),
+            delta_removes: self.delta_removes.len(),
+            filter_bits: self.base.filter.bit_len,
+            estimated_bytes: base_bytes + filter_bytes + overlay_bytes,
+        }
+    }
+
+    pub fn delta_entries_len(&self) -> usize {
+        self.delta_adds.len() + self.delta_removes.len()
+    }
+
+    pub fn compact_delta_overlay(&mut self) {
+        if self.delta_adds.is_empty() && self.delta_removes.is_empty() {
+            return;
+        }
+        let entries = self.materialized_entries();
+        self.base = Arc::new(ImmutableBase::from_entries(entries));
+        self.delta_adds.clear();
+        self.delta_removes.clear();
+    }
+
+    fn materialized_entries(&self) -> Vec<DenyEntry> {
+        let mut entries = Vec::with_capacity(self.entries_len());
+        for entry in &self.base.entries {
+            let key = entry.acl_key();
+            if self.delta_removes.contains_key(&key) {
+                continue;
+            }
+            if self.delta_adds.contains_key(&key) {
+                continue;
+            }
+            entries.push(entry.clone());
+        }
+        entries.extend(self.delta_adds.values().cloned());
+        entries
+    }
+}
+
+impl ImmutableBase {
+    fn from_entries(mut entries: Vec<DenyEntry>) -> Self {
+        entries.sort_by(compare_entries_by_key);
+
+        let mut deduped: Vec<DenyEntry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match deduped.last_mut() {
+                Some(last) if same_entry_key(last, &entry) => {
+                    if entry.commit_seq >= last.commit_seq {
+                        *last = entry;
+                    }
+                }
+                _ => deduped.push(entry),
+            }
+        }
+
+        let filter = NegativeFilter::from_entries(&deduped);
+        Self {
+            entries: deduped,
+            filter,
+        }
+    }
+
+    fn lookup(&self, key: &AclKey) -> Option<&DenyEntry> {
+        if !self.filter.may_contain(key) {
+            return None;
+        }
+        self.lookup_exact(key)
+    }
+
+    fn lookup_exact(&self, key: &AclKey) -> Option<&DenyEntry> {
+        self.entries
+            .binary_search_by(|entry| compare_entry_to_key(entry, key))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    fn contains_key(&self, key: &AclKey) -> bool {
+        self.lookup_exact(key).is_some()
+    }
+}
+
+impl NegativeFilter {
+    fn from_entries(entries: &[DenyEntry]) -> Self {
+        if entries.is_empty() {
+            return Self {
+                bits: Vec::new(),
+                bit_len: 0,
+            };
+        }
+
+        let desired_bits = (entries.len() * 16).next_power_of_two().max(64);
+        let words = desired_bits.div_ceil(64);
+        let bit_len = words * 64;
+        let mut filter = Self {
+            bits: vec![0; words],
+            bit_len,
+        };
+
+        for entry in entries {
+            filter.insert(&entry.acl_key());
+        }
+
+        filter
+    }
+
+    fn insert(&mut self, key: &AclKey) {
+        for bit_index in self.bit_indexes(key) {
+            self.bits[bit_index / 64] |= 1u64 << (bit_index % 64);
+        }
+    }
+
+    fn may_contain(&self, key: &AclKey) -> bool {
+        if self.bit_len == 0 {
+            return false;
+        }
+        self.bit_indexes(key)
+            .into_iter()
+            .all(|bit_index| (self.bits[bit_index / 64] & (1u64 << (bit_index % 64))) != 0)
+    }
+
+    fn bit_indexes(&self, key: &AclKey) -> [usize; 3] {
+        let seed = fingerprint_acl_key(key);
+        let first = splitmix64(seed);
+        let second = splitmix64(seed ^ 0x9e3779b97f4a7c15);
+        let third = splitmix64(seed ^ 0xbf58476d1ce4e5b9);
+        [
+            (first as usize) % self.bit_len,
+            (second as usize) % self.bit_len,
+            (third as usize) % self.bit_len,
+        ]
     }
 }
 
@@ -604,6 +792,51 @@ pub fn stable_key_hash(tenant_id: &str, namespace: &str, raw_key: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn fingerprint_acl_key(key: &AclKey) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for chunk in [
+        key.tenant_id.as_bytes(),
+        key.namespace.as_bytes(),
+        &key.key_hash.to_le_bytes(),
+    ] {
+        for byte in chunk {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn compare_entries_by_key(left: &DenyEntry, right: &DenyEntry) -> Ordering {
+    left.tenant_id
+        .cmp(&right.tenant_id)
+        .then_with(|| left.namespace.cmp(&right.namespace))
+        .then_with(|| left.key_hash.cmp(&right.key_hash))
+}
+
+fn compare_entry_to_key(entry: &DenyEntry, key: &AclKey) -> Ordering {
+    entry
+        .tenant_id
+        .cmp(&key.tenant_id)
+        .then_with(|| entry.namespace.cmp(&key.namespace))
+        .then_with(|| entry.key_hash.cmp(&key.key_hash))
+}
+
+fn same_entry_key(left: &DenyEntry, right: &DenyEntry) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.namespace == right.namespace
+        && left.key_hash == right.key_hash
 }
 
 pub fn shard_for_hash(key_hash: u64, shard_count: u16) -> u16 {
@@ -1384,6 +1617,35 @@ mod tests {
             active.lookup("tenant-a", "user", "u1", now_unix()),
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn active_state_uses_base_and_delta_overlay() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let mut active = ActiveState::from_snapshot(source.snapshot()).unwrap();
+
+        assert_eq!(active.stats().base_entries, 1);
+        assert_eq!(active.stats().delta_adds, 0);
+        assert!(active
+            .lookup("tenant-a", "user", "u1", now_unix())
+            .is_denied());
+
+        let add = source.commit(request("op-2", "u2", Action::Deny)).unwrap();
+        active.apply_mutation(&add.mutation).unwrap();
+
+        assert_eq!(active.stats().base_entries, 1);
+        assert_eq!(active.stats().delta_adds, 1);
+        assert!(active
+            .lookup("tenant-a", "user", "u2", now_unix())
+            .is_denied());
+
+        active.compact_delta_overlay();
+        assert_eq!(active.stats().base_entries, 2);
+        assert_eq!(active.stats().delta_adds, 0);
+        assert!(active
+            .lookup("tenant-a", "user", "u2", now_unix())
+            .is_denied());
     }
 
     #[test]

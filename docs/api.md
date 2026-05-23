@@ -88,6 +88,20 @@ shard_0001=42
 
 Agents use this to avoid scanning every shard when nothing changed.
 
+## Agent Health State
+
+Agent `/health` includes edge-state sizing and overlay counters:
+
+```text
+base_entries=...
+delta_adds=...
+delta_removes=...
+filter_bits=...
+estimated_state_bytes=...
+```
+
+The steady-state lookup path checks the exact delta overlay first, then uses the immutable base filter as a negative accelerator before probing the sorted exact base index.
+
 ## Canaries
 
 `POST /v1/canary` commits a synthetic P0 deny under:

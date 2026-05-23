@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+const DELTA_COMPACT_THRESHOLD: usize = 1024;
+
 struct App {
     agent_id: String,
     relay_addr: String,
     snapshot_path: PathBuf,
-    state: RwLock<ActiveState>,
+    state: RwLock<Arc<ActiveState>>,
     metrics: Mutex<AgentMetrics>,
 }
 
@@ -63,7 +65,7 @@ fn main() -> Result<()> {
         agent_id,
         relay_addr,
         snapshot_path,
-        state: RwLock::new(ActiveState::from_snapshot(snapshot)?),
+        state: RwLock::new(Arc::new(ActiveState::from_snapshot(snapshot)?)),
         metrics: Mutex::new(AgentMetrics {
             last_sync_unix: now_unix(),
             ..AgentMetrics::default()
@@ -104,14 +106,20 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
-            let state = read_state(&app)?;
+            let state = current_state(&app)?;
             let metrics = lock_metrics(&app)?;
             let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
+            let stats = state.stats();
             let body = format!(
-                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
+                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nfilter_bits={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
                 app.agent_id,
                 state.shard_count(),
                 state.entries_len(),
+                stats.base_entries,
+                stats.delta_adds,
+                stats.delta_removes,
+                stats.filter_bits,
+                stats.estimated_bytes,
                 max_seq,
                 metrics.last_sync_unix,
                 metrics.applied_mutations,
@@ -129,7 +137,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let namespace = required_query(&query, "namespace")?;
             let key = required_query(&query, "key")?;
             let decision = {
-                let state = read_state(&app)?;
+                let state = current_state(&app)?;
                 state.lookup(tenant_id, namespace, key, now_unix())
             };
             let body = format_decision(&decision);
@@ -137,7 +145,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/snapshot") => {
             let snapshot = {
-                let state = read_state(&app)?;
+                let state = current_state(&app)?;
                 state.snapshot()
             };
             let body = encode_snapshot(&snapshot);
@@ -162,14 +170,14 @@ fn poll_loop(app: Arc<App>, interval: Duration) {
 
 fn poll_once(app: &Arc<App>) -> Result<()> {
     let shard_count = {
-        let state = read_state(app)?;
+        let state = current_state(app)?;
         state.shard_count()
     };
     let remote_watermarks = fetch_watermarks(app).ok();
 
     for shard_id in 0..shard_count {
         let from_seq = {
-            let state = read_state(app)?;
+            let state = current_state(app)?;
             state.watermarks()[shard_id as usize]
         };
         if let Some(remote_watermarks) = &remote_watermarks {
@@ -196,8 +204,9 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
         }
 
         let mut applied = 0u64;
-        let (ack_seq, entries) = {
-            let mut state = write_state(app)?;
+        let (ack_seq, entries, snapshot, next_state) = {
+            let current = current_state(app)?;
+            let mut state = current.as_ref().clone();
             for mutation in &mutations {
                 match state.apply_mutation(mutation) {
                     Ok(globacl_core::ApplyStatus::Applied) => applied += 1,
@@ -219,11 +228,16 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
                     Err(err) => return Err(err),
                 }
             }
+            if state.delta_entries_len() >= DELTA_COMPACT_THRESHOLD {
+                state.compact_delta_overlay();
+            }
             let ack_seq = state.watermarks()[shard_id as usize];
             let entries = state.entries_len();
-            write_snapshot_file(&app.snapshot_path, &state.snapshot())?;
-            (ack_seq, entries)
+            let snapshot = state.snapshot();
+            (ack_seq, entries, snapshot, state)
         };
+        write_snapshot_file(&app.snapshot_path, &snapshot)?;
+        swap_state(app, next_state)?;
 
         let mut metrics = lock_metrics(app)?;
         metrics.last_sync_unix = now_unix();
@@ -255,14 +269,19 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
         if response.status_code == 200 {
             let mutations = decode_mutation_stream(&response.body)?;
             if !mutations.is_empty() {
-                let mut state = write_state(app)?;
+                let current = current_state(app)?;
+                let mut state = current.as_ref().clone();
                 for mutation in &mutations {
                     state.apply_mutation(mutation)?;
                 }
-                write_snapshot_file(&app.snapshot_path, &state.snapshot())?;
+                if state.delta_entries_len() >= DELTA_COMPACT_THRESHOLD {
+                    state.compact_delta_overlay();
+                }
+                let snapshot = state.snapshot();
                 let seq = state.watermarks()[shard_id as usize];
                 let entries = state.entries_len();
-                drop(state);
+                write_snapshot_file(&app.snapshot_path, &snapshot)?;
+                swap_state(app, state)?;
                 send_ack(app, shard_id, seq, entries)?;
                 let mut metrics = lock_metrics(app)?;
                 metrics.last_sync_unix = now_unix();
@@ -280,15 +299,13 @@ fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
     let snapshot = fetch_snapshot(&app.relay_addr)?;
     write_snapshot_file(&app.snapshot_path, &snapshot)?;
     let mut ack_targets = Vec::new();
-    {
-        let mut state = write_state(app)?;
-        *state = ActiveState::from_snapshot(snapshot)?;
-        for (shard_id, seq) in state.watermarks().iter().copied().enumerate() {
-            if seq > 0 {
-                ack_targets.push((shard_id as u16, seq, state.entries_len()));
-            }
+    let state = ActiveState::from_snapshot(snapshot)?;
+    for (shard_id, seq) in state.watermarks().iter().copied().enumerate() {
+        if seq > 0 {
+            ack_targets.push((shard_id as u16, seq, state.entries_len()));
         }
     }
+    swap_state(app, state)?;
     for (shard_id, seq, entries) in ack_targets {
         send_ack(app, shard_id, seq, entries)?;
     }
@@ -335,7 +352,7 @@ fn check_canary(app: &Arc<App>) -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let decision = {
-        let state = read_state(app)?;
+        let state = current_state(app)?;
         state.lookup("globacl", "canary", key, now_unix())
     };
     if matches!(decision, Decision::Deny { .. }) {
@@ -370,16 +387,19 @@ fn fetch_snapshot(relay_addr: &str) -> Result<globacl_core::Snapshot> {
     decode_snapshot(&response.body)
 }
 
-fn read_state(app: &App) -> Result<std::sync::RwLockReadGuard<'_, ActiveState>> {
+fn current_state(app: &App) -> Result<Arc<ActiveState>> {
     app.state
         .read()
+        .map(|state| Arc::clone(&state))
         .map_err(|_| GlobAclError::InvalidData("active state read lock poisoned".to_owned()))
 }
 
-fn write_state(app: &App) -> Result<std::sync::RwLockWriteGuard<'_, ActiveState>> {
-    app.state
+fn swap_state(app: &App, next: ActiveState) -> Result<()> {
+    *app.state
         .write()
-        .map_err(|_| GlobAclError::InvalidData("active state write lock poisoned".to_owned()))
+        .map_err(|_| GlobAclError::InvalidData("active state write lock poisoned".to_owned()))? =
+        Arc::new(next);
+    Ok(())
 }
 
 fn lock_metrics(app: &App) -> Result<std::sync::MutexGuard<'_, AgentMetrics>> {

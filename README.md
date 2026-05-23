@@ -28,10 +28,11 @@ The propagation path also records per-agent acknowledgements, writes per-mutatio
 
 This workspace intentionally has no third-party crate dependencies yet, so it can build in restricted environments.
 
-- `globacl-core`: domain model, idempotent source-of-truth state, exact lookup engine, binary mutation stream, binary snapshot format, per-shard append log, delta bundle, and ack helpers.
+- `globacl-core`: domain model, idempotent source-of-truth state, immutable sorted edge index, negative filter, exact delta overlay, binary mutation stream, binary snapshot format, per-shard append log, delta bundle, and ack helpers.
 - `globacl-control`: ACL authoring/API service with a linearized in-process source of truth and durable per-shard append logs.
 - `globacl-relay`: regional relay that proxies mutation/snapshot fetches, records PoP acknowledgements, and can be chained as a location-aware relay tree.
 - `globacl-agent`: PoP agent that cold-starts from a snapshot, polls deltas through the relay, repairs gaps, acknowledges watermarks, checks canaries, applies exact local state, and exposes local lookup.
+- `globacl-bench`: dependency-free benchmark runner for edge state build time, positive lookups, negative lookups, and memory estimates.
 
 ## Docs
 

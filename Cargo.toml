@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/globacl-agent",
+    "crates/globacl-bench",
     "crates/globacl-control",
     "crates/globacl-core",
     "crates/globacl-relay",
@@ -11,4 +12,3 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/thevilledev/globacl"
-
