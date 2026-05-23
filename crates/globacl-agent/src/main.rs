@@ -1,7 +1,7 @@
 use globacl_core::{
     decode_mutation_stream, decode_snapshot, encode_snapshot, format_decision, http_get, now_unix,
-    parse_query_path, read_http_request, read_snapshot_file, write_http_response,
-    write_snapshot_file, ActiveState, GlobAclError, Result,
+    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, read_snapshot_file,
+    write_http_response, write_snapshot_file, ActiveState, Decision, GlobAclError, PopAck, Result,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 struct App {
+    agent_id: String,
     relay_addr: String,
     snapshot_path: PathBuf,
     state: RwLock<ActiveState>,
@@ -22,6 +23,11 @@ struct AgentMetrics {
     last_sync_unix: u64,
     applied_mutations: u64,
     repairs: u64,
+    bundle_repairs: u64,
+    snapshot_repairs: u64,
+    last_canary_key: String,
+    last_canary_seq: u64,
+    last_canary_seen_unix: u64,
 }
 
 fn main() -> Result<()> {
@@ -41,9 +47,20 @@ fn main() -> Result<()> {
         .map(|value| parse_arg_u64(value, "poll_ms"))
         .transpose()?
         .unwrap_or(1000);
+    let agent_id = args.get(5).cloned().unwrap_or_else(|| {
+        format!(
+            "agent-{}",
+            bind_addr
+                .replace(":", "-")
+                .replace(".", "-")
+                .replace("[", "")
+                .replace("]", "")
+        )
+    });
 
     let snapshot = load_or_fetch_snapshot(&relay_addr, &snapshot_path)?;
     let app = Arc::new(App {
+        agent_id,
         relay_addr,
         snapshot_path,
         state: RwLock::new(ActiveState::from_snapshot(snapshot)?),
@@ -60,8 +77,8 @@ fn main() -> Result<()> {
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
-        "globacl-agent listening on {bind_addr}; relay_addr={}",
-        app.relay_addr
+        "globacl-agent listening on {bind_addr}; agent_id={}; relay_addr={}",
+        app.agent_id, app.relay_addr
     );
 
     for stream in listener.incoming() {
@@ -91,13 +108,19 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let metrics = lock_metrics(&app)?;
             let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
             let body = format!(
-                "status=ok\nrole=agent\nshard_count={}\nentries={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\n",
+                "status=ok\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nmax_seq={}\nlast_sync_unix={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
+                app.agent_id,
                 state.shard_count(),
                 state.entries_len(),
                 max_seq,
                 metrics.last_sync_unix,
                 metrics.applied_mutations,
-                metrics.repairs
+                metrics.repairs,
+                metrics.bundle_repairs,
+                metrics.snapshot_repairs,
+                metrics.last_canary_key,
+                metrics.last_canary_seq,
+                metrics.last_canary_seen_unix
             );
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
@@ -142,12 +165,23 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
         let state = read_state(app)?;
         state.shard_count()
     };
+    let remote_watermarks = fetch_watermarks(app).ok();
 
     for shard_id in 0..shard_count {
         let from_seq = {
             let state = read_state(app)?;
             state.watermarks()[shard_id as usize]
         };
+        if let Some(remote_watermarks) = &remote_watermarks {
+            if remote_watermarks
+                .get(shard_id as usize)
+                .copied()
+                .unwrap_or(from_seq)
+                <= from_seq
+            {
+                continue;
+            }
+        }
         let path = format!("/v1/mutations?shard={shard_id}&from_seq={from_seq}");
         let response = http_get(&app.relay_addr, &path)?;
         if response.status_code != 200 {
@@ -162,41 +196,154 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
         }
 
         let mut applied = 0u64;
-        {
+        let (ack_seq, entries) = {
             let mut state = write_state(app)?;
             for mutation in &mutations {
                 match state.apply_mutation(mutation) {
                     Ok(globacl_core::ApplyStatus::Applied) => applied += 1,
                     Ok(globacl_core::ApplyStatus::DuplicateOrOld) => {}
-                    Err(GlobAclError::Gap { .. }) => {
+                    Err(GlobAclError::Gap {
+                        shard_id,
+                        expected_seq,
+                        received_seq,
+                    }) => {
                         drop(state);
-                        repair_from_snapshot(app)?;
+                        repair_gap(
+                            app,
+                            shard_id,
+                            expected_seq.saturating_sub(1),
+                            received_seq.saturating_sub(1),
+                        )?;
                         return Ok(());
                     }
                     Err(err) => return Err(err),
                 }
             }
+            let ack_seq = state.watermarks()[shard_id as usize];
+            let entries = state.entries_len();
             write_snapshot_file(&app.snapshot_path, &state.snapshot())?;
-        }
+            (ack_seq, entries)
+        };
 
         let mut metrics = lock_metrics(app)?;
         metrics.last_sync_unix = now_unix();
         metrics.applied_mutations += applied;
+        drop(metrics);
+
+        send_ack(app, shard_id, ack_seq, entries)?;
     }
 
+    check_canary(app)?;
     Ok(())
+}
+
+fn fetch_watermarks(app: &Arc<App>) -> Result<Vec<u64>> {
+    let response = http_get(&app.relay_addr, "/v1/watermarks")?;
+    if response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "relay returned status {} for watermarks",
+            response.status_code
+        )));
+    }
+    parse_watermarks(&response.body)
+}
+
+fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Result<()> {
+    if to_seq >= from_seq {
+        let path = format!("/v1/delta_bundle?shard={shard_id}&from_seq={from_seq}&to_seq={to_seq}");
+        let response = http_get(&app.relay_addr, &path)?;
+        if response.status_code == 200 {
+            let mutations = decode_mutation_stream(&response.body)?;
+            if !mutations.is_empty() {
+                let mut state = write_state(app)?;
+                for mutation in &mutations {
+                    state.apply_mutation(mutation)?;
+                }
+                write_snapshot_file(&app.snapshot_path, &state.snapshot())?;
+                let seq = state.watermarks()[shard_id as usize];
+                let entries = state.entries_len();
+                drop(state);
+                send_ack(app, shard_id, seq, entries)?;
+                let mut metrics = lock_metrics(app)?;
+                metrics.last_sync_unix = now_unix();
+                metrics.repairs += 1;
+                metrics.bundle_repairs += 1;
+                return Ok(());
+            }
+        }
+    }
+
+    repair_from_snapshot(app)
 }
 
 fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
     let snapshot = fetch_snapshot(&app.relay_addr)?;
     write_snapshot_file(&app.snapshot_path, &snapshot)?;
+    let mut ack_targets = Vec::new();
     {
         let mut state = write_state(app)?;
         *state = ActiveState::from_snapshot(snapshot)?;
+        for (shard_id, seq) in state.watermarks().iter().copied().enumerate() {
+            if seq > 0 {
+                ack_targets.push((shard_id as u16, seq, state.entries_len()));
+            }
+        }
+    }
+    for (shard_id, seq, entries) in ack_targets {
+        send_ack(app, shard_id, seq, entries)?;
     }
     let mut metrics = lock_metrics(app)?;
     metrics.last_sync_unix = now_unix();
     metrics.repairs += 1;
+    metrics.snapshot_repairs += 1;
+    Ok(())
+}
+
+fn send_ack(app: &Arc<App>, shard_id: u16, seq: u64, entries: usize) -> Result<()> {
+    let ack = PopAck {
+        agent_id: app.agent_id.clone(),
+        shard_id,
+        seq,
+        entries,
+        applied_at_unix: now_unix(),
+    };
+    let response =
+        globacl_core::http_post(&app.relay_addr, "/v1/ack", ack.to_form_body().as_bytes())?;
+    if response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "relay returned status {} for ack",
+            response.status_code
+        )));
+    }
+    Ok(())
+}
+
+fn check_canary(app: &Arc<App>) -> Result<()> {
+    let response = http_get(&app.relay_addr, "/v1/canary/latest")?;
+    if response.status_code != 200 {
+        return Ok(());
+    }
+    let form = parse_form_lines(&response.body)?;
+    if form.get("status").map(String::as_str) != Some("ok") {
+        return Ok(());
+    }
+    let Some(key) = form.get("key") else {
+        return Ok(());
+    };
+    let canary_seq = form
+        .get("seq")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let decision = {
+        let state = read_state(app)?;
+        state.lookup("globacl", "canary", key, now_unix())
+    };
+    if matches!(decision, Decision::Deny { .. }) {
+        let mut metrics = lock_metrics(app)?;
+        metrics.last_canary_key = key.clone();
+        metrics.last_canary_seq = canary_seq;
+        metrics.last_canary_seen_unix = now_unix();
+    }
     Ok(())
 }
 

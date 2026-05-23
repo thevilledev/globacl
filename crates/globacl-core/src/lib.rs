@@ -97,6 +97,53 @@ impl Action {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryPriority {
+    P0,
+    P1,
+    P2,
+}
+
+impl DeliveryPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryPriority::P0 => "p0",
+            DeliveryPriority::P1 => "p1",
+            DeliveryPriority::P2 => "p2",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "p0" | "emergency" | "emergency_deny" => Ok(DeliveryPriority::P0),
+            "p1" | "normal" | "mutation" => Ok(DeliveryPriority::P1),
+            "p2" | "repair" | "snapshot" => Ok(DeliveryPriority::P2),
+            other => Err(GlobAclError::Parse(format!(
+                "unknown delivery priority {other:?}"
+            ))),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            DeliveryPriority::P0 => 0,
+            DeliveryPriority::P1 => 1,
+            DeliveryPriority::P2 => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(DeliveryPriority::P0),
+            1 => Ok(DeliveryPriority::P1),
+            2 => Ok(DeliveryPriority::P2),
+            _ => Err(GlobAclError::InvalidData(format!(
+                "unknown delivery priority tag {value}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct AclKey {
     pub tenant_id: String,
@@ -125,6 +172,7 @@ pub struct DenyRequest {
     pub reason_code: String,
     pub expires_at: u64,
     pub created_by: String,
+    pub delivery_priority: DeliveryPriority,
 }
 
 impl DenyRequest {
@@ -144,6 +192,13 @@ impl DenyRequest {
             .get("created_by")
             .cloned()
             .unwrap_or_else(|| "unknown".to_owned());
+        let delivery_priority = form
+            .get("delivery_priority")
+            .or_else(|| form.get("channel"))
+            .or_else(|| form.get("stream"))
+            .map(|value| DeliveryPriority::from_name(value))
+            .transpose()?
+            .unwrap_or(DeliveryPriority::P1);
 
         Ok(Self {
             op_id,
@@ -155,6 +210,7 @@ impl DenyRequest {
             reason_code,
             expires_at,
             created_by,
+            delivery_priority,
         })
     }
 }
@@ -200,6 +256,8 @@ pub struct Mutation {
     pub op_id: String,
     pub commit_id: CommitId,
     pub entry: DenyEntry,
+    pub delivery_priority: DeliveryPriority,
+    pub committed_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,6 +370,8 @@ impl SourceOfTruth {
             op_id: request.op_id,
             commit_id,
             entry,
+            delivery_priority: request.delivery_priority,
+            committed_at_unix: now_unix(),
         };
 
         self.apply_committed_mutation(&mutation)?;
@@ -639,6 +699,8 @@ pub fn encode_mutation(mutation: &Mutation) -> Vec<u8> {
     write_u64(&mut out, mutation.commit_id.epoch);
     write_string(&mut out, &mutation.commit_id.source_region);
     encode_entry(&mut out, &mutation.entry);
+    out.push(mutation.delivery_priority.to_u8());
+    write_u64(&mut out, mutation.committed_at_unix);
     out
 }
 
@@ -719,6 +781,43 @@ pub fn shard_log_path(log_dir: impl AsRef<Path>, shard_id: u16) -> PathBuf {
     log_dir.as_ref().join(format!("shard_{shard_id:04}.glog"))
 }
 
+pub fn write_delta_bundle_file(
+    bundle_dir: impl AsRef<Path>,
+    shard_id: u16,
+    from_seq: u64,
+    to_seq: u64,
+    mutations: &[Mutation],
+) -> Result<PathBuf> {
+    fs::create_dir_all(&bundle_dir)?;
+    let path = delta_bundle_path(bundle_dir, shard_id, from_seq, to_seq);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&encode_mutation_stream(mutations))?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp, &path)?;
+    Ok(path)
+}
+
+pub fn read_delta_bundle_file(path: impl AsRef<Path>) -> Result<Vec<Mutation>> {
+    decode_mutation_stream(&fs::read(path)?)
+}
+
+pub fn delta_bundle_path(
+    bundle_dir: impl AsRef<Path>,
+    shard_id: u16,
+    from_seq: u64,
+    to_seq: u64,
+) -> PathBuf {
+    bundle_dir.as_ref().join(format!(
+        "shard_{shard_id:04}/delta_{from_seq:020}_{to_seq:020}.glog"
+    ))
+}
+
 pub fn parse_form_lines(body: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(body)
         .map_err(|err| GlobAclError::Parse(format!("request body is not utf8: {err}")))?;
@@ -772,6 +871,49 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     pub status_code: u16,
     pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PopAck {
+    pub agent_id: String,
+    pub shard_id: u16,
+    pub seq: u64,
+    pub entries: usize,
+    pub applied_at_unix: u64,
+}
+
+impl PopAck {
+    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            agent_id: required(form, "agent_id")?,
+            shard_id: parse_u16(
+                form.get("shard_id")
+                    .or_else(|| form.get("shard"))
+                    .map(String::as_str),
+                "shard_id",
+            )?,
+            seq: parse_u64(
+                form.get("seq")
+                    .or_else(|| form.get("watermark"))
+                    .map(String::as_str),
+                0,
+                "seq",
+            )?,
+            entries: parse_usize(form.get("entries").map(String::as_str), 0, "entries")?,
+            applied_at_unix: parse_u64(
+                form.get("applied_at_unix").map(String::as_str),
+                now_unix(),
+                "applied_at_unix",
+            )?,
+        })
+    }
+
+    pub fn to_form_body(&self) -> String {
+        format!(
+            "agent_id={}\nshard_id={}\nseq={}\nentries={}\napplied_at_unix={}\n",
+            self.agent_id, self.shard_id, self.seq, self.entries, self.applied_at_unix
+        )
+    }
 }
 
 pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -870,13 +1012,15 @@ pub fn write_http_response(
 pub fn format_commit_outcome(outcome: &CommitOutcome) -> String {
     let entries_changed = if outcome.duplicate { 0 } else { 1 };
     format!(
-        "duplicate={}\nshard_id={}\nseq={}\nepoch={}\naction={}\nkey_hash={}\nentries_changed={entries_changed}\n",
+        "duplicate={}\nshard_id={}\nseq={}\nepoch={}\naction={}\nkey_hash={}\ndelivery_priority={}\ncommitted_at_unix={}\nentries_changed={entries_changed}\n",
         outcome.duplicate,
         outcome.mutation.commit_id.shard_id,
         outcome.mutation.commit_id.seq,
         outcome.mutation.commit_id.epoch,
         outcome.mutation.entry.action.as_str(),
-        outcome.mutation.entry.key_hash
+        outcome.mutation.entry.key_hash,
+        outcome.mutation.delivery_priority.as_str(),
+        outcome.mutation.committed_at_unix
     )
 }
 
@@ -892,6 +1036,30 @@ pub fn format_decision(decision: &Decision) -> String {
             commit_id.shard_id, commit_id.seq, commit_id.epoch
         ),
     }
+}
+
+pub fn format_watermarks(watermarks: &[u64]) -> String {
+    let mut body = format!("shard_count={}\n", watermarks.len());
+    for (shard_id, seq) in watermarks.iter().enumerate() {
+        body.push_str(&format!("shard_{shard_id:04}={seq}\n"));
+    }
+    body
+}
+
+pub fn parse_watermarks(body: &[u8]) -> Result<Vec<u64>> {
+    let form = parse_form_lines(body)?;
+    let shard_count = parse_usize(
+        form.get("shard_count").map(String::as_str),
+        0,
+        "shard_count",
+    )?;
+    let mut watermarks = Vec::with_capacity(shard_count);
+    for shard_id in 0..shard_count {
+        let key = format!("shard_{shard_id:04}");
+        let seq = parse_u64(form.get(&key).map(String::as_str), 0, &key)?;
+        watermarks.push(seq);
+    }
+    Ok(watermarks)
 }
 
 fn send_http(addr: &str, request: &[u8]) -> Result<HttpResponse> {
@@ -974,6 +1142,28 @@ fn parse_u32(value: Option<&str>, default: u32, field: &str) -> Result<u32> {
     }
 }
 
+fn parse_u16(value: Option<&str>, field: &str) -> Result<u16> {
+    match value {
+        Some(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u16>()
+            .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}"))),
+        _ => Err(GlobAclError::Parse(format!(
+            "missing required field {field}"
+        ))),
+    }
+}
+
+fn parse_usize(value: Option<&str>, default: usize, field: &str) -> Result<usize> {
+    match value {
+        Some(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}"))),
+        _ => Ok(default),
+    }
+}
+
 fn encode_entry(out: &mut Vec<u8>, entry: &DenyEntry) {
     write_string(out, &entry.tenant_id);
     write_string(out, &entry.namespace);
@@ -1016,6 +1206,16 @@ fn decode_mutation_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Mutation> {
     let epoch = read_u64(cursor)?;
     let source_region = read_string(cursor)?;
     let entry = decode_entry(cursor)?;
+    let delivery_priority = if cursor_remaining(cursor) >= 1 {
+        DeliveryPriority::from_u8(read_u8(cursor)?)?
+    } else {
+        DeliveryPriority::P1
+    };
+    let committed_at_unix = if cursor_remaining(cursor) >= 8 {
+        read_u64(cursor)?
+    } else {
+        0
+    };
     Ok(Mutation {
         op_id,
         commit_id: CommitId {
@@ -1025,6 +1225,8 @@ fn decode_mutation_from_cursor(cursor: &mut Cursor<&[u8]>) -> Result<Mutation> {
             source_region,
         },
         entry,
+        delivery_priority,
+        committed_at_unix,
     })
 }
 
@@ -1091,6 +1293,13 @@ fn read_exact_vec(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn cursor_remaining(cursor: &Cursor<&[u8]>) -> usize {
+    cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize)
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -1140,6 +1349,7 @@ mod tests {
             reason_code: "test".to_owned(),
             expires_at: 0,
             created_by: "unit-test".to_owned(),
+            delivery_priority: DeliveryPriority::P1,
         }
     }
 
@@ -1210,6 +1420,19 @@ mod tests {
     }
 
     #[test]
+    fn mutation_priority_round_trips() {
+        let mut source = SourceOfTruth::new(16, "local");
+        let mut request = request("op-1", "u1", Action::Deny);
+        request.delivery_priority = DeliveryPriority::P0;
+        let outcome = source.commit(request).unwrap();
+
+        let decoded = decode_mutation(&encode_mutation(&outcome.mutation)).unwrap();
+
+        assert_eq!(decoded.delivery_priority, DeliveryPriority::P0);
+        assert_ne!(decoded.committed_at_unix, 0);
+    }
+
+    #[test]
     fn gap_detection_rejects_out_of_order_apply() {
         let mut source = SourceOfTruth::new(1, "local");
         let first = source.commit(request("op-1", "u1", Action::Deny)).unwrap();
@@ -1253,5 +1476,52 @@ mod tests {
             .is_denied());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delta_bundle_file_round_trips() {
+        let root = std::env::temp_dir().join(format!(
+            "globacl-core-bundle-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let bundle_dir = root.join("bundles");
+
+        let mut source = SourceOfTruth::new(16, "local");
+        let one = source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let path = write_delta_bundle_file(
+            &bundle_dir,
+            one.mutation.commit_id.shard_id,
+            one.mutation.commit_id.seq,
+            one.mutation.commit_id.seq,
+            std::slice::from_ref(&one.mutation),
+        )
+        .unwrap();
+
+        let decoded = read_delta_bundle_file(path).unwrap();
+        assert_eq!(decoded, vec![one.mutation]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pop_ack_parses_and_formats() {
+        let form = parse_form_lines(
+            b"agent_id=pop-a\nshard_id=7\nseq=42\nentries=12\napplied_at_unix=1000\n",
+        )
+        .unwrap();
+        let ack = PopAck::from_form(&form).unwrap();
+
+        assert_eq!(ack.agent_id, "pop-a");
+        assert_eq!(ack.shard_id, 7);
+        assert_eq!(ack.seq, 42);
+        assert!(ack.to_form_body().contains("agent_id=pop-a"));
+    }
+
+    #[test]
+    fn watermarks_round_trip() {
+        let watermarks = vec![0, 7, 42];
+        let decoded = parse_watermarks(format_watermarks(&watermarks).as_bytes()).unwrap();
+        assert_eq!(decoded, watermarks);
     }
 }
