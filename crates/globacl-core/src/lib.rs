@@ -994,8 +994,29 @@ pub struct ActiveState {
 
 #[derive(Clone, Debug)]
 struct ImmutableBase {
-    entries: Vec<DenyEntry>,
+    entries: Vec<CompactDenyEntry>,
+    symbols: SymbolTable,
     filter: NegativeFilter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactDenyEntry {
+    key_hash: u64,
+    expires_at: u64,
+    commit_seq: u64,
+    priority: u32,
+    tenant_id: u32,
+    namespace: u32,
+    reason_code: u32,
+    created_by: u32,
+    shard_id: u16,
+    action: Action,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SymbolTable {
+    values: Vec<String>,
+    ids: HashMap<String, u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -1112,16 +1133,25 @@ impl ActiveState {
         raw_key: &str,
         now_unix: u64,
     ) -> Decision {
-        let key = AclKey::from_raw(tenant_id, namespace, raw_key);
-        if let Some(entry) = self.delta_adds.get(&key) {
-            return decision_for_entry(Some(entry), now_unix);
+        let key_hash = stable_key_hash(tenant_id, namespace, raw_key);
+
+        if !self.delta_adds.is_empty() || !self.delta_removes.is_empty() {
+            let key = AclKey {
+                tenant_id: tenant_id.to_owned(),
+                namespace: namespace.to_owned(),
+                key_hash,
+            };
+            if let Some(entry) = self.delta_adds.get(&key) {
+                return decision_for_entry(Some(entry), now_unix);
+            }
+
+            if self.delta_removes.contains_key(&key) {
+                return Decision::Allow;
+            }
         }
 
-        if self.delta_removes.contains_key(&key) {
-            return Decision::Allow;
-        }
-
-        decision_for_entry(self.base.lookup(&key), now_unix)
+        self.base
+            .decision_for_parts(tenant_id, namespace, key_hash, now_unix)
     }
 
     pub fn check(
@@ -1165,7 +1195,7 @@ impl ActiveState {
     }
 
     pub fn entries_len(&self) -> usize {
-        let mut len = self.base.entries.len();
+        let mut len = self.base.len();
         for key in self.delta_removes.keys() {
             if self.base.contains_key(key) && !self.delta_adds.contains_key(key) {
                 len = len.saturating_sub(1);
@@ -1184,8 +1214,7 @@ impl ActiveState {
     }
 
     pub fn stats(&self) -> ActiveStateStats {
-        let base_bytes = self.base.entries.len() * std::mem::size_of::<DenyEntry>();
-        let filter_bytes = self.base.filter.bits.len() * std::mem::size_of::<u64>();
+        let base_bytes = self.base.estimated_bytes();
         let overlay_bytes = (self.delta_adds.len() * std::mem::size_of::<(AclKey, DenyEntry)>())
             + (self.delta_removes.len() * std::mem::size_of::<(AclKey, u64)>());
         let rule_bytes = self.rule_base.rules_len * std::mem::size_of::<RuleEntry>()
@@ -1193,14 +1222,14 @@ impl ActiveState {
             + (self.delta_rule_removes.len() * std::mem::size_of::<(RuleKey, u64)>());
 
         ActiveStateStats {
-            base_entries: self.base.entries.len(),
+            base_entries: self.base.len(),
             delta_adds: self.delta_adds.len(),
             delta_removes: self.delta_removes.len(),
             base_rules: self.rule_base.rules_len,
             delta_rule_adds: self.delta_rule_adds.len(),
             delta_rule_removes: self.delta_rule_removes.len(),
             filter_bits: self.base.filter.bit_len,
-            estimated_bytes: base_bytes + filter_bytes + overlay_bytes + rule_bytes,
+            estimated_bytes: base_bytes + overlay_bytes + rule_bytes,
         }
     }
 
@@ -1209,8 +1238,11 @@ impl ActiveState {
     /// A `true` result is approximate and must never be treated as a deny decision
     /// without the exact lookup verification performed by [`Self::lookup`].
     pub fn base_filter_may_contain(&self, tenant_id: &str, namespace: &str, raw_key: &str) -> bool {
-        let key = AclKey::from_raw(tenant_id, namespace, raw_key);
-        self.base.filter.may_contain(&key)
+        self.base.filter.may_contain_parts(
+            tenant_id,
+            namespace,
+            stable_key_hash(tenant_id, namespace, raw_key),
+        )
     }
 
     pub fn delta_entries_len(&self) -> usize {
@@ -1240,7 +1272,7 @@ impl ActiveState {
 
     fn materialized_entries(&self) -> Vec<DenyEntry> {
         let mut entries = Vec::with_capacity(self.entries_len());
-        for entry in &self.base.entries {
+        for entry in self.base.materialized_entries() {
             let key = entry.acl_key();
             if self.delta_removes.contains_key(&key) {
                 continue;
@@ -1248,7 +1280,7 @@ impl ActiveState {
             if self.delta_adds.contains_key(&key) {
                 continue;
             }
-            entries.push(entry.clone());
+            entries.push(entry);
         }
         entries.extend(self.delta_adds.values().cloned());
         entries
@@ -1296,34 +1328,178 @@ impl ImmutableBase {
             }
         }
 
-        let filter = NegativeFilter::from_entries(&deduped);
+        let mut symbols = SymbolTable::default();
+        let mut compact_entries = Vec::with_capacity(deduped.len());
+        for entry in deduped {
+            compact_entries.push(CompactDenyEntry::from_entry(entry, &mut symbols));
+        }
+        compact_entries.sort_by(compare_compact_entries_by_key);
+
+        let filter = NegativeFilter::from_compact_entries(&compact_entries, &symbols);
         Self {
-            entries: deduped,
+            entries: compact_entries,
+            symbols,
             filter,
         }
     }
 
-    fn lookup(&self, key: &AclKey) -> Option<&DenyEntry> {
-        if !self.filter.may_contain(key) {
-            return None;
-        }
-        self.lookup_exact(key)
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 
-    fn lookup_exact(&self, key: &AclKey) -> Option<&DenyEntry> {
+    fn decision_for_parts(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        key_hash: u64,
+        now_unix: u64,
+    ) -> Decision {
+        let Some(entry) = self.lookup_parts(tenant_id, namespace, key_hash) else {
+            return Decision::Allow;
+        };
+        if entry.is_expired(now_unix) {
+            return Decision::Allow;
+        }
+        match entry.action {
+            Action::Deny => Decision::Deny {
+                reason_code: self.symbols.get(entry.reason_code).to_owned(),
+                priority: entry.priority,
+                commit_id: CommitId {
+                    shard_id: entry.shard_id,
+                    seq: entry.commit_seq,
+                    epoch: 1,
+                    source_region: String::new(),
+                },
+            },
+            Action::AllowOverride | Action::Delete => Decision::Allow,
+        }
+    }
+
+    fn lookup_parts(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        key_hash: u64,
+    ) -> Option<&CompactDenyEntry> {
+        if !self
+            .filter
+            .may_contain_parts(tenant_id, namespace, key_hash)
+        {
+            return None;
+        }
+        self.lookup_exact_parts(tenant_id, namespace, key_hash)
+    }
+
+    fn lookup_exact_parts(
+        &self,
+        tenant_id: &str,
+        namespace: &str,
+        key_hash: u64,
+    ) -> Option<&CompactDenyEntry> {
+        let tenant_id = self.symbols.id(tenant_id)?;
+        let namespace = self.symbols.id(namespace)?;
         self.entries
-            .binary_search_by(|entry| compare_entry_to_key(entry, key))
+            .binary_search_by(|entry| {
+                compare_compact_entry_to_key(entry, tenant_id, namespace, key_hash)
+            })
             .ok()
             .map(|index| &self.entries[index])
     }
 
     fn contains_key(&self, key: &AclKey) -> bool {
-        self.lookup_exact(key).is_some()
+        self.lookup_exact_parts(&key.tenant_id, &key.namespace, key.key_hash)
+            .is_some()
+    }
+
+    fn materialized_entries(&self) -> Vec<DenyEntry> {
+        self.entries
+            .iter()
+            .map(|entry| entry.to_deny_entry(&self.symbols))
+            .collect()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        (self.entries.len() * std::mem::size_of::<CompactDenyEntry>())
+            + (self.filter.bits.len() * std::mem::size_of::<u64>())
+            + self.symbols.estimated_bytes()
+    }
+}
+
+impl CompactDenyEntry {
+    fn from_entry(entry: DenyEntry, symbols: &mut SymbolTable) -> Self {
+        Self {
+            key_hash: entry.key_hash,
+            expires_at: entry.expires_at,
+            commit_seq: entry.commit_seq,
+            priority: entry.priority,
+            tenant_id: symbols.intern(entry.tenant_id),
+            namespace: symbols.intern(entry.namespace),
+            reason_code: symbols.intern(entry.reason_code),
+            created_by: symbols.intern(entry.created_by),
+            shard_id: entry.shard_id,
+            action: entry.action,
+        }
+    }
+
+    fn is_expired(self, now_unix: u64) -> bool {
+        self.expires_at != 0 && self.expires_at <= now_unix
+    }
+
+    fn to_deny_entry(self, symbols: &SymbolTable) -> DenyEntry {
+        DenyEntry {
+            tenant_id: symbols.get(self.tenant_id).to_owned(),
+            namespace: symbols.get(self.namespace).to_owned(),
+            key_hash: self.key_hash,
+            action: self.action,
+            priority: self.priority,
+            reason_code: symbols.get(self.reason_code).to_owned(),
+            expires_at: self.expires_at,
+            created_by: symbols.get(self.created_by).to_owned(),
+            commit_seq: self.commit_seq,
+            shard_id: self.shard_id,
+        }
+    }
+}
+
+impl SymbolTable {
+    fn intern(&mut self, value: String) -> u32 {
+        if let Some(id) = self.ids.get(value.as_str()) {
+            return *id;
+        }
+        let id = self.values.len();
+        let id = u32::try_from(id).expect("symbol table exceeded u32::MAX entries");
+        self.values.push(value.clone());
+        self.ids.insert(value, id);
+        id
+    }
+
+    fn id(&self, value: &str) -> Option<u32> {
+        self.ids.get(value).copied()
+    }
+
+    fn get(&self, id: u32) -> &str {
+        &self.values[id as usize]
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let value_bytes = self
+            .values
+            .iter()
+            .map(|value| std::mem::size_of::<String>() + value.capacity())
+            .sum::<usize>();
+        let index_bytes = self
+            .ids
+            .keys()
+            .map(|value| {
+                std::mem::size_of::<String>() + value.capacity() + std::mem::size_of::<u32>()
+            })
+            .sum::<usize>();
+        value_bytes + index_bytes
     }
 }
 
 impl NegativeFilter {
-    fn from_entries(entries: &[DenyEntry]) -> Self {
+    fn from_compact_entries(entries: &[CompactDenyEntry], symbols: &SymbolTable) -> Self {
         if entries.is_empty() {
             return Self {
                 bits: Vec::new(),
@@ -1340,29 +1516,33 @@ impl NegativeFilter {
         };
 
         for entry in entries {
-            filter.insert(&entry.acl_key());
+            filter.insert_parts(
+                symbols.get(entry.tenant_id),
+                symbols.get(entry.namespace),
+                entry.key_hash,
+            );
         }
 
         filter
     }
 
-    fn insert(&mut self, key: &AclKey) {
-        for bit_index in self.bit_indexes(key) {
+    fn insert_parts(&mut self, tenant_id: &str, namespace: &str, key_hash: u64) {
+        for bit_index in self.bit_indexes_parts(tenant_id, namespace, key_hash) {
             self.bits[bit_index / 64] |= 1u64 << (bit_index % 64);
         }
     }
 
-    fn may_contain(&self, key: &AclKey) -> bool {
+    fn may_contain_parts(&self, tenant_id: &str, namespace: &str, key_hash: u64) -> bool {
         if self.bit_len == 0 {
             return false;
         }
-        self.bit_indexes(key)
+        self.bit_indexes_parts(tenant_id, namespace, key_hash)
             .into_iter()
             .all(|bit_index| (self.bits[bit_index / 64] & (1u64 << (bit_index % 64))) != 0)
     }
 
-    fn bit_indexes(&self, key: &AclKey) -> [usize; 3] {
-        let seed = fingerprint_acl_key(key);
+    fn bit_indexes_parts(&self, tenant_id: &str, namespace: &str, key_hash: u64) -> [usize; 3] {
+        let seed = fingerprint_acl_key_parts(tenant_id, namespace, key_hash);
         let first = splitmix64(seed);
         let second = splitmix64(seed ^ 0x9e3779b97f4a7c15);
         let third = splitmix64(seed ^ 0xbf58476d1ce4e5b9);
@@ -1627,12 +1807,12 @@ pub fn rule_requires_blast_radius_override(request: &RuleRequest) -> bool {
     }
 }
 
-fn fingerprint_acl_key(key: &AclKey) -> u64 {
+fn fingerprint_acl_key_parts(tenant_id: &str, namespace: &str, key_hash: u64) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for chunk in [
-        key.tenant_id.as_bytes(),
-        key.namespace.as_bytes(),
-        &key.key_hash.to_le_bytes(),
+        tenant_id.as_bytes(),
+        namespace.as_bytes(),
+        &key_hash.to_le_bytes(),
     ] {
         for byte in chunk {
             hash ^= u64::from(*byte);
@@ -1658,18 +1838,30 @@ fn compare_entries_by_key(left: &DenyEntry, right: &DenyEntry) -> Ordering {
         .then_with(|| left.key_hash.cmp(&right.key_hash))
 }
 
-fn compare_entry_to_key(entry: &DenyEntry, key: &AclKey) -> Ordering {
-    entry
-        .tenant_id
-        .cmp(&key.tenant_id)
-        .then_with(|| entry.namespace.cmp(&key.namespace))
-        .then_with(|| entry.key_hash.cmp(&key.key_hash))
-}
-
 fn same_entry_key(left: &DenyEntry, right: &DenyEntry) -> bool {
     left.tenant_id == right.tenant_id
         && left.namespace == right.namespace
         && left.key_hash == right.key_hash
+}
+
+fn compare_compact_entries_by_key(left: &CompactDenyEntry, right: &CompactDenyEntry) -> Ordering {
+    left.tenant_id
+        .cmp(&right.tenant_id)
+        .then_with(|| left.namespace.cmp(&right.namespace))
+        .then_with(|| left.key_hash.cmp(&right.key_hash))
+}
+
+fn compare_compact_entry_to_key(
+    entry: &CompactDenyEntry,
+    tenant_id: u32,
+    namespace: u32,
+    key_hash: u64,
+) -> Ordering {
+    entry
+        .tenant_id
+        .cmp(&tenant_id)
+        .then_with(|| entry.namespace.cmp(&namespace))
+        .then_with(|| entry.key_hash.cmp(&key_hash))
 }
 
 struct CompiledRulePattern {
