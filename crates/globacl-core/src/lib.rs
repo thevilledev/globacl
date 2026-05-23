@@ -3582,6 +3582,30 @@ mod tests {
     }
 
     #[test]
+    fn payload_signature_accepts_non_default_keypair() {
+        // RFC 8032 Ed25519 test vector 2.
+        let private_key = "hex:4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
+        let public_key = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+        let payload = [0x72];
+        let expected_signature = concat!(
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da",
+            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+        );
+
+        let signature = payload_signature_hex(private_key, &payload).unwrap();
+        assert_eq!(signature, expected_signature);
+        assert!(verify_payload_signature(public_key, &payload, &signature).unwrap());
+        assert!(
+            !verify_payload_signature(DEFAULT_SIGNATURE_PUBLIC_KEY, &payload, &signature).unwrap()
+        );
+
+        let formatted = format_payload_signature("custom-ed25519", private_key, &payload).unwrap();
+        assert!(formatted.contains("algorithm=ed25519"));
+        assert!(formatted.contains("key_id=custom-ed25519"));
+        assert!(formatted.contains(expected_signature));
+    }
+
+    #[test]
     fn gap_detection_rejects_out_of_order_apply() {
         let mut source = SourceOfTruth::new(1, "local");
         let first = source.commit(request("op-1", "u1", Action::Deny)).unwrap();
