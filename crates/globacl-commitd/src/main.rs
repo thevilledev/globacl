@@ -2,10 +2,11 @@ use globacl_core::{
     append_mutation_to_log, decode_mutation, decode_mutation_stream, decode_snapshot,
     deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
     format_commit_outcome, format_decision, format_payload_signature, format_watermarks, http_get,
-    http_post, load_all_logs, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
-    read_http_request, rule_requires_blast_radius_override, write_delta_bundle_file,
-    write_http_response, write_snapshot_file, Action, ApplyStatus, DeliveryPriority, DenyRequest,
-    GlobAclError, Mutation, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
+    http_post, load_all_logs, nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix,
+    parse_form_lines, parse_query_path, parse_watermarks, read_http_request,
+    rule_requires_blast_radius_override, write_delta_bundle_file, write_http_response,
+    write_snapshot_file, Action, ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError,
+    Mutation, Result, RuleRequest, Snapshot, SourceOfTruth, DEFAULT_SHARD_COUNT,
     DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
 };
 use std::env;
@@ -32,6 +33,8 @@ struct App {
     replication: ReplicationConfig,
     consensus: Mutex<ConsensusState>,
     sync_status: Mutex<SyncStatus>,
+    publisher: Option<PublisherConfig>,
+    publisher_status: Mutex<PublisherStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +117,22 @@ struct SyncStatus {
     sync_errors: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PublisherConfig {
+    nats_addr: String,
+    stream: String,
+    subject_prefix: String,
+    publish_interval_ms: u64,
+    autocreate_stream: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PublisherStatus {
+    last_published: Vec<u64>,
+    last_publish_unix: u64,
+    publish_errors: u64,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let data_dir = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("data/commitd"));
@@ -141,6 +160,16 @@ fn main() -> Result<()> {
     let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
         .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
     let replication = replication_config(bind_addr)?;
+    let publisher = publisher_config()?;
+    if let Some(publisher) = &publisher {
+        if publisher.autocreate_stream {
+            nats_jetstream_ensure_stream(
+                &publisher.nats_addr,
+                &publisher.stream,
+                &[format!("{}.>", publisher.subject_prefix)],
+            )?;
+        }
+    }
     let consensus = load_consensus_state(&consensus_path, &replication)?;
     let mutations = load_all_logs(&log_dir, shard_count)?;
     let state = SourceOfTruth::from_mutations(shard_count, &replication.cluster_id, mutations)?;
@@ -169,6 +198,12 @@ fn main() -> Result<()> {
             last_peer_sync_unix: 0,
             sync_errors: 0,
         }),
+        publisher,
+        publisher_status: Mutex::new(PublisherStatus {
+            last_published: vec![0; shard_count as usize],
+            last_publish_unix: 0,
+            publish_errors: 0,
+        }),
     });
 
     if canary_interval_secs > 0 {
@@ -183,6 +218,11 @@ fn main() -> Result<()> {
         let app = Arc::clone(&app);
         let interval = Duration::from_millis(app.replication.sync_interval_ms);
         thread::spawn(move || control_sync_loop(app, interval));
+    }
+    if let Some(publisher) = &app.publisher {
+        let app = Arc::clone(&app);
+        let interval = Duration::from_millis(publisher.publish_interval_ms);
+        thread::spawn(move || publisher_loop(app, interval));
     }
 
     let listener = TcpListener::bind(bind_addr)?;
@@ -231,8 +271,9 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let state = lock_state(&app)?;
             let consensus = lock_consensus(&app)?.clone();
             let sync_status = lock_sync_status(&app)?.clone();
+            let publisher_status = lock_publisher_status(&app)?.clone();
             let body = format!(
-                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
+                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
                 consensus.role.as_str(),
                 app.replication.node_id,
                 app.replication.cluster_id,
@@ -245,6 +286,9 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.shard_count(),
                 state.entries_len(),
                 state.mutations_len(),
+                app.publisher.is_some(),
+                publisher_status.last_publish_unix,
+                publisher_status.publish_errors,
                 sync_status.last_peer_sync_unix,
                 sync_status.sync_errors
             );
@@ -1240,6 +1284,73 @@ fn sync_from_leader(app: &App) -> Result<()> {
     Ok(())
 }
 
+fn publisher_loop(app: Arc<App>, interval: Duration) {
+    loop {
+        if let Err(err) = publish_committed_mutations(&app) {
+            eprintln!("commitd JetStream publish failed: {err}");
+            if let Ok(mut status) = lock_publisher_status(&app) {
+                status.publish_errors += 1;
+            }
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn publish_committed_mutations(app: &App) -> Result<()> {
+    let Some(publisher) = &app.publisher else {
+        return Ok(());
+    };
+    if app.replication.is_clustered() && !is_write_leader(app)? {
+        return Ok(());
+    }
+
+    let last_published = lock_publisher_status(app)?.last_published.clone();
+    let mutations = {
+        let state = lock_state(app)?;
+        let mut mutations = Vec::new();
+        for shard_id in 0..state.shard_count() {
+            let from_seq = last_published.get(shard_id as usize).copied().unwrap_or(0);
+            mutations.extend(state.mutations_for_shard(shard_id, from_seq));
+        }
+        mutations.sort_by_key(|mutation| {
+            (
+                mutation.committed_at_unix,
+                mutation.commit_id.shard_id,
+                mutation.commit_id.seq,
+            )
+        });
+        mutations
+    };
+
+    if mutations.is_empty() {
+        return Ok(());
+    }
+
+    let mut next_published = last_published;
+    for mutation in mutations {
+        let subject = mutation_subject(&publisher.subject_prefix, &mutation);
+        nats_jetstream_publish(&publisher.nats_addr, &subject, &encode_mutation(&mutation))?;
+        let slot = mutation.commit_id.shard_id as usize;
+        if let Some(seq) = next_published.get_mut(slot) {
+            *seq = (*seq).max(mutation.commit_id.seq);
+        }
+    }
+
+    let mut status = lock_publisher_status(app)?;
+    status.last_published = next_published;
+    status.last_publish_unix = now_unix();
+    Ok(())
+}
+
+fn mutation_subject(prefix: &str, mutation: &Mutation) -> String {
+    format!(
+        "{}.{}.shard.{}",
+        prefix,
+        mutation.delivery_priority.as_str(),
+        mutation.commit_id.shard_id
+    )
+}
+
 fn canary_loop(app: Arc<App>, interval: Duration) {
     loop {
         if let Err(err) = commit_canary(&app) {
@@ -1314,6 +1425,12 @@ fn lock_sync_status(app: &App) -> Result<std::sync::MutexGuard<'_, SyncStatus>> 
         .map_err(|_| GlobAclError::InvalidData("sync status lock poisoned".to_owned()))
 }
 
+fn lock_publisher_status(app: &App) -> Result<std::sync::MutexGuard<'_, PublisherStatus>> {
+    app.publisher_status
+        .lock()
+        .map_err(|_| GlobAclError::InvalidData("publisher status lock poisoned".to_owned()))
+}
+
 fn requires_leader(method: &str, route: &str) -> bool {
     method == "POST"
         && matches!(
@@ -1363,6 +1480,48 @@ fn current_leader_addr(app: &App) -> Result<Option<String>> {
             .peer_addr(&node_id)
             .map(|addr| addr.to_owned())
     }))
+}
+
+fn publisher_config() -> Result<Option<PublisherConfig>> {
+    let mode = env::var("GLOBACL_COMMITD_PUBLISHER")
+        .or_else(|_| env::var("GLOBACL_PUBLISHER"))
+        .unwrap_or_else(|_| {
+            if env::var("GLOBACL_NATS_ADDR")
+                .or_else(|_| env::var("GLOBACL_NATS_URL"))
+                .is_ok()
+            {
+                "jetstream".to_owned()
+            } else {
+                "none".to_owned()
+            }
+        });
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "off" | "disabled" => Ok(None),
+        "jetstream" | "nats" | "nats_jetstream" => {
+            let nats_addr = env::var("GLOBACL_NATS_ADDR")
+                .or_else(|_| env::var("GLOBACL_NATS_URL"))
+                .unwrap_or_else(|_| "127.0.0.1:4222".to_owned());
+            let stream = env::var("GLOBACL_NATS_STREAM").unwrap_or_else(|_| "GLOBACL".to_owned());
+            let subject_prefix =
+                env::var("GLOBACL_NATS_SUBJECT_PREFIX").unwrap_or_else(|_| "globacl".to_owned());
+            let publish_interval_ms = env::var("GLOBACL_NATS_PUBLISH_MS")
+                .ok()
+                .map(|value| parse_env_u64(&value, "GLOBACL_NATS_PUBLISH_MS"))
+                .transpose()?
+                .unwrap_or(250);
+            let autocreate_stream = env_bool("GLOBACL_NATS_AUTOCREATE", true);
+            Ok(Some(PublisherConfig {
+                nats_addr,
+                stream,
+                subject_prefix,
+                publish_interval_ms,
+                autocreate_stream,
+            }))
+        }
+        other => Err(GlobAclError::Parse(format!(
+            "unknown GLOBACL_COMMITD_PUBLISHER mode {other:?}"
+        ))),
+    }
 }
 
 fn required_query<'a>(
@@ -1498,6 +1657,18 @@ fn parse_env_u64(value: &str, field: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 fn load_consensus_state(path: &Path, replication: &ReplicationConfig) -> Result<ConsensusState> {

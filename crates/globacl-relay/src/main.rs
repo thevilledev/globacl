@@ -1,23 +1,73 @@
 use globacl_core::{
-    http_get, http_post, now_unix, parse_form_lines, read_http_request, write_http_response,
-    GlobAclError, PopAck, Result,
+    decode_mutation, decode_mutation_stream, decode_snapshot, encode_mutation_stream,
+    format_payload_signature, format_watermarks, http_get, http_post, nats_ack,
+    nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream, nats_jetstream_pull, now_unix,
+    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, write_http_response,
+    DeliveryPriority, GlobAclError, HttpResponse, Mutation, PopAck, Result, DEFAULT_SHARD_COUNT,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_SECRET,
 };
 use std::collections::HashMap;
 use std::env;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 struct App {
-    control_addr: String,
+    source: Arc<dyn RelaySource>,
     relay_id: String,
     location: String,
     acks: Mutex<HashMap<String, PopAck>>,
 }
 
+struct SourceHealth {
+    ok: bool,
+    details: String,
+}
+
+trait RelaySource: Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn upstream_addr(&self) -> &str;
+    fn health(&self) -> Result<SourceHealth>;
+    fn get(&self, path: &str) -> Result<HttpResponse>;
+    fn post(&self, path: &str, body: &[u8]) -> Result<HttpResponse>;
+}
+
+struct HttpPullSource {
+    upstream_addr: String,
+}
+
+struct JetStreamSource {
+    bootstrap_addr: String,
+    nats_addr: String,
+    stream: String,
+    durable: String,
+    batch: usize,
+    signature_key_id: String,
+    signature_secret: String,
+    cache: Mutex<RelayCache>,
+    status: Mutex<JetStreamStatus>,
+}
+
+#[derive(Clone, Debug)]
+struct RelayCache {
+    base_watermarks: Vec<u64>,
+    watermarks: Vec<u64>,
+    mutations: Vec<Vec<Mutation>>,
+}
+
+#[derive(Clone, Debug)]
+struct JetStreamStatus {
+    last_pull_unix: u64,
+    applied_messages: u64,
+    duplicate_messages: u64,
+    gap_repairs: u64,
+    errors: u64,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let control_addr = args
+    let upstream_addr = args
         .get(1)
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:7000".to_owned());
@@ -27,8 +77,9 @@ fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "relay-local".to_owned());
     let location = args.get(4).cloned().unwrap_or_else(|| "local".to_owned());
+    let source = build_source(&upstream_addr, &relay_id)?;
     let app = Arc::new(App {
-        control_addr,
+        source,
         relay_id,
         location,
         acks: Mutex::new(HashMap::new()),
@@ -36,8 +87,11 @@ fn main() -> Result<()> {
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
-        "globacl-relay listening on {bind_addr}; relay_id={}; location={}; upstream={}",
-        app.relay_id, app.location, app.control_addr
+        "globacl-relay listening on {bind_addr}; relay_id={}; location={}; source={}; upstream={}",
+        app.relay_id,
+        app.location,
+        app.source.kind(),
+        app.source.upstream_addr()
     );
 
     for stream in listener.incoming() {
@@ -57,33 +111,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn build_source(upstream_addr: &str, relay_id: &str) -> Result<Arc<dyn RelaySource>> {
+    let mode = env::var("GLOBACL_RELAY_SOURCE").unwrap_or_else(|_| "http".to_owned());
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "http" | "pull" | "proxy" | "pull_proxy" => Ok(Arc::new(HttpPullSource {
+            upstream_addr: upstream_addr.to_owned(),
+        })),
+        "jetstream" | "nats" | "nats_jetstream" => {
+            let source = Arc::new(JetStreamSource::new(upstream_addr.to_owned(), relay_id)?);
+            let loop_source = Arc::clone(&source);
+            thread::spawn(move || jetstream_pull_loop(loop_source));
+            Ok(source)
+        }
+        other => Err(GlobAclError::Parse(format!(
+            "unknown GLOBACL_RELAY_SOURCE mode {other:?}"
+        ))),
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     let request = read_http_request(&mut stream)?;
-    let content_type = if request.path.starts_with("/v1/mutations")
-        || request.path.starts_with("/v1/snapshot")
-        || request.path.starts_with("/v1/delta_bundle")
-    {
-        "application/octet-stream"
-    } else {
-        "text/plain"
-    };
 
     match request.method.as_str() {
         "GET" if request.path == "/health" => {
-            let upstream = http_get(&app.control_addr, "/health")?;
+            let health = app.source.health()?;
             let ack_count = lock_acks(&app)?.len();
-            let status = if upstream.status_code == 200 {
-                format!(
-                    "status=ok\nrole=relay\nrelay_id={}\nlocation={}\nupstream=ok\nack_count={ack_count}\n",
-                    app.relay_id, app.location
-                )
-            } else {
-                format!(
-                    "status=degraded\nrole=relay\nrelay_id={}\nlocation={}\nupstream=bad\nack_count={ack_count}\n",
-                    app.relay_id, app.location
-                )
-            };
-            write_http_response(&mut stream, 200, "text/plain", status.as_bytes())?;
+            let status = if health.ok { "ok" } else { "degraded" };
+            let upstream = if health.ok { "ok" } else { "bad" };
+            let body = format!(
+                "status={status}\nrole=relay\nrelay_id={}\nlocation={}\nsource={}\nupstream={upstream}\nupstream_addr={}\nack_count={ack_count}\n{}\n",
+                app.relay_id,
+                app.location,
+                app.source.kind(),
+                app.source.upstream_addr(),
+                health.details.trim_end()
+            );
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         "GET" if request.path == "/v1/acks" => {
             let body = format_acks(&app)?;
@@ -97,20 +160,20 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
         }
         "GET" => {
-            let upstream = http_get(&app.control_addr, &request.path)?;
+            let upstream = app.source.get(&request.path)?;
             write_http_response(
                 &mut stream,
                 upstream.status_code,
-                content_type,
+                content_type_for(&request.path),
                 &upstream.body,
             )?;
         }
         "POST" => {
-            let upstream = http_post(&app.control_addr, &request.path, &request.body)?;
+            let upstream = app.source.post(&request.path, &request.body)?;
             write_http_response(
                 &mut stream,
                 upstream.status_code,
-                content_type,
+                content_type_for(&request.path),
                 &upstream.body,
             )?;
         }
@@ -124,10 +187,421 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
+impl RelaySource for HttpPullSource {
+    fn kind(&self) -> &'static str {
+        "http_pull"
+    }
+
+    fn upstream_addr(&self) -> &str {
+        &self.upstream_addr
+    }
+
+    fn health(&self) -> Result<SourceHealth> {
+        let upstream = http_get(&self.upstream_addr, "/health")?;
+        Ok(SourceHealth {
+            ok: upstream.status_code == 200,
+            details: format!("http_status={}\n", upstream.status_code),
+        })
+    }
+
+    fn get(&self, path: &str) -> Result<HttpResponse> {
+        http_get(&self.upstream_addr, path)
+    }
+
+    fn post(&self, path: &str, body: &[u8]) -> Result<HttpResponse> {
+        http_post(&self.upstream_addr, path, body)
+    }
+}
+
+impl JetStreamSource {
+    fn new(bootstrap_addr: String, relay_id: &str) -> Result<Self> {
+        let nats_addr = env::var("GLOBACL_NATS_ADDR")
+            .or_else(|_| env::var("GLOBACL_NATS_URL"))
+            .unwrap_or_else(|_| "127.0.0.1:4222".to_owned());
+        let stream = env::var("GLOBACL_NATS_STREAM").unwrap_or_else(|_| "GLOBACL".to_owned());
+        let subject_prefix =
+            env::var("GLOBACL_NATS_SUBJECT_PREFIX").unwrap_or_else(|_| "globacl".to_owned());
+        let filter_subject = env::var("GLOBACL_NATS_SUBJECT_FILTER")
+            .unwrap_or_else(|_| format!("{subject_prefix}.>"));
+        let durable =
+            env::var("GLOBACL_NATS_CONSUMER").unwrap_or_else(|_| sanitize_nats_name(relay_id));
+        let batch = env::var("GLOBACL_NATS_BATCH")
+            .ok()
+            .map(|value| parse_env_usize(&value, "GLOBACL_NATS_BATCH"))
+            .transpose()?
+            .unwrap_or(128);
+        if env_bool("GLOBACL_NATS_AUTOCREATE", true) {
+            nats_jetstream_ensure_stream(
+                &nats_addr,
+                &stream,
+                std::slice::from_ref(&filter_subject),
+            )?;
+            nats_jetstream_ensure_consumer(&nats_addr, &stream, &durable, &filter_subject)?;
+        }
+        let signature_key_id = env::var("GLOBACL_SIGNATURE_KEY_ID")
+            .unwrap_or_else(|_| DEFAULT_SIGNATURE_KEY_ID.to_owned());
+        let signature_secret = env::var("GLOBACL_SIGNATURE_SECRET")
+            .unwrap_or_else(|_| DEFAULT_SIGNATURE_SECRET.to_owned());
+        let cache = bootstrap_cache(&bootstrap_addr)?;
+        Ok(Self {
+            bootstrap_addr,
+            nats_addr,
+            stream,
+            durable,
+            batch,
+            signature_key_id,
+            signature_secret,
+            cache: Mutex::new(cache),
+            status: Mutex::new(JetStreamStatus {
+                last_pull_unix: 0,
+                applied_messages: 0,
+                duplicate_messages: 0,
+                gap_repairs: 0,
+                errors: 0,
+            }),
+        })
+    }
+
+    fn pull_once(&self) -> Result<usize> {
+        let messages = nats_jetstream_pull(
+            &self.nats_addr,
+            &self.stream,
+            &self.durable,
+            self.batch,
+            1_000,
+        )?;
+        let count = messages.len();
+        for message in messages {
+            let mutation = decode_mutation(&message.payload)?;
+            let applied = self.apply_or_repair(mutation)?;
+            if applied {
+                lock_jetstream_status(self)?.applied_messages += 1;
+            } else {
+                lock_jetstream_status(self)?.duplicate_messages += 1;
+            }
+            if let Some(reply_to) = message.reply_to {
+                nats_ack(&self.nats_addr, &reply_to)?;
+            }
+        }
+        if count > 0 {
+            lock_jetstream_status(self)?.last_pull_unix = now_unix();
+        }
+        Ok(count)
+    }
+
+    fn apply_or_repair(&self, mutation: Mutation) -> Result<bool> {
+        match self.apply_to_cache(mutation.clone()) {
+            Ok(applied) => Ok(applied),
+            Err(GlobAclError::Gap {
+                shard_id,
+                expected_seq,
+                received_seq,
+            }) => {
+                self.repair_gap(shard_id, expected_seq.saturating_sub(1), received_seq)?;
+                lock_jetstream_status(self)?.gap_repairs += 1;
+                self.apply_to_cache(mutation)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn apply_to_cache(&self, mutation: Mutation) -> Result<bool> {
+        let mut cache = lock_cache(self)?;
+        cache.apply(mutation)
+    }
+
+    fn repair_gap(&self, shard_id: u16, from_seq: u64, to_seq: u64) -> Result<()> {
+        let path = format!("/v1/delta_bundle?shard={shard_id}&from_seq={from_seq}&to_seq={to_seq}");
+        let response = http_get(&self.bootstrap_addr, &path)?;
+        if response.status_code != 200 {
+            return Err(GlobAclError::InvalidData(format!(
+                "bootstrap returned status {} for {path}",
+                response.status_code
+            )));
+        }
+        let mutations = decode_mutation_stream(&response.body)?;
+        let mut cache = lock_cache(self)?;
+        for mutation in mutations {
+            cache.apply(mutation)?;
+        }
+        Ok(())
+    }
+
+    fn local_mutations_for_path(&self, path: &str) -> Result<Option<Vec<Mutation>>> {
+        let (route, query) = parse_query_path(path);
+        let shard_id = required_query_u16(&query, "shard")?;
+        let from_seq = query
+            .get("from_seq")
+            .or_else(|| query.get("from"))
+            .map(|value| parse_query_u64(value, "from_seq"))
+            .transpose()?
+            .unwrap_or(0);
+        let priority_filter = query
+            .get("delivery_priority")
+            .or_else(|| query.get("channel"))
+            .map(|value| DeliveryPriority::from_name(value))
+            .transpose()?;
+        let cache = lock_cache(self)?;
+        if route == "/v1/mutations" || route == "/v1/mutations.sig" {
+            return cache.mutations_for_shard(shard_id, from_seq, priority_filter);
+        }
+        let to_seq = query
+            .get("to_seq")
+            .or_else(|| query.get("to"))
+            .map(|value| parse_query_u64(value, "to_seq"))
+            .transpose()?
+            .unwrap_or(u64::MAX);
+        cache.delta_bundle(shard_id, from_seq, to_seq)
+    }
+
+    fn signed_stream_response(&self, mutations: Vec<Mutation>) -> HttpResponse {
+        let payload = encode_mutation_stream(&mutations);
+        HttpResponse {
+            status_code: 200,
+            body: format_payload_signature(
+                &self.signature_key_id,
+                &self.signature_secret,
+                &payload,
+            )
+            .into_bytes(),
+        }
+    }
+}
+
+impl RelaySource for JetStreamSource {
+    fn kind(&self) -> &'static str {
+        "jetstream"
+    }
+
+    fn upstream_addr(&self) -> &str {
+        &self.bootstrap_addr
+    }
+
+    fn health(&self) -> Result<SourceHealth> {
+        let status = lock_jetstream_status(self)?.clone();
+        let bootstrap_status = http_get(&self.bootstrap_addr, "/health")
+            .map(|response| response.status_code)
+            .unwrap_or(503);
+        Ok(SourceHealth {
+            ok: status.errors == 0 || status.last_pull_unix > 0,
+            details: format!(
+                "nats_addr={}\nstream={}\nconsumer={}\nbootstrap_status={bootstrap_status}\nlast_pull_unix={}\napplied_messages={}\nduplicate_messages={}\ngap_repairs={}\njetstream_errors={}\n",
+                self.nats_addr,
+                self.stream,
+                self.durable,
+                status.last_pull_unix,
+                status.applied_messages,
+                status.duplicate_messages,
+                status.gap_repairs,
+                status.errors
+            ),
+        })
+    }
+
+    fn get(&self, path: &str) -> Result<HttpResponse> {
+        let (route, _) = parse_query_path(path);
+        match route.as_str() {
+            "/v1/watermarks" => {
+                let cache = lock_cache(self)?;
+                Ok(HttpResponse {
+                    status_code: 200,
+                    body: format_watermarks(&cache.watermarks).into_bytes(),
+                })
+            }
+            "/v1/mutations" | "/v1/delta_bundle" => {
+                if let Some(mutations) = self.local_mutations_for_path(path)? {
+                    Ok(HttpResponse {
+                        status_code: 200,
+                        body: encode_mutation_stream(&mutations),
+                    })
+                } else {
+                    http_get(&self.bootstrap_addr, path)
+                }
+            }
+            "/v1/mutations.sig" | "/v1/delta_bundle.sig" => {
+                if let Some(mutations) = self.local_mutations_for_path(path)? {
+                    Ok(self.signed_stream_response(mutations))
+                } else {
+                    http_get(&self.bootstrap_addr, path)
+                }
+            }
+            _ => http_get(&self.bootstrap_addr, path),
+        }
+    }
+
+    fn post(&self, path: &str, body: &[u8]) -> Result<HttpResponse> {
+        http_post(&self.bootstrap_addr, path, body)
+    }
+}
+
+impl RelayCache {
+    fn new(base_watermarks: Vec<u64>) -> Self {
+        let shard_count = base_watermarks.len().max(1);
+        Self {
+            base_watermarks: base_watermarks.clone(),
+            watermarks: base_watermarks,
+            mutations: vec![Vec::new(); shard_count],
+        }
+    }
+
+    fn apply(&mut self, mutation: Mutation) -> Result<bool> {
+        let shard_id = mutation.commit_id.shard_id as usize;
+        if shard_id >= self.watermarks.len() {
+            return Err(GlobAclError::InvalidData(format!(
+                "shard {} is outside relay shard_count {}",
+                mutation.commit_id.shard_id,
+                self.watermarks.len()
+            )));
+        }
+        let current_seq = self.watermarks[shard_id];
+        if mutation.commit_id.seq <= current_seq {
+            return Ok(false);
+        }
+        let expected_seq = current_seq + 1;
+        if mutation.commit_id.seq != expected_seq {
+            return Err(GlobAclError::Gap {
+                shard_id: mutation.commit_id.shard_id,
+                expected_seq,
+                received_seq: mutation.commit_id.seq,
+            });
+        }
+        self.watermarks[shard_id] = mutation.commit_id.seq;
+        self.mutations[shard_id].push(mutation);
+        Ok(true)
+    }
+
+    fn mutations_for_shard(
+        &self,
+        shard_id: u16,
+        from_seq: u64,
+        priority_filter: Option<DeliveryPriority>,
+    ) -> Result<Option<Vec<Mutation>>> {
+        let shard_index = shard_id as usize;
+        if shard_index >= self.watermarks.len() {
+            return Err(GlobAclError::InvalidData(format!(
+                "shard {shard_id} is outside relay shard_count {}",
+                self.watermarks.len()
+            )));
+        }
+        if from_seq < self.base_watermarks[shard_index] {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.mutations[shard_index]
+                .iter()
+                .filter(|mutation| mutation.commit_id.seq > from_seq)
+                .filter(|mutation| {
+                    priority_filter
+                        .map(|priority| mutation.delivery_priority == priority)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect(),
+        ))
+    }
+
+    fn delta_bundle(
+        &self,
+        shard_id: u16,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Result<Option<Vec<Mutation>>> {
+        let shard_index = shard_id as usize;
+        if shard_index >= self.watermarks.len() {
+            return Err(GlobAclError::InvalidData(format!(
+                "shard {shard_id} is outside relay shard_count {}",
+                self.watermarks.len()
+            )));
+        }
+        if from_seq < self.base_watermarks[shard_index] {
+            return Ok(None);
+        }
+        let upper = to_seq.min(self.watermarks[shard_index]);
+        let mutations = self.mutations[shard_index]
+            .iter()
+            .filter(|mutation| mutation.commit_id.seq > from_seq && mutation.commit_id.seq <= upper)
+            .cloned()
+            .collect::<Vec<_>>();
+        if upper > from_seq && mutations.len() != (upper - from_seq) as usize {
+            return Ok(None);
+        }
+        Ok(Some(mutations))
+    }
+}
+
+fn jetstream_pull_loop(source: Arc<JetStreamSource>) {
+    loop {
+        match source.pull_once() {
+            Ok(0) => thread::sleep(Duration::from_millis(100)),
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("JetStream relay pull failed: {err}");
+                if let Ok(mut status) = lock_jetstream_status(&source) {
+                    status.errors += 1;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn bootstrap_cache(bootstrap_addr: &str) -> Result<RelayCache> {
+    let snapshot_response = http_get(bootstrap_addr, "/v1/snapshot");
+    if let Ok(response) = snapshot_response {
+        if response.status_code == 200 {
+            let snapshot = decode_snapshot(&response.body)?;
+            return Ok(RelayCache::new(snapshot.watermarks));
+        }
+    }
+
+    let watermarks_response = http_get(bootstrap_addr, "/v1/watermarks");
+    if let Ok(response) = watermarks_response {
+        if response.status_code == 200 {
+            return Ok(RelayCache::new(parse_watermarks(&response.body)?));
+        }
+    }
+
+    let shard_count = env::var("GLOBACL_SHARD_COUNT")
+        .ok()
+        .map(|value| parse_env_u16(&value, "GLOBACL_SHARD_COUNT"))
+        .transpose()?
+        .unwrap_or(DEFAULT_SHARD_COUNT);
+    Ok(RelayCache::new(vec![0; shard_count as usize]))
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    if path.ends_with(".sig") {
+        "text/plain"
+    } else if path.starts_with("/v1/mutations")
+        || path.starts_with("/v1/snapshot")
+        || path.starts_with("/v1/delta_bundle")
+    {
+        "application/octet-stream"
+    } else {
+        "text/plain"
+    }
+}
+
 fn lock_acks(app: &App) -> Result<std::sync::MutexGuard<'_, HashMap<String, PopAck>>> {
     app.acks
         .lock()
         .map_err(|_| GlobAclError::InvalidData("ack lock poisoned".to_owned()))
+}
+
+fn lock_cache(source: &JetStreamSource) -> Result<std::sync::MutexGuard<'_, RelayCache>> {
+    source
+        .cache
+        .lock()
+        .map_err(|_| GlobAclError::InvalidData("relay cache lock poisoned".to_owned()))
+}
+
+fn lock_jetstream_status(
+    source: &JetStreamSource,
+) -> Result<std::sync::MutexGuard<'_, JetStreamStatus>> {
+    source
+        .status
+        .lock()
+        .map_err(|_| GlobAclError::InvalidData("JetStream status lock poisoned".to_owned()))
 }
 
 fn format_acks(app: &App) -> Result<String> {
@@ -153,4 +627,61 @@ fn format_acks(app: &App) -> Result<String> {
         ));
     }
     Ok(body)
+}
+
+fn required_query_u16(query: &HashMap<String, String>, key: &str) -> Result<u16> {
+    query
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GlobAclError::Parse(format!("missing query parameter {key}")))?
+        .parse::<u16>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid {key}: {err}")))
+}
+
+fn parse_query_u64(value: &str, field: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
+}
+
+fn parse_env_usize(value: &str, field: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
+}
+
+fn parse_env_u16(value: &str, field: &str) -> Result<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|err| GlobAclError::Parse(format!("invalid {field}: {err}")))
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn sanitize_nats_name(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if out.is_empty() {
+        out = "relay".to_owned();
+    }
+    out
 }

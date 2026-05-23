@@ -163,6 +163,20 @@ GLOBACL_COMMITD_ELECTION_MS   follower election timeout base
 GLOBACL_COMMITD_SYNC_MS       follower mutation catch-up interval
 ```
 
+Relay source selection is runtime-configurable:
+
+```text
+GLOBACL_RELAY_SOURCE          http, pull_proxy, jetstream, or nats
+GLOBACL_NATS_ADDR             NATS server address, for example nats://nats:4222
+GLOBACL_NATS_STREAM           JetStream stream name, default GLOBACL
+GLOBACL_NATS_SUBJECT_PREFIX   subject prefix, default globacl
+GLOBACL_NATS_CONSUMER         durable consumer name, default relay id
+GLOBACL_NATS_BATCH            pull batch size, default 128
+GLOBACL_NATS_AUTOCREATE       create stream/consumer when true
+```
+
+When `GLOBACL_COMMITD_PUBLISHER=jetstream` is set on commitd, the leader scans its durable mutation log and publishes committed mutations to JetStream subjects such as `globacl.p0.shard.42`. Relays in JetStream mode consume that durable stream into a local mutation cache. Agents keep using the relay HTTP API in both modes.
+
 ## Production Notes
 
 These manifests prove the distribution mechanics, but they are intentionally not a complete production platform.
@@ -173,7 +187,7 @@ For production:
 control: multiple stateless ACL API pods behind a load balancer
 commitd: 3 or 5 ACL commit service pods with persistent volumes
 source of truth: built-in ACL-specific Raft commit log owned by commitd
-logs: Kafka/Pulsar/NATS/Redpanda or cloud Pub/Sub
+logs: HTTP pull-proxy for simple deployments, NATS JetStream in this repo, or Kafka/Pulsar/Redpanda/cloud Pub/Sub behind the same relay-source interface
 snapshots: durable object storage
 relays: regional/PoP relay pools with autoscaling
 agents: one per node or service workload depending latency needs

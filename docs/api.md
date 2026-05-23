@@ -162,6 +162,17 @@ p2 repair/snapshot work
 
 The exact edge apply path still uses contiguous per-shard sequence numbers. Priority filtering on `/v1/mutations` is intended for inspection and relay/channel work, not for applying out-of-order mutations.
 
+## Relay Sources
+
+The relay exposes the same HTTP API to agents in both source modes:
+
+```text
+GLOBACL_RELAY_SOURCE=http       proxy/pull from control or parent relay
+GLOBACL_RELAY_SOURCE=jetstream  consume NATS JetStream into relay-local cache
+```
+
+In JetStream mode, commitd must publish committed mutations by setting `GLOBACL_COMMITD_PUBLISHER=jetstream`. The relay still uses its HTTP upstream as the bootstrap and repair path for snapshots, signatures, old gaps, canaries, and writes.
+
 ## Relay Acknowledgements
 
 PoP agents report applied watermarks to relays with `POST /v1/ack`:

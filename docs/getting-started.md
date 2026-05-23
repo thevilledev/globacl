@@ -31,6 +31,20 @@ cargo run -p globacl-relay -- 127.0.0.1:7000 127.0.0.1:7001 relay-local local
 
 The relay can point at control or at another relay, which lets you chain `global -> region -> PoP` in the local model.
 
+The default relay source is HTTP pull-proxy. To use NATS JetStream instead, run NATS separately with JetStream enabled, start commitd with publishing enabled, and start the relay with `GLOBACL_RELAY_SOURCE=jetstream`:
+
+```sh
+GLOBACL_COMMITD_PUBLISHER=jetstream \
+GLOBACL_NATS_ADDR=127.0.0.1:4222 \
+cargo run -p globacl-commitd -- data/commitd 127.0.0.1:7003 4096 0
+
+GLOBACL_RELAY_SOURCE=jetstream \
+GLOBACL_NATS_ADDR=127.0.0.1:4222 \
+cargo run -p globacl-relay -- 127.0.0.1:7000 127.0.0.1:7001 relay-local local
+```
+
+In JetStream mode, the relay still exposes the same HTTP API to agents. It uses control as the bootstrap/repair path for snapshots, signatures, and old gaps.
+
 Start one PoP agent:
 
 ```sh
