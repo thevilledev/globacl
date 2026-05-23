@@ -25,7 +25,7 @@ cargo run -p globacl-bench --release -- --ci
 cargo run -p globacl-bench --release -- --entries 10000000 --lookups 10000000 --shards 4096
 ```
 
-It reports snapshot/build time, process RSS where supported, estimated state bytes, sampled p50/p95/p99/p99.9 lookup latency, and negative-filter-positive rate. Use `--sample-limit` to cap latency samples for very large runs.
+It reports snapshot/build time, process RSS where supported, estimated state bytes, filter bit/hash settings, sampled p50/p95/p99/p99.9 lookup latency, and negative-filter-positive rate. Use `--sample-limit` to cap latency samples for very large runs.
 
 The core tests cover:
 

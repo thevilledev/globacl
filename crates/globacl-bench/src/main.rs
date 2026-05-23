@@ -105,6 +105,7 @@ fn run(config: BenchConfig) {
     println!("delta_rule_adds={}", stats.delta_rule_adds);
     println!("delta_rule_removes={}", stats.delta_rule_removes);
     println!("filter_bits={}", stats.filter_bits);
+    println!("filter_hashes={}", stats.filter_hashes);
     println!(
         "filter_bits_per_entry={:.3}",
         ratio(stats.filter_bits, stats.base_entries)

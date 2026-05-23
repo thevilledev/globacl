@@ -21,6 +21,8 @@ pub const DEFAULT_SIGNATURE_PRIVATE_KEY: &str =
     "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 pub const DEFAULT_SIGNATURE_PUBLIC_KEY: &str =
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+pub const NEGATIVE_FILTER_BITS_PER_ENTRY: usize = 20;
+pub const NEGATIVE_FILTER_HASHES: usize = 8;
 
 pub type Result<T> = std::result::Result<T, GlobAclError>;
 
@@ -1041,6 +1043,7 @@ pub struct ActiveStateStats {
     pub delta_rule_adds: usize,
     pub delta_rule_removes: usize,
     pub filter_bits: usize,
+    pub filter_hashes: usize,
     pub estimated_bytes: usize,
 }
 
@@ -1229,6 +1232,7 @@ impl ActiveState {
             delta_rule_adds: self.delta_rule_adds.len(),
             delta_rule_removes: self.delta_rule_removes.len(),
             filter_bits: self.base.filter.bit_len,
+            filter_hashes: NEGATIVE_FILTER_HASHES,
             estimated_bytes: base_bytes + overlay_bytes + rule_bytes,
         }
     }
@@ -1507,7 +1511,10 @@ impl NegativeFilter {
             };
         }
 
-        let desired_bits = (entries.len() * 16).next_power_of_two().max(64);
+        let desired_bits = entries
+            .len()
+            .saturating_mul(NEGATIVE_FILTER_BITS_PER_ENTRY)
+            .max(64);
         let words = desired_bits.div_ceil(64);
         let bit_len = words * 64;
         let mut filter = Self {
@@ -1527,7 +1534,9 @@ impl NegativeFilter {
     }
 
     fn insert_parts(&mut self, tenant_id: &str, namespace: &str, key_hash: u64) {
-        for bit_index in self.bit_indexes_parts(tenant_id, namespace, key_hash) {
+        let (first, second) = self.hash_pair_parts(tenant_id, namespace, key_hash);
+        for index in 0..NEGATIVE_FILTER_HASHES {
+            let bit_index = self.bit_index(first, second, index);
             self.bits[bit_index / 64] |= 1u64 << (bit_index % 64);
         }
     }
@@ -1536,21 +1545,29 @@ impl NegativeFilter {
         if self.bit_len == 0 {
             return false;
         }
-        self.bit_indexes_parts(tenant_id, namespace, key_hash)
-            .into_iter()
-            .all(|bit_index| (self.bits[bit_index / 64] & (1u64 << (bit_index % 64))) != 0)
+        let (first, second) = self.hash_pair_parts(tenant_id, namespace, key_hash);
+        for index in 0..NEGATIVE_FILTER_HASHES {
+            let bit_index = self.bit_index(first, second, index);
+            if (self.bits[bit_index / 64] & (1u64 << (bit_index % 64))) == 0 {
+                return false;
+            }
+        }
+        true
     }
 
-    fn bit_indexes_parts(&self, tenant_id: &str, namespace: &str, key_hash: u64) -> [usize; 3] {
+    fn hash_pair_parts(&self, tenant_id: &str, namespace: &str, key_hash: u64) -> (u64, u64) {
         let seed = fingerprint_acl_key_parts(tenant_id, namespace, key_hash);
         let first = splitmix64(seed);
-        let second = splitmix64(seed ^ 0x9e3779b97f4a7c15);
-        let third = splitmix64(seed ^ 0xbf58476d1ce4e5b9);
-        [
-            (first as usize) % self.bit_len,
-            (second as usize) % self.bit_len,
-            (third as usize) % self.bit_len,
-        ]
+        let second = splitmix64(seed ^ 0x9e3779b97f4a7c15) | 1;
+        (first, second)
+    }
+
+    fn bit_index(&self, first: u64, second: u64, index: usize) -> usize {
+        let index = index as u64;
+        let hash = first
+            .wrapping_add(index.wrapping_mul(second))
+            .wrapping_add(index.wrapping_mul(index));
+        (hash as usize) % self.bit_len
     }
 }
 
@@ -3568,6 +3585,7 @@ mod tests {
         source.commit(request("op-1", "u1", Action::Deny)).unwrap();
         let active = ActiveState::from_snapshot(source.snapshot()).unwrap();
 
+        assert_eq!(active.stats().filter_hashes, NEGATIVE_FILTER_HASHES);
         assert!(active.base_filter_may_contain("tenant-a", "user", "u1"));
     }
 
