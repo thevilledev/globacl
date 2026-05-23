@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -994,6 +995,10 @@ pub struct ActiveState {
     watermarks: Vec<u64>,
 }
 
+pub struct ActiveStateHandle {
+    state: ArcSwap<ActiveState>,
+}
+
 #[derive(Clone, Debug)]
 struct ImmutableBase {
     entries: Vec<CompactDenyEntry>,
@@ -1045,6 +1050,26 @@ pub struct ActiveStateStats {
     pub filter_bits: usize,
     pub filter_hashes: usize,
     pub estimated_bytes: usize,
+}
+
+impl ActiveStateHandle {
+    pub fn new(state: ActiveState) -> Self {
+        Self {
+            state: ArcSwap::from_pointee(state),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: Snapshot) -> Result<Self> {
+        Ok(Self::new(ActiveState::from_snapshot(snapshot)?))
+    }
+
+    pub fn load(&self) -> Arc<ActiveState> {
+        self.state.load_full()
+    }
+
+    pub fn store(&self, state: ActiveState) {
+        self.state.store(Arc::new(state));
+    }
 }
 
 impl ActiveState {
@@ -3587,6 +3612,28 @@ mod tests {
 
         assert_eq!(active.stats().filter_hashes, NEGATIVE_FILTER_HASHES);
         assert!(active.base_filter_may_contain("tenant-a", "user", "u1"));
+    }
+
+    #[test]
+    fn active_state_handle_loads_and_swaps_rcu_style() {
+        let mut source = SourceOfTruth::new(16, "local");
+        source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let handle = ActiveStateHandle::from_snapshot(source.snapshot()).unwrap();
+
+        let old_reader = handle.load();
+        assert!(old_reader
+            .lookup("tenant-a", "user", "u1", now_unix())
+            .is_denied());
+
+        handle.store(ActiveState::new(16));
+
+        assert!(old_reader
+            .lookup("tenant-a", "user", "u1", now_unix())
+            .is_denied());
+        assert_eq!(
+            handle.load().lookup("tenant-a", "user", "u1", now_unix()),
+            Decision::Allow
+        );
     }
 
     #[test]

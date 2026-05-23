@@ -85,7 +85,7 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 
 | Component | Role | What it owns |
 | --- | --- | --- |
-| `globacl-core` | Shared engine/library | Domain model, per-shard sequencing, binary snapshots, mutation streams, append logs, delta bundles, compact immutable edge lookup state, compiled IPv4/domain rules, Ed25519 signing helpers, and tests. |
+| `globacl-core` | Shared engine/library | Domain model, per-shard sequencing, binary snapshots, mutation streams, append logs, delta bundles, compact immutable edge lookup state with an RCU-style handle, compiled IPv4/domain rules, Ed25519 signing helpers, and tests. |
 | `globacl-control` | ACL authoring/API gateway | Validates public deny/rule requests, rejects broad updates without override, proxies committed-state reads and writes to `globacl-commitd`, and gives clients a stable API endpoint. |
 | `globacl-commitd` | ACL commit service and source of truth | Elects a fenced leader, assigns shard sequences, replicates committed mutations through quorum, persists mutation logs, aggregates propagation acks, optionally publishes committed mutations to NATS JetStream, writes snapshot archives, records audit entries, serves snapshots/deltas, and performs rollback through forward mutations. |
 | `globacl-relay` | Distribution fanout layer | Uses a pluggable source: HTTP pull-proxy from an upstream control/relay or NATS JetStream consumption into a local mutation cache. It serves the same agent-facing HTTP API in both modes, records and forwards PoP acknowledgements, and can be chained into a relay tree. |

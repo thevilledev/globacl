@@ -1,13 +1,14 @@
 use globacl_core::{
     decode_mutation_stream, decode_snapshot, encode_snapshot, format_decision, http_get, now_unix,
     parse_form_lines, parse_query_path, parse_watermarks, read_http_request, read_snapshot_file,
-    verify_payload_signature, write_http_response, write_snapshot_file, ActiveState, Decision,
-    GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_PUBLIC_KEY,
+    verify_payload_signature, write_http_response, write_snapshot_file, ActiveState,
+    ActiveStateHandle, Decision, GlobAclError, PopAck, Result, DEFAULT_SIGNATURE_KEY_ID,
+    DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ struct App {
     stale_after_secs: u64,
     signature_key_id: String,
     signature_public_key: String,
-    state: RwLock<Arc<ActiveState>>,
+    state: ActiveStateHandle,
     metrics: Mutex<AgentMetrics>,
 }
 
@@ -88,7 +89,7 @@ fn main() -> Result<()> {
         stale_after_secs,
         signature_key_id,
         signature_public_key,
-        state: RwLock::new(Arc::new(ActiveState::from_snapshot(snapshot)?)),
+        state: ActiveStateHandle::from_snapshot(snapshot)?,
         metrics: Mutex::new(AgentMetrics {
             last_sync_unix: started_at,
             last_successful_poll_unix: started_at,
@@ -130,7 +131,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
-            let state = current_state(&app)?;
+            let state = current_state(&app);
             let metrics = lock_metrics(&app)?;
             let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
             let stats = state.stats();
@@ -175,7 +176,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let namespace = required_query(&query, "namespace")?;
             let key = required_query(&query, "key")?;
             let decision = {
-                let state = current_state(&app)?;
+                let state = current_state(&app);
                 state.lookup(tenant_id, namespace, key, now_unix())
             };
             let body = format_decision(&decision);
@@ -191,7 +192,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| GlobAclError::Parse("missing query parameter value".to_owned()))?;
             let decision = {
-                let state = current_state(&app)?;
+                let state = current_state(&app);
                 state.check(tenant_id, namespace, value, now_unix())
             };
             let body = format_decision(&decision);
@@ -199,7 +200,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/snapshot") => {
             let snapshot = {
-                let state = current_state(&app)?;
+                let state = current_state(&app);
                 state.snapshot()
             };
             let body = encode_snapshot(&snapshot);
@@ -224,14 +225,14 @@ fn poll_loop(app: Arc<App>, interval: Duration) {
 
 fn poll_once(app: &Arc<App>) -> Result<()> {
     let shard_count = {
-        let state = current_state(app)?;
+        let state = current_state(app);
         state.shard_count()
     };
     let remote_watermarks = fetch_watermarks(app).ok();
 
     for shard_id in 0..shard_count {
         let from_seq = {
-            let state = current_state(app)?;
+            let state = current_state(app);
             state.watermarks()[shard_id as usize]
         };
         if let Some(remote_watermarks) = &remote_watermarks {
@@ -267,7 +268,7 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
 
         let mut applied = 0u64;
         let (ack_seq, entries, snapshot, next_state) = {
-            let current = current_state(app)?;
+            let current = current_state(app);
             let mut state = current.as_ref().clone();
             for mutation in &mutations {
                 match state.apply_mutation(mutation) {
@@ -299,7 +300,7 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
             (ack_seq, entries, snapshot, state)
         };
         write_snapshot_file(&app.snapshot_path, &snapshot)?;
-        swap_state(app, next_state)?;
+        swap_state(app, next_state);
 
         let mut metrics = lock_metrics(app)?;
         metrics.last_sync_unix = now_unix();
@@ -342,7 +343,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
             )?;
             let mutations = decode_mutation_stream(&response.body)?;
             if !mutations.is_empty() {
-                let current = current_state(app)?;
+                let current = current_state(app);
                 let mut state = current.as_ref().clone();
                 for mutation in &mutations {
                     state.apply_mutation(mutation)?;
@@ -354,7 +355,7 @@ fn repair_gap(app: &Arc<App>, shard_id: u16, from_seq: u64, to_seq: u64) -> Resu
                 let seq = state.watermarks()[shard_id as usize];
                 let entries = state.entries_len();
                 write_snapshot_file(&app.snapshot_path, &snapshot)?;
-                swap_state(app, state)?;
+                swap_state(app, state);
                 send_ack(app, shard_id, seq, entries)?;
                 let mut metrics = lock_metrics(app)?;
                 metrics.last_sync_unix = now_unix();
@@ -383,7 +384,7 @@ fn repair_from_snapshot(app: &Arc<App>) -> Result<()> {
             ack_targets.push((shard_id as u16, seq, state.entries_len()));
         }
     }
-    swap_state(app, state)?;
+    swap_state(app, state);
     for (shard_id, seq, entries) in ack_targets {
         send_ack(app, shard_id, seq, entries)?;
     }
@@ -431,7 +432,7 @@ fn check_canary(app: &Arc<App>) -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let decision = {
-        let state = current_state(app)?;
+        let state = current_state(app);
         state.lookup("globacl", "canary", key, now_unix())
     };
     if matches!(decision, Decision::Deny { .. }) {
@@ -552,19 +553,12 @@ fn signature_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sig", path.display()))
 }
 
-fn current_state(app: &App) -> Result<Arc<ActiveState>> {
-    app.state
-        .read()
-        .map(|state| Arc::clone(&state))
-        .map_err(|_| GlobAclError::InvalidData("active state read lock poisoned".to_owned()))
+fn current_state(app: &App) -> Arc<ActiveState> {
+    app.state.load()
 }
 
-fn swap_state(app: &App, next: ActiveState) -> Result<()> {
-    *app.state
-        .write()
-        .map_err(|_| GlobAclError::InvalidData("active state write lock poisoned".to_owned()))? =
-        Arc::new(next);
-    Ok(())
+fn swap_state(app: &App, next: ActiveState) {
+    app.state.store(next);
 }
 
 fn lock_metrics(app: &App) -> Result<std::sync::MutexGuard<'_, AgentMetrics>> {

@@ -41,6 +41,7 @@ The core tests cover:
 - PoP acknowledgement parsing/formatting
 - source watermark formatting/parsing
 - immutable base plus exact delta overlay behavior
+- RCU-style active-state handle swaps
 - IPv4 CIDR rule compilation and matching
 - domain suffix rule compilation and matching
 - rule delete overlays
