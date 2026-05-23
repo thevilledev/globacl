@@ -365,6 +365,21 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             remove_pending_mutation(&app.pending_dir, &mutation)?;
             write_http_response(&mut stream, 200, "text/plain", b"status=aborted\n")?;
         }
+        ("POST", "/internal/replication/ack") => {
+            let form = parse_form_lines(&request.body)?;
+            let ack = PropagationAck::from_form(&form)?;
+            let applied = apply_propagation_ack(&app, ack)?;
+            let body = if applied {
+                "status=applied\n"
+            } else {
+                "status=duplicate\n"
+            };
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
+        ("GET", "/internal/replication/acks") => {
+            let body = format_propagation_ack_log_snapshot(&app)?;
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
         ("POST", "/v1/deny") | ("POST", "/v1/mutation") => {
             let form = parse_form_lines(&request.body)?;
             let deny_request = DenyRequest::from_form(&form)?;
@@ -1260,6 +1275,9 @@ fn start_election(app: &App) -> Result<()> {
             consensus.last_leader_contact_ms = now_unix_millis();
             persist_consensus_state(&app.consensus_path, &consensus)?;
             drop(consensus);
+            if let Err(err) = sync_acks_from_peers(app) {
+                eprintln!("leader ack merge failed: {err}");
+            }
             send_heartbeats(app);
         }
     }
@@ -1444,6 +1462,8 @@ fn sync_from_leader(app: &App) -> Result<()> {
         }
     }
 
+    sync_acks_from_peer(app, &leader_addr)?;
+
     let mut status = lock_sync_status(app)?;
     status.last_peer_sync_unix = now_unix();
     Ok(())
@@ -1555,18 +1575,61 @@ fn persist_publisher_offsets(path: &Path, offsets: &[u64]) -> Result<()> {
 }
 
 fn record_propagation_ack(app: &App, ack: PropagationAck) -> Result<()> {
-    let key = ack.key();
+    if app.replication.is_clustered() {
+        ensure_write_authority(app)?;
+    }
+    apply_propagation_ack(app, ack.clone())?;
+    replicate_propagation_ack_on_quorum(app, &ack)
+}
+
+fn apply_propagation_ack(app: &App, ack: PropagationAck) -> Result<bool> {
     let mut acks = lock_propagation_acks(app)?;
-    if acks
-        .get(&key)
-        .map(|existing| existing.seq > ack.seq)
-        .unwrap_or(false)
-    {
+    apply_propagation_ack_to_store(&app.propagation_acks_path, &mut acks, ack)
+}
+
+fn apply_propagation_ack_to_store(
+    path: &Path,
+    acks: &mut HashMap<String, PropagationAck>,
+    ack: PropagationAck,
+) -> Result<bool> {
+    let key = ack.key();
+    if let Some(existing) = acks.get(&key) {
+        if existing.seq > ack.seq || existing == &ack {
+            return Ok(false);
+        }
+    }
+    append_propagation_ack(path, &ack)?;
+    acks.insert(key, ack);
+    Ok(true)
+}
+
+fn replicate_propagation_ack_on_quorum(app: &App, ack: &PropagationAck) -> Result<()> {
+    if !app.replication.is_clustered() {
         return Ok(());
     }
-    append_propagation_ack(&app.propagation_acks_path, &ack)?;
-    acks.insert(key, ack);
-    Ok(())
+
+    let payload = ack.to_form_body();
+    let mut replicated = 1usize;
+    let mut failures = Vec::new();
+    for peer in app.replication.remote_peers() {
+        match http_post(&peer.addr, "/internal/replication/ack", payload.as_bytes()) {
+            Ok(response) if response.status_code == 200 => replicated += 1,
+            Ok(response) => {
+                failures.push(format!("{}:status={}", peer.node_id, response.status_code))
+            }
+            Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
+        }
+    }
+
+    if replicated >= app.replication.quorum {
+        return Ok(());
+    }
+
+    Err(GlobAclError::InvalidData(format!(
+        "commitd ack quorum unavailable: replicated={replicated} quorum={} failures={}",
+        app.replication.quorum,
+        failures.join(",")
+    )))
 }
 
 fn load_propagation_acks(path: &Path) -> Result<HashMap<String, PropagationAck>> {
@@ -1595,8 +1658,13 @@ fn append_propagation_ack(path: &Path, ack: &PropagationAck) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(
-        file,
+    writeln!(file, "{}", format_propagation_ack_log_line(ack))?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn format_propagation_ack_log_line(ack: &PropagationAck) -> String {
+    format!(
         "relay_id={}\tlocation={}\tagent_id={}\tshard_id={}\tseq={}\tentries={}\tapplied_at_unix={}\trelay_received_at_unix={}",
         encode_ack_field(&ack.relay_id),
         encode_ack_field(&ack.location),
@@ -1605,10 +1673,8 @@ fn append_propagation_ack(path: &Path, ack: &PropagationAck) -> Result<()> {
         ack.seq,
         ack.entries,
         ack.applied_at_unix,
-        ack.relay_received_at_unix
-    )?;
-    file.sync_all()?;
-    Ok(())
+        ack.relay_received_at_unix,
+    )
 }
 
 fn parse_propagation_ack_log_line(line: &str) -> Result<PropagationAck> {
@@ -1620,6 +1686,68 @@ fn parse_propagation_ack_log_line(line: &str) -> Result<PropagationAck> {
         form.insert(key.to_owned(), decode_ack_field(value)?);
     }
     PropagationAck::from_form(&form)
+}
+
+fn format_propagation_ack_log_snapshot(app: &App) -> Result<String> {
+    let mut acks = lock_propagation_acks(app)?
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    acks.sort_by(|left, right| {
+        left.relay_id
+            .cmp(&right.relay_id)
+            .then(left.agent_id.cmp(&right.agent_id))
+            .then(left.shard_id.cmp(&right.shard_id))
+    });
+    let mut body = String::new();
+    for ack in acks {
+        body.push_str(&format_propagation_ack_log_line(&ack));
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+fn apply_propagation_ack_log_snapshot(app: &App, body: &[u8]) -> Result<usize> {
+    let text = String::from_utf8(body.to_vec())
+        .map_err(|err| GlobAclError::Parse(format!("ack snapshot is not utf8: {err}")))?;
+    let mut applied = 0usize;
+    let mut acks = lock_propagation_acks(app)?;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let ack = parse_propagation_ack_log_line(line)?;
+        if apply_propagation_ack_to_store(&app.propagation_acks_path, &mut acks, ack)? {
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
+fn sync_acks_from_peer(app: &App, peer_addr: &str) -> Result<usize> {
+    let response = http_get(peer_addr, "/internal/replication/acks")?;
+    if response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "peer returned status {} for ack snapshot",
+            response.status_code
+        )));
+    }
+    apply_propagation_ack_log_snapshot(app, &response.body)
+}
+
+fn sync_acks_from_peers(app: &App) -> Result<usize> {
+    let mut applied = 0usize;
+    let mut failures = Vec::new();
+    for peer in app.replication.remote_peers() {
+        match sync_acks_from_peer(app, &peer.addr) {
+            Ok(count) => applied += count,
+            Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(applied);
+    }
+    Err(GlobAclError::InvalidData(format!(
+        "ack peer sync failed: {}",
+        failures.join(",")
+    )))
 }
 
 fn format_propagation_status(app: &App) -> Result<String> {
@@ -2310,5 +2438,51 @@ mod tests {
         assert_eq!(loaded.get(&second.key()).expect("ack").seq, 42);
 
         std::fs::remove_dir_all(root).expect("remove temp ack dir");
+    }
+
+    #[test]
+    fn propagation_ack_snapshot_rehydrates_follower_store() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-ack-snapshot-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let follower_path = root.join("follower").join("propagation_acks.log");
+        let first = PropagationAck {
+            relay_id: "relay-a".to_owned(),
+            location: "region-a".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            shard_id: 7,
+            seq: 41,
+            entries: 10,
+            applied_at_unix: 1000,
+            relay_received_at_unix: 1001,
+        };
+        let second = PropagationAck {
+            seq: 42,
+            entries: 11,
+            applied_at_unix: 1002,
+            relay_received_at_unix: 1003,
+            ..first.clone()
+        };
+        let snapshot = format!(
+            "{}\n{}\n",
+            format_propagation_ack_log_line(&first),
+            format_propagation_ack_log_line(&second)
+        );
+
+        let mut follower_acks = HashMap::new();
+        for line in snapshot.lines().filter(|line| !line.trim().is_empty()) {
+            let ack = parse_propagation_ack_log_line(line).expect("parse ack snapshot line");
+            apply_propagation_ack_to_store(&follower_path, &mut follower_acks, ack)
+                .expect("apply ack snapshot line");
+        }
+
+        let loaded = load_propagation_acks(&follower_path).expect("load follower acks");
+        assert_eq!(follower_acks.len(), 1);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&second.key()).expect("ack").seq, 42);
+
+        std::fs::remove_dir_all(root).expect("remove temp ack snapshot dir");
     }
 }

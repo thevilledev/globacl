@@ -40,6 +40,7 @@ The core tests cover:
 - per-shard append-log replay
 - delta-bundle file roundtrip
 - PoP acknowledgement parsing/formatting
+- central propagation acknowledgement log replay and follower rehydration
 - source watermark formatting/parsing
 - immutable base plus exact delta overlay behavior
 - RCU-style active-state handle swaps

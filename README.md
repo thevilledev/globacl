@@ -29,7 +29,7 @@ The request path evaluates denies locally. Updates enter the stateless control A
 
 The relay can run in the default HTTP pull-proxy mode or in NATS JetStream mode. Pull-proxy mode keeps the repo easy to run locally. JetStream mode lets commitd publish committed mutations to a durable stream while relays consume into a local cache and keep the agent-facing HTTP API unchanged.
 
-The propagation path also records per-agent acknowledgements, forwards them into a central propagation status view, writes per-mutation delta bundles for repair, tags updates as P0/P1/P2 delivery priority, and supports synthetic canaries for measuring propagation.
+The propagation path also records per-agent acknowledgements, forwards them into a quorum-replicated central propagation status view, writes per-mutation delta bundles for repair, tags updates as P0/P1/P2 delivery priority, and supports synthetic canaries for measuring propagation.
 
 The control plane includes production-oriented safety hooks around that path: broad-deny blast-radius gates, an append-only audit log, versioned Ed25519 signatures with verifier keyrings, archived snapshot artifacts, forward-only rollback via new mutations, bounded request bodies, and stale-agent health reporting.
 
