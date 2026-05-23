@@ -15,9 +15,11 @@ DEMO_PF_PID=""
 cleanup() {
   if [[ -n "${CONTROL_PF_PID}" ]]; then
     kill "${CONTROL_PF_PID}" 2>/dev/null || true
+    wait "${CONTROL_PF_PID}" 2>/dev/null || true
   fi
   if [[ -n "${DEMO_PF_PID}" ]]; then
     kill "${DEMO_PF_PID}" 2>/dev/null || true
+    wait "${DEMO_PF_PID}" 2>/dev/null || true
   fi
   if [[ "${KEEP_CLUSTER}" != "1" ]]; then
     k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true

@@ -49,6 +49,24 @@ GET  /v1/acks
 
 Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
+Control `/health` includes quorum state in HA deployments:
+
+```text
+role=leader|candidate|follower
+node_id=...
+cluster_id=...
+leader_id=...
+term=...
+voted_for=...
+write_authority=true|false
+quorum=2
+peer_count=3
+last_peer_sync_unix=...
+sync_errors=...
+```
+
+Followers proxy write requests to the elected leader. The leader assigns the per-shard sequence and only makes the mutation locally visible after a quorum of control peers prepares it.
+
 The demo consumer app exposes:
 
 ```text

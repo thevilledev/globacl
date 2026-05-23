@@ -480,6 +480,24 @@ impl SourceOfTruth {
     }
 
     pub fn commit(&mut self, request: DenyRequest) -> Result<CommitOutcome> {
+        let outcome = self.prepare_commit(request)?;
+        if !outcome.duplicate {
+            self.apply_replicated_mutation(outcome.mutation.clone())?;
+        }
+
+        Ok(outcome)
+    }
+
+    pub fn commit_rule(&mut self, request: RuleRequest) -> Result<CommitOutcome> {
+        let outcome = self.prepare_rule_commit(request)?;
+        if !outcome.duplicate {
+            self.apply_replicated_mutation(outcome.mutation.clone())?;
+        }
+
+        Ok(outcome)
+    }
+
+    pub fn prepare_commit(&self, request: DenyRequest) -> Result<CommitOutcome> {
         if request.op_id.trim().is_empty() {
             return Err(GlobAclError::Parse("op_id must not be empty".to_owned()));
         }
@@ -521,18 +539,13 @@ impl SourceOfTruth {
             committed_at_unix: now_unix(),
         };
 
-        self.apply_committed_mutation(&mutation)?;
-        self.op_index
-            .insert(mutation.op_id.clone(), mutation.clone());
-        self.mutations.push(mutation.clone());
-
         Ok(CommitOutcome {
             mutation,
             duplicate: false,
         })
     }
 
-    pub fn commit_rule(&mut self, request: RuleRequest) -> Result<CommitOutcome> {
+    pub fn prepare_rule_commit(&self, request: RuleRequest) -> Result<CommitOutcome> {
         if request.op_id.trim().is_empty() {
             return Err(GlobAclError::Parse("op_id must not be empty".to_owned()));
         }
@@ -595,15 +608,53 @@ impl SourceOfTruth {
             committed_at_unix: now_unix(),
         };
 
-        self.apply_committed_mutation(&mutation)?;
-        self.op_index
-            .insert(mutation.op_id.clone(), mutation.clone());
-        self.mutations.push(mutation.clone());
-
         Ok(CommitOutcome {
             mutation,
             duplicate: false,
         })
+    }
+
+    pub fn apply_replicated_mutation(&mut self, mutation: Mutation) -> Result<ApplyStatus> {
+        if let Some(existing) = self.op_index.get(&mutation.op_id) {
+            if existing == &mutation {
+                return Ok(ApplyStatus::DuplicateOrOld);
+            }
+            return Err(GlobAclError::InvalidData(format!(
+                "op_id {} already exists with a different mutation",
+                mutation.op_id
+            )));
+        }
+
+        let shard_id = mutation.commit_id.shard_id;
+        if shard_id >= self.shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "shard {shard_id} is outside shard_count {}",
+                self.shard_count
+            )));
+        }
+
+        let current_seq = self.watermarks[shard_id as usize];
+        if mutation.commit_id.seq <= current_seq {
+            let already_applied = self.mutations.iter().any(|existing| {
+                existing.commit_id.shard_id == shard_id
+                    && existing.commit_id.seq == mutation.commit_id.seq
+                    && existing == &mutation
+            });
+            if already_applied {
+                return Ok(ApplyStatus::DuplicateOrOld);
+            }
+            return Err(GlobAclError::InvalidData(format!(
+                "stale or conflicting mutation for shard {shard_id} seq {}",
+                mutation.commit_id.seq
+            )));
+        }
+
+        self.apply_committed_mutation(&mutation)?;
+        self.op_index
+            .insert(mutation.op_id.clone(), mutation.clone());
+        self.mutations.push(mutation);
+
+        Ok(ApplyStatus::Applied)
     }
 
     pub fn lookup(
@@ -755,6 +806,14 @@ impl SourceOfTruth {
 
     pub fn watermarks(&self) -> &[u64] {
         &self.watermarks
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch.max(1);
     }
 
     pub fn entries_len(&self) -> usize {
@@ -2164,8 +2223,10 @@ pub fn write_http_response(
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         405 => "Method Not Allowed",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "OK",
     };
@@ -2605,6 +2666,34 @@ mod tests {
         assert!(!first.duplicate);
         assert!(second.duplicate);
         assert_eq!(first.mutation.commit_id, second.mutation.commit_id);
+        assert_eq!(source.mutations_len(), 1);
+    }
+
+    #[test]
+    fn prepared_commit_is_not_visible_until_applied() {
+        let mut source = SourceOfTruth::new(16, "local");
+        let prepared = source
+            .prepare_commit(request("op-1", "u1", Action::Deny))
+            .unwrap();
+
+        assert_eq!(source.mutations_len(), 0);
+        assert_eq!(
+            source.lookup("tenant-a", "user", "u1", now_unix()),
+            Decision::Allow
+        );
+
+        let status = source
+            .apply_replicated_mutation(prepared.mutation.clone())
+            .unwrap();
+        assert_eq!(status, ApplyStatus::Applied);
+        assert!(source
+            .lookup("tenant-a", "user", "u1", now_unix())
+            .is_denied());
+
+        let duplicate = source
+            .apply_replicated_mutation(prepared.mutation.clone())
+            .unwrap();
+        assert_eq!(duplicate, ApplyStatus::DuplicateOrOld);
         assert_eq!(source.mutations_len(), 1);
     }
 

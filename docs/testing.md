@@ -21,6 +21,7 @@ entry_count lookup_count shard_count
 The core tests cover:
 
 - duplicate `op_id` idempotency
+- prepared commits remaining invisible until replicated application
 - exact add/delete lookup behavior
 - binary snapshot roundtrip
 - binary mutation-stream roundtrip
@@ -47,7 +48,9 @@ Run k3d-backed k3s smoke tests:
 ./deploy/k3s/global-smoke.sh
 ```
 
-The local smoke deploys one control, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys central control in one k3s cluster plus three regional k3s clusters with HA relays and demo apps.
+The local smoke deploys one control, one relay, one agent, and one demo app in a single k3s cluster. The global smoke deploys a three-replica central control StatefulSet with persistent volumes, plus three regional k3s clusters with HA relays and demo apps.
+
+The global smoke also exercises the custom control-plane consensus path: the three central control pods elect a leader, writes can arrive at any control pod through the Service, and committed mutations are replicated to the control quorum before regional relays and agents observe them.
 
 Rollback smoke test:
 

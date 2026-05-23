@@ -31,14 +31,16 @@ runs:
 
     - name: Run yamllint
       shell: bash
+      env:
+        YAMLLINT_CONFIG: ${{ inputs.config }}
+        YAMLLINT_PATHS: ${{ inputs.paths }}
+        YAMLLINT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-        mapfile -t paths <<'EOF'
-        ${{ inputs.paths }}
-        EOF
+        mapfile -t paths <<<"${YAMLLINT_PATHS}"
         filtered=()
         for path in "${paths[@]}"; do
           [[ -n "${path}" ]] && filtered+=("${path}")
         done
-        uvx --from "yamllint==${{ inputs.version }}" yamllint --version
-        uvx --from "yamllint==${{ inputs.version }}" yamllint -c "${{ inputs.config }}" "${filtered[@]}"
+        uvx --from "yamllint==${YAMLLINT_VERSION}" yamllint --version
+        uvx --from "yamllint==${YAMLLINT_VERSION}" yamllint -c "${YAMLLINT_CONFIG}" "${filtered[@]}"

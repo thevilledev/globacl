@@ -13,16 +13,32 @@ stringData:
   key_id: dev
   secret: globacl-dev-secret
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-control-peer
+  namespace: globacl
+spec:
+  clusterIP: None
+  selector:
+    app: globacl-control
+  ports:
+    - name: http
+      port: 7000
+      targetPort: http
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: globacl-control
   namespace: globacl
 spec:
-  replicas: 1
+  serviceName: globacl-control-peer
+  replicas: 3
   selector:
     matchLabels:
       app: globacl-control
+  podManagementPolicy: Parallel
   template:
     metadata:
       labels:
@@ -39,6 +55,23 @@ spec:
           command: ["/usr/local/bin/globacl-control"]
           args: ["/data/control", "0.0.0.0:7000", "64", "0"]
           env:
+            - name: GLOBACL_CONTROL_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GLOBACL_CONTROL_CLUSTER_ID
+              value: globacl-global
+            - name: GLOBACL_CONTROL_QUORUM
+              value: "2"
+            - name: GLOBACL_CONTROL_HEARTBEAT_MS
+              value: "250"
+            - name: GLOBACL_CONTROL_ELECTION_MS
+              value: "1200"
+            - name: GLOBACL_CONTROL_PEERS
+              value: >-
+                globacl-control-0=globacl-control-0.globacl-control-peer.globacl.svc.cluster.local:7000,
+                globacl-control-1=globacl-control-1.globacl-control-peer.globacl.svc.cluster.local:7000,
+                globacl-control-2=globacl-control-2.globacl-control-peer.globacl.svc.cluster.local:7000
             - name: GLOBACL_SIGNATURE_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -59,9 +92,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-      volumes:
-        - name: data
-          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
 ---
 apiVersion: v1
 kind: Service

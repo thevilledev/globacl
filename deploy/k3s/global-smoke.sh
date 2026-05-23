@@ -19,6 +19,7 @@ CREATED_NETWORK="0"
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
   done
   if [[ "${KEEP_CLUSTERS}" != "1" ]]; then
     for cluster in "${CLUSTERS[@]:-}"; do
@@ -85,7 +86,7 @@ k3d cluster create "${CENTRAL_CLUSTER}" \
   --wait
 k3d image import "${IMAGE}" -c "${CENTRAL_CLUSTER}"
 k "${CENTRAL_CLUSTER}" apply -f "${ROOT_DIR}/deploy/k8s/global/central.yaml"
-k "${CENTRAL_CLUSTER}" -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
+k "${CENTRAL_CLUSTER}" -n "${NAMESPACE}" rollout status statefulset/globacl-control --timeout=180s
 wait_for_http "http://127.0.0.1:${CENTRAL_HOST_PORT}/health"
 
 if [[ -z "${CONTROL_UPSTREAM}" ]]; then
