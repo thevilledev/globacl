@@ -101,7 +101,7 @@ The script:
 3. Creates one central k3s cluster.
 4. Creates three regional k3s clusters.
 5. Exposes central control on host port 17000.
-6. Points regional HA relays at host.k3d.internal:17000.
+6. Points regional HA relays at the central k3d server node's NodePort address on the shared Docker network.
 7. Commits a P0 deny to central control.
 8. Calls every regional demo app until each returns access=denied.
 ```
@@ -133,12 +133,14 @@ IMAGE=globacl:ci
 CLUSTER=globacl-local
 CENTRAL_CLUSTER=globacl-central
 REGIONS="region-a region-b region-c"
-CONTROL_UPSTREAM=host.k3d.internal:17000
+CONTROL_UPSTREAM=<optional-control-hostport>
 KEEP_CLUSTER=1
 KEEP_CLUSTERS=1
 ```
 
 Use `KEEP_CLUSTER=1` or `KEEP_CLUSTERS=1` when debugging locally so the script does not delete the clusters on exit.
+
+When `CONTROL_UPSTREAM` is unset, the global smoke script resolves the central k3d server container IP and uses `<central-server-ip>:30080`. Override it only when your environment has a different routable address for central control.
 
 ## Production Notes
 

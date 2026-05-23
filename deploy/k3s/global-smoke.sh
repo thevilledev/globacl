@@ -6,7 +6,7 @@ IMAGE="${IMAGE:-globacl:ci}"
 NETWORK="${NETWORK:-globacl-k3d}"
 CENTRAL_CLUSTER="${CENTRAL_CLUSTER:-globacl-central}"
 CENTRAL_HOST_PORT="${CENTRAL_HOST_PORT:-17000}"
-CONTROL_UPSTREAM="${CONTROL_UPSTREAM:-host.k3d.internal:${CENTRAL_HOST_PORT}}"
+CONTROL_UPSTREAM="${CONTROL_UPSTREAM:-}"
 NAMESPACE="${NAMESPACE:-globacl}"
 KEEP_CLUSTERS="${KEEP_CLUSTERS:-0}"
 REGIONS=(${REGIONS:-region-a region-b region-c})
@@ -14,6 +14,7 @@ DEMO_BASE_PORT="${DEMO_BASE_PORT:-18100}"
 
 PIDS=()
 CLUSTERS=("${CENTRAL_CLUSTER}")
+CREATED_NETWORK="0"
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
@@ -23,7 +24,9 @@ cleanup() {
     for cluster in "${CLUSTERS[@]:-}"; do
       k3d cluster delete "${cluster}" >/dev/null 2>&1 || true
     done
-    docker network rm "${NETWORK}" >/dev/null 2>&1 || true
+    if [[ "${CREATED_NETWORK}" == "1" ]]; then
+      docker network rm "${NETWORK}" >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT
@@ -69,7 +72,10 @@ require_cmd curl
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
 
-docker network inspect "${NETWORK}" >/dev/null 2>&1 || docker network create "${NETWORK}" >/dev/null
+if ! docker network inspect "${NETWORK}" >/dev/null 2>&1; then
+  docker network create "${NETWORK}" >/dev/null
+  CREATED_NETWORK="1"
+fi
 
 k3d cluster delete "${CENTRAL_CLUSTER}" >/dev/null 2>&1 || true
 k3d cluster create "${CENTRAL_CLUSTER}" \
@@ -81,6 +87,13 @@ k3d image import "${IMAGE}" -c "${CENTRAL_CLUSTER}"
 k "${CENTRAL_CLUSTER}" apply -f "${ROOT_DIR}/deploy/k8s/global/central.yaml"
 k "${CENTRAL_CLUSTER}" -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
 wait_for_http "http://127.0.0.1:${CENTRAL_HOST_PORT}/health"
+
+if [[ -z "${CONTROL_UPSTREAM}" ]]; then
+  central_node="k3d-${CENTRAL_CLUSTER}-server-0"
+  central_ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${NETWORK}\").IPAddress}}" "${central_node}")"
+  CONTROL_UPSTREAM="${central_ip}:30080"
+fi
+echo "Using CONTROL_UPSTREAM=${CONTROL_UPSTREAM}"
 
 for region in "${REGIONS[@]}"; do
   cluster="globacl-${region}"
