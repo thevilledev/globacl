@@ -353,7 +353,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("POST", "/internal/replication/commit") => {
             let mutation = decode_mutation(&request.body)?;
-            let status = commit_replicated_mutation(&app, mutation)?;
+            let status = commit_replicated_mutation(&app, mutation, true)?;
             let body = match status {
                 ApplyStatus::Applied => "status=applied\n",
                 ApplyStatus::DuplicateOrOld => "status=duplicate\n",
@@ -916,10 +916,23 @@ fn prepare_replicated_mutation(app: &App, mutation: &Mutation) -> Result<()> {
     write_pending_mutation(&app.pending_dir, mutation)
 }
 
-fn commit_replicated_mutation(app: &App, mutation: Mutation) -> Result<ApplyStatus> {
+fn commit_replicated_mutation(
+    app: &App,
+    mutation: Mutation,
+    require_pending: bool,
+) -> Result<ApplyStatus> {
     ensure_same_cluster(app, &mutation)?;
     ensure_mutation_term(app, &mutation)?;
     let mut state = lock_state(app)?;
+    let already_at_or_past_seq = state
+        .watermarks()
+        .get(mutation.commit_id.shard_id as usize)
+        .copied()
+        .unwrap_or(0)
+        >= mutation.commit_id.seq;
+    if require_pending && !already_at_or_past_seq {
+        ensure_pending_mutation(&app.pending_dir, &mutation)?;
+    }
     apply_prepared_mutation(app, &mut state, mutation)
 }
 
@@ -1069,10 +1082,27 @@ fn write_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()>
         if existing == *mutation {
             return Ok(());
         }
-        return Err(GlobAclError::InvalidData(format!(
-            "pending mutation conflict at {}",
-            path.display()
-        )));
+        if existing.commit_id.epoch < mutation.commit_id.epoch {
+            eprintln!(
+                "replacing stale pending mutation: shard={} seq={} old_epoch={} new_epoch={}",
+                mutation.commit_id.shard_id,
+                mutation.commit_id.seq,
+                existing.commit_id.epoch,
+                mutation.commit_id.epoch
+            );
+        } else if existing.commit_id.epoch > mutation.commit_id.epoch {
+            return Err(GlobAclError::InvalidData(format!(
+                "pending mutation at {} has newer epoch {} than incoming epoch {}",
+                path.display(),
+                existing.commit_id.epoch,
+                mutation.commit_id.epoch
+            )));
+        } else {
+            return Err(GlobAclError::InvalidData(format!(
+                "pending mutation conflict at {}",
+                path.display()
+            )));
+        }
     }
 
     let tmp = path.with_extension("tmp");
@@ -1086,6 +1116,24 @@ fn write_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()>
         file.sync_all()?;
     }
     fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn ensure_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()> {
+    let path = pending_mutation_path(pending_dir, mutation);
+    if !path.exists() {
+        return Err(GlobAclError::InvalidData(format!(
+            "pending mutation missing at {}",
+            path.display()
+        )));
+    }
+    let existing = decode_mutation(&fs::read(&path)?)?;
+    if existing != *mutation {
+        return Err(GlobAclError::InvalidData(format!(
+            "pending mutation at {} does not match commit payload",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1480,7 +1528,7 @@ fn sync_from_leader(app: &App) -> Result<()> {
             )));
         }
         for mutation in decode_mutation_stream(&response.body)? {
-            commit_replicated_mutation(app, mutation)?;
+            commit_replicated_mutation(app, mutation, false)?;
         }
     }
 
@@ -2502,6 +2550,15 @@ mod tests {
         }
     }
 
+    fn prepared_mutation(op_id: &str, key: &str, epoch: u64) -> Mutation {
+        let mut source = SourceOfTruth::new(4, "cluster-a");
+        source.set_epoch(epoch);
+        source
+            .prepare_commit(deny_request(op_id, key))
+            .expect("prepare mutation")
+            .mutation
+    }
+
     fn remove_test_dir(path: impl AsRef<Path>) {
         match std::fs::remove_dir_all(path) {
             Ok(()) => {}
@@ -2663,6 +2720,141 @@ mod tests {
         assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
         assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
         drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn consensus_state_restarts_with_persisted_term_and_vote() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-consensus-restart-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Candidate, 7);
+        let persisted = ConsensusState {
+            current_term: 7,
+            voted_for: Some("node-b".to_owned()),
+            role: ConsensusRole::Candidate,
+            leader_id: None,
+            last_leader_contact_ms: 123,
+            election_deadline_ms: 456,
+        };
+
+        persist_consensus_state(&app.consensus_path, &persisted).expect("persist consensus");
+        let loaded =
+            load_consensus_state(&app.consensus_path, &app.replication).expect("load consensus");
+
+        assert_eq!(loaded.current_term, 7);
+        assert_eq!(loaded.voted_for.as_deref(), Some("node-b"));
+        assert_eq!(loaded.role, ConsensusRole::Follower);
+        assert_eq!(loaded.leader_id, None);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn prepare_replaces_stale_pending_entry_from_older_term() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-pending-replace-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        let old = prepared_mutation("op-old", "user-1", 1);
+        let mut new = old.clone();
+        new.op_id = "op-new".to_owned();
+        new.commit_id.epoch = 2;
+        new.entry.reason_code = "newer-term".to_owned();
+
+        prepare_replicated_mutation(&app, &old).expect("prepare old pending");
+        prepare_replicated_mutation(&app, &new).expect("replace stale pending");
+
+        let pending_path = pending_mutation_path(&app.pending_dir, &new);
+        let pending = decode_mutation(&std::fs::read(pending_path).expect("read pending"))
+            .expect("decode pending");
+        assert_eq!(pending, new);
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 2);
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn pending_entry_rejects_older_epoch_replacement() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-pending-reject-old-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let pending_dir = root.join("pending");
+        let mut newer = prepared_mutation("op-new", "user-1", 3);
+        let mut older = newer.clone();
+        older.op_id = "op-old".to_owned();
+        older.commit_id.epoch = 2;
+        newer.entry.reason_code = "newer-term".to_owned();
+
+        write_pending_mutation(&pending_dir, &newer).expect("write newer pending");
+        let err = write_pending_mutation(&pending_dir, &older).expect_err("reject older pending");
+
+        assert!(err.to_string().contains("newer epoch"));
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn peer_commit_requires_matching_pending_entry() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-pending-required-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        let mutation = prepared_mutation("op-1", "user-1", 1);
+
+        let err = commit_replicated_mutation(&app, mutation.clone(), true)
+            .expect_err("commit without pending should fail");
+        assert!(err.to_string().contains("pending mutation missing"));
+        {
+            let state = lock_state(&app).expect("state");
+            assert_eq!(state.mutations_len(), 0);
+        }
+
+        prepare_replicated_mutation(&app, &mutation).expect("prepare mutation");
+        let status =
+            commit_replicated_mutation(&app, mutation.clone(), true).expect("commit prepared");
+        assert_eq!(status, ApplyStatus::Applied);
+        assert!(!pending_mutation_path(&app.pending_dir, &mutation).exists());
+        {
+            let state = lock_state(&app).expect("state");
+            assert_eq!(state.mutations_len(), 1);
+            assert_eq!(
+                state.watermarks()[mutation.commit_id.shard_id as usize],
+                mutation.commit_id.seq
+            );
+        }
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn follower_catch_up_replays_committed_mutation_without_pending_entry() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-catch-up-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        let mutation = prepared_mutation("op-1", "user-1", 1);
+
+        let status =
+            commit_replicated_mutation(&app, mutation.clone(), false).expect("catch-up replay");
+
+        assert_eq!(status, ApplyStatus::Applied);
+        assert!(!pending_mutation_path(&app.pending_dir, &mutation).exists());
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 1);
+        assert_eq!(
+            state.watermarks()[mutation.commit_id.shard_id as usize],
+            mutation.commit_id.seq
+        );
+        drop(state);
         remove_test_dir(root);
     }
 

@@ -42,7 +42,7 @@ The core tests cover:
 - PoP acknowledgement parsing/formatting
 - central propagation acknowledgement log replay and follower rehydration
 - source watermark formatting/parsing
-- commitd vote/heartbeat consensus invariants
+- commitd vote/heartbeat, restart, catch-up, and pending-entry consensus invariants
 - immutable base plus exact delta overlay behavior
 - RCU-style active-state handle swaps
 - IPv4 CIDR rule compilation and matching
