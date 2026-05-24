@@ -1,0 +1,29 @@
+[package]
+name = "globacl-contract-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+globacl-core = { path = "../globacl-core" }
+
+[[bin]]
+name = "globacl-contract-commitd"
+path = "../globacl-commitd/src/main.rs"
+test = false
+
+[[bin]]
+name = "globacl-contract-control"
+path = "../globacl-control/src/main.rs"
+test = false
+
+[[bin]]
+name = "globacl-contract-relay"
+path = "../globacl-relay/src/main.rs"
+test = false
+
+[[bin]]
+name = "globacl-contract-agent"
+path = "../globacl-agent/src/main.rs"
+test = false

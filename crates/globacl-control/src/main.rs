@@ -131,12 +131,9 @@ fn proxy_get(stream: &mut TcpStream, app: &App, path: &str) -> Result<()> {
 
 fn proxy_post(stream: &mut TcpStream, app: &App, path: &str, body: &[u8]) -> Result<()> {
     match http_post(&app.commit_addr, path, body) {
-        Ok(response) => write_http_response(
-            stream,
-            response.status_code,
-            content_type_for(path),
-            &response.body,
-        ),
+        Ok(response) => {
+            write_http_response(stream, response.status_code, "text/plain", &response.body)
+        }
         Err(err) => write_proxy_error(stream, err),
     }
 }
@@ -147,12 +144,13 @@ fn write_proxy_error(stream: &mut TcpStream, err: GlobAclError) -> Result<()> {
 }
 
 fn content_type_for(path: &str) -> &'static str {
-    if path.ends_with(".sig") {
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    if route.ends_with(".sig") || route == "/v1/snapshot_manifest" || route == "/v1/snapshots" {
         "text/plain"
-    } else if path.starts_with("/v1/mutations")
-        || path.starts_with("/v1/snapshot")
-        || path.starts_with("/v1/delta_bundle")
-    {
+    } else if matches!(
+        route,
+        "/v1/mutations" | "/v1/snapshot" | "/v1/snapshot_artifact" | "/v1/delta_bundle"
+    ) {
         "application/octet-stream"
     } else {
         "text/plain"

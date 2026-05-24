@@ -6,6 +6,14 @@ Run all tests:
 cargo test
 ```
 
+Run OpenAPI/backend contract tests:
+
+```sh
+cargo test -p globacl-contract-tests --locked
+```
+
+The contract tests start real commitd, control, relay, and agent processes on loopback ports with a non-default signature keypair. They check the documented OpenAPI paths against backend status codes, `Content-Type` headers, key response fields, binary snapshot/mutation decoding, signatures, propagation acknowledgements, and audit output.
+
 Run the edge lookup benchmark:
 
 ```sh

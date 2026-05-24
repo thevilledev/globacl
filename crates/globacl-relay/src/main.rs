@@ -205,7 +205,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(
                 &mut stream,
                 upstream.status_code,
-                content_type_for(&request.path),
+                "text/plain",
                 &upstream.body,
             )?;
         }
@@ -723,12 +723,13 @@ fn bootstrap_cache(bootstrap_addr: &str) -> Result<RelayCache> {
 }
 
 fn content_type_for(path: &str) -> &'static str {
-    if path.ends_with(".sig") || path.starts_with("/v1/snapshot_manifest") {
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    if route.ends_with(".sig") || route == "/v1/snapshot_manifest" || route == "/v1/snapshots" {
         "text/plain"
-    } else if path.starts_with("/v1/mutations")
-        || path.starts_with("/v1/snapshot")
-        || path.starts_with("/v1/delta_bundle")
-    {
+    } else if matches!(
+        route,
+        "/v1/mutations" | "/v1/snapshot" | "/v1/snapshot_artifact" | "/v1/delta_bundle"
+    ) {
         "application/octet-stream"
     } else {
         "text/plain"
