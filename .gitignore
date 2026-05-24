@@ -2,3 +2,5 @@
 /data/
 /.DS_Store
 /docs-local
+/clients/typescript/node_modules/
+/clients/typescript/dist/
