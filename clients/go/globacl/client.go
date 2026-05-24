@@ -46,6 +46,14 @@ func WithHTTPClient(httpClient *http.Client) ClientOption {
 	}
 }
 
+func (client *Client) Health(ctx context.Context) (*HealthResponse, error) {
+	var response HealthResponse
+	if err := client.doJSON(ctx, http.MethodGet, "/health", nil, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
 func (client *Client) Deny(ctx context.Context, request DenyMutationRequest) (*CommitOutcomeResponse, error) {
 	var response CommitOutcomeResponse
 	if err := client.doJSON(ctx, http.MethodPost, "/v1/deny", request, &response); err != nil {
@@ -91,6 +99,14 @@ func (client *Client) Check(ctx context.Context, tenantID, namespace, value stri
 func (client *Client) Watermarks(ctx context.Context) (*WatermarksResponse, error) {
 	var response WatermarksResponse
 	if err := client.doJSON(ctx, http.MethodGet, "/v1/watermarks", nil, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
+func (client *Client) PropagationStatus(ctx context.Context) (*PropagationStatusResponse, error) {
+	var response PropagationStatusResponse
+	if err := client.doJSON(ctx, http.MethodGet, "/v1/propagation/status", nil, &response); err != nil {
 		return nil, err
 	}
 	return &response, nil

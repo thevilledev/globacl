@@ -47,39 +47,19 @@ k() {
 
 wait_for_http() {
   local url="$1"
-  for _ in $(seq 1 120); do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "timed out waiting for ${url}" >&2
-  return 1
-}
-
-json_number() {
-  local key="$1"
-  local body="$2"
-  sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" <<<"${body}" | head -n1
+  smoke_client wait-health --base-url "${url}" --timeout 120s
 }
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  local status
-  local agent_count
-  local max_seq_lag
-  for _ in $(seq 1 120); do
-    status="$(curl -sS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/propagation/status")"
-    agent_count="$(json_number "agent_count" "${status}")"
-    max_seq_lag="$(json_number "max_seq_lag" "${status}")"
-    if [[ "${agent_count:-0}" -ge "${expected_agents}" && "${max_seq_lag:-1}" -eq 0 ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "timed out waiting for central propagation ack" >&2
-  curl -sS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/propagation/status" >&2 || true
-  return 1
+  smoke_client wait-propagation \
+    --base-url "http://127.0.0.1:${CENTRAL_HOST_PORT}" \
+    --expected-agents "${expected_agents}" \
+    --timeout 120s
+}
+
+smoke_client() {
+  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
 }
 
 render_region() {
@@ -93,8 +73,7 @@ render_region() {
 require_cmd docker
 require_cmd k3d
 require_cmd kubectl
-require_cmd curl
-require_cmd awk
+require_cmd go
 
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
@@ -135,8 +114,15 @@ for region in "${REGIONS[@]}"; do
   k "${cluster}" -n "${NAMESPACE}" rollout status deploy/globacl-demo --timeout=180s
 done
 
-curl -fsS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/deny" \
-  --header "Content-Type: application/json" --data-binary '{"op_id":"ci-global-user","tenant_id":"tenant-a","namespace":"user","key":"user-global","action":"deny","delivery_priority":"p0","reason_code":"ci_global_smoke","created_by":"ci"}' >/tmp/globacl-global-commit.out
+smoke_client deny \
+  --base-url "http://127.0.0.1:${CENTRAL_HOST_PORT}" \
+  --op-id ci-global-user \
+  --tenant-id tenant-a \
+  --namespace user \
+  --key user-global \
+  --delivery-priority p0 \
+  --reason-code ci_global_smoke \
+  --created-by ci >/tmp/globacl-global-commit.out
 
 index=1
 for region in "${REGIONS[@]}"; do
@@ -146,16 +132,12 @@ for region in "${REGIONS[@]}"; do
   PIDS+=("$!")
   wait_for_http "http://127.0.0.1:${port}/health"
 
-  observed="0"
-  for _ in $(seq 1 120); do
-    response="$(curl -sS "http://127.0.0.1:${port}/access?tenant_id=tenant-a&namespace=user&key=user-global")"
-    if grep -q '"access":"denied"' <<<"${response}"; then
-      observed="1"
-      break
-    fi
-    sleep 1
-  done
-  if [[ "${observed}" != "1" ]]; then
+  if ! smoke_client wait-demo-deny \
+    --base-url "http://127.0.0.1:${port}" \
+    --tenant-id tenant-a \
+    --namespace user \
+    --key user-global \
+    --timeout 120s; then
     echo "global smoke failed: ${region} did not observe deny" >&2
     exit 1
   fi

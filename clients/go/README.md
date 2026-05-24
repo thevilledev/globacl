@@ -20,8 +20,16 @@ outcome, err := client.Deny(context.Background(), globacl.DenyMutationRequest{
 })
 ```
 
-Regenerate from `docs/openapi.yaml`:
+Regenerate from `docs/openapi.yaml` at the repo root:
 
 ```sh
 scripts/generate-clients.sh
+```
+
+The k3s smoke tests use `cmd/globacl-smoke` as their API assertion runner:
+
+```sh
+go run ./cmd/globacl-smoke wait-health --base-url http://127.0.0.1:7000
+go run ./cmd/globacl-smoke deny --base-url http://127.0.0.1:7000 \
+  --op-id demo-1 --tenant-id tenant-a --namespace user --key user-123
 ```

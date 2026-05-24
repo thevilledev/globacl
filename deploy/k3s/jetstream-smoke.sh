@@ -46,46 +46,25 @@ k() {
 
 wait_for_http() {
   local url="$1"
-  for _ in $(seq 1 120); do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "timed out waiting for ${url}" >&2
-  return 1
-}
-
-json_number() {
-  local key="$1"
-  local body="$2"
-  sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" <<<"${body}" | head -n1
+  smoke_client wait-health --base-url "${url}" --timeout 120s
 }
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  local status
-  local agent_count
-  local max_seq_lag
-  for _ in $(seq 1 120); do
-    status="$(curl -sS "http://127.0.0.1:${CONTROL_PORT}/v1/propagation/status")"
-    agent_count="$(json_number "agent_count" "${status}")"
-    max_seq_lag="$(json_number "max_seq_lag" "${status}")"
-    if [[ "${agent_count:-0}" -ge "${expected_agents}" && "${max_seq_lag:-1}" -eq 0 ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "timed out waiting for central propagation ack" >&2
-  curl -sS "http://127.0.0.1:${CONTROL_PORT}/v1/propagation/status" >&2 || true
-  return 1
+  smoke_client wait-propagation \
+    --base-url "http://127.0.0.1:${CONTROL_PORT}" \
+    --expected-agents "${expected_agents}" \
+    --timeout 120s
+}
+
+smoke_client() {
+  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
 }
 
 require_cmd docker
 require_cmd k3d
 require_cmd kubectl
-require_cmd curl
-require_cmd awk
+require_cmd go
 
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
@@ -125,27 +104,34 @@ k -n "${NAMESPACE}" port-forward svc/globacl-demo "${DEMO_PORT}:8080" >/tmp/glob
 DEMO_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
 
-relay_health="$(curl -fsS "http://127.0.0.1:${RELAY_PORT}/health")"
-grep -q "source_lag_max" <<<"${relay_health}"
-grep -q "consumer_num_pending" <<<"${relay_health}"
-grep -q "consumer_num_ack_pending" <<<"${relay_health}"
+smoke_client require-health-fields \
+  --base-url "http://127.0.0.1:${RELAY_PORT}" \
+  --fields source_lag_max,consumer_num_pending,consumer_num_ack_pending \
+  --timeout 120s
 
-curl -fsS "http://127.0.0.1:${CONTROL_PORT}/v1/deny" \
-  --header "Content-Type: application/json" --data-binary '{"op_id":"ci-jetstream-user","tenant_id":"tenant-a","namespace":"user","key":"user-js-ci","action":"deny","delivery_priority":"p0","reason_code":"ci_jetstream_smoke","created_by":"ci"}' >/tmp/globacl-jetstream-commit.out
+smoke_client deny \
+  --base-url "http://127.0.0.1:${CONTROL_PORT}" \
+  --op-id ci-jetstream-user \
+  --tenant-id tenant-a \
+  --namespace user \
+  --key user-js-ci \
+  --delivery-priority p0 \
+  --reason-code ci_jetstream_smoke \
+  --created-by ci >/tmp/globacl-jetstream-commit.out
 
-for _ in $(seq 1 120); do
-  response="$(curl -sS "http://127.0.0.1:${DEMO_PORT}/access?tenant_id=tenant-a&namespace=user&key=user-js-ci")"
-  if grep -q '"access":"denied"' <<<"${response}"; then
-    wait_for_propagation_ack 1
-    echo "jetstream smoke passed"
-    exit 0
-  fi
-  sleep 1
-done
+if ! smoke_client wait-demo-deny \
+  --base-url "http://127.0.0.1:${DEMO_PORT}" \
+  --tenant-id tenant-a \
+  --namespace user \
+  --key user-js-ci \
+  --timeout 120s; then
+  echo "jetstream smoke failed: demo app did not observe deny" >&2
+  k -n "${NAMESPACE}" get pods -o wide >&2 || true
+  k -n "${NAMESPACE}" logs deploy/globacl-commitd --tail=100 >&2 || true
+  k -n "${NAMESPACE}" logs deploy/globacl-relay --tail=100 >&2 || true
+  k -n "${NAMESPACE}" logs deploy/globacl-agent --tail=100 >&2 || true
+  exit 1
+fi
 
-echo "jetstream smoke failed: demo app did not observe deny" >&2
-k -n "${NAMESPACE}" get pods -o wide >&2 || true
-k -n "${NAMESPACE}" logs deploy/globacl-commitd --tail=100 >&2 || true
-k -n "${NAMESPACE}" logs deploy/globacl-relay --tail=100 >&2 || true
-k -n "${NAMESPACE}" logs deploy/globacl-agent --tail=100 >&2 || true
-exit 1
+wait_for_propagation_ack 1
+echo "jetstream smoke passed"
