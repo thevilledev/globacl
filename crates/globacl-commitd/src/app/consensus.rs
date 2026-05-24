@@ -269,8 +269,9 @@ fn sync_from_leader(app: &App) -> Result<()> {
     if is_write_leader(app)? {
         return Ok(());
     }
-    let leader_addr = current_leader_addr(app)?
-        .ok_or_else(|| GlobAclError::InvalidData("leader address is not configured".to_owned()))?;
+    let Some(leader_addr) = current_leader_addr(app)? else {
+        return Ok(());
+    };
     let watermarks_response = http_get(&leader_addr, "/v1/watermarks")?;
     if watermarks_response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(

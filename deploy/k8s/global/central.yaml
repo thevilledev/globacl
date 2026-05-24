@@ -21,6 +21,7 @@ metadata:
   namespace: globacl
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: globacl-commitd
   ports:

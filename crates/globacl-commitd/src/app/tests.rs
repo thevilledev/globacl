@@ -342,6 +342,23 @@ mod tests {
     }
 
     #[test]
+    fn follower_sync_without_known_leader_is_noop() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-sync-no-leader-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Candidate, 3);
+
+        sync_from_leader(&app).expect("sync without leader should be a noop");
+
+        let sync_status = lock_sync_status(&app).expect("sync status");
+        assert_eq!(sync_status.sync_errors, 0);
+        drop(sync_status);
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn prepare_replaces_stale_pending_entry_from_older_term() {
         let root = env::temp_dir().join(format!(
             "globacl-commitd-pending-replace-{}-{}",
