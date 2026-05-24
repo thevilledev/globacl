@@ -2859,6 +2859,90 @@ mod tests {
     }
 
     #[test]
+    fn stale_leader_prepare_is_rejected_by_newer_term_peer() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-stale-prepare-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        let mutation = prepared_mutation("op-stale", "user-1", 2);
+
+        let err = prepare_replicated_mutation(&app, &mutation)
+            .expect_err("stale leader prepare should fail");
+
+        assert!(err.to_string().contains("stale mutation epoch"));
+        assert!(!pending_mutation_path(&app.pending_dir, &mutation).exists());
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 0);
+        drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn stale_leader_commit_is_rejected_by_newer_term_peer() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-stale-commit-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        let mutation = prepared_mutation("op-stale", "user-1", 2);
+
+        let err = commit_replicated_mutation(&app, mutation.clone(), false)
+            .expect_err("stale leader commit should fail");
+
+        assert!(err.to_string().contains("stale mutation epoch"));
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 0);
+        assert_eq!(state.watermarks()[mutation.commit_id.shard_id as usize], 0);
+        drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn leader_write_without_quorum_does_not_apply_locally() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-partitioned-leader-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 4);
+
+        let err = commit_request(&app, deny_request("op-partitioned", "user-1"))
+            .expect_err("partitioned leader should fail quorum prepare");
+
+        assert!(err.to_string().contains("commitd quorum unavailable"));
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 0);
+        assert_eq!(state.entries_len(), 0);
+        assert!(state.watermarks().iter().all(|seq| *seq == 0));
+        drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn stepped_down_leader_rejects_new_write() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-stepdown-write-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 4);
+
+        handle_heartbeat(&app, &test_form(&[("term", "5"), ("leader_id", "node-b")]))
+            .expect("higher-term heartbeat");
+        let err = commit_request(&app, deny_request("op-after-stepdown", "user-1"))
+            .expect_err("stepped-down leader should reject writes");
+
+        assert!(err.to_string().contains("not the write leader"));
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 0);
+        drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn publisher_offsets_round_trip() {
         let root = env::temp_dir().join(format!(
             "globacl-commitd-offsets-{}-{}",
