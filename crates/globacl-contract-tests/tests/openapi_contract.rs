@@ -124,6 +124,63 @@ fn backend_conforms_to_documented_openapi_contract() {
         &["status", "role", "commitd", "commit_addr"],
     );
 
+    assert_status(&raw_get(&cluster.control_addr, "/metrics"), 404);
+    assert_status(&raw_get(&cluster.commit_addr, "/metrics"), 404);
+    assert_status(&raw_get(&cluster.relay_addr, "/metrics"), 404);
+    assert_status(&raw_get(&cluster.agent_addr, "/metrics"), 404);
+    assert_status(&raw_get(&cluster.demo_addr, "/metrics"), 404);
+
+    assert_prometheus_metric(
+        &raw_get(&cluster.control_metrics_addr, "/metrics"),
+        "globacl_control_up",
+    );
+    assert_prometheus_metric(
+        &raw_get(&cluster.commit_metrics_addr, "/metrics"),
+        "globacl_commitd_up",
+    );
+    assert_prometheus_metric(
+        &raw_get(&cluster.relay_metrics_addr, "/metrics"),
+        "globacl_relay_up",
+    );
+    assert_prometheus_metric(
+        &raw_get(&cluster.agent_metrics_addr, "/metrics"),
+        "globacl_agent_up",
+    );
+    assert_prometheus_metric(
+        &raw_get(&cluster.demo_metrics_addr, "/metrics"),
+        "globacl_demo_up",
+    );
+    assert_eq!(
+        prometheus_metric_value(
+            &raw_get(&cluster.control_metrics_addr, "/metrics"),
+            "globacl_control_commitd_up"
+        ),
+        1.0
+    );
+    assert_eq!(
+        prometheus_metric_value(
+            &raw_get(&cluster.control_metrics_addr, "/metrics"),
+            "globacl_control_commitd_status_code"
+        ),
+        200.0
+    );
+    let initial_commitd_mutations = prometheus_metric_value(
+        &raw_get(&cluster.commit_metrics_addr, "/metrics"),
+        "globacl_commitd_mutations",
+    );
+    let initial_commitd_entries = prometheus_metric_value(
+        &raw_get(&cluster.commit_metrics_addr, "/metrics"),
+        "globacl_commitd_entries",
+    );
+    let initial_agent_applied = prometheus_metric_value(
+        &raw_get(&cluster.agent_metrics_addr, "/metrics"),
+        "globacl_agent_applied_mutations_total",
+    );
+    let initial_agent_entries = prometheus_metric_value(
+        &raw_get(&cluster.agent_metrics_addr, "/metrics"),
+        "globacl_agent_entries",
+    );
+
     let deny = raw_post(
         &cluster.control_addr,
         "/v1/deny",
@@ -160,6 +217,16 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_eq!(deny_form.get("delivery_priority").unwrap(), "p0");
     let deny_shard = deny_form.get("shard_id").unwrap().parse::<u16>().unwrap();
     let deny_seq = deny_form.get("seq").unwrap().parse::<u64>().unwrap();
+    assert_prometheus_metric_at_least(
+        &cluster.commit_metrics_addr,
+        "globacl_commitd_mutations",
+        initial_commitd_mutations + 1.0,
+    );
+    assert_prometheus_metric_at_least(
+        &cluster.commit_metrics_addr,
+        "globacl_commitd_entries",
+        initial_commitd_entries + 1.0,
+    );
 
     let mutation = raw_post(
         &cluster.control_addr,
@@ -241,6 +308,21 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_fields(
         &lookup,
         &["decision", "reason_code", "priority", "shard_id", "seq"],
+    );
+    assert_prometheus_metric_at_least(
+        &cluster.agent_metrics_addr,
+        "globacl_agent_entries",
+        initial_agent_entries + 1.0,
+    );
+    assert_prometheus_metric_at_least(
+        &cluster.agent_metrics_addr,
+        "globacl_agent_applied_mutations_total",
+        initial_agent_applied + 1.0,
+    );
+    assert_prometheus_metric_at_least(
+        &cluster.agent_metrics_addr,
+        "globacl_agent_max_seq",
+        deny_seq as f64,
     );
 
     let check = wait_for_form(
@@ -382,6 +464,10 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_content_type(&rollback, "application/json");
     assert_fields(&form(&rollback), &["status", "snapshot", "mutations"]);
 
+    let central_ack_count_before = prometheus_metric_value(
+        &raw_get(&cluster.commit_metrics_addr, "/metrics"),
+        "globacl_commitd_central_ack_count",
+    );
     let central_ack = raw_post(
         &cluster.control_addr,
         "/v1/ack",
@@ -390,7 +476,7 @@ fn backend_conforms_to_documented_openapi_contract() {
             r#"{{
               "relay_id": "relay-contract",
               "location": "local",
-              "agent_id": "agent-contract",
+              "agent_id": "agent-contract-central-metric",
               "shard_id": {deny_shard},
               "seq": {deny_seq},
               "entries": 1,
@@ -403,6 +489,11 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_status(&central_ack, 200);
     assert_content_type(&central_ack, "application/json");
     assert_eq!(form(&central_ack).get("status").unwrap(), "ok");
+    assert_prometheus_metric_at_least(
+        &cluster.commit_metrics_addr,
+        "globacl_commitd_central_ack_count",
+        central_ack_count_before + 1.0,
+    );
 
     let propagation = raw_get(&cluster.control_addr, "/v1/propagation/status");
     assert_status(&propagation, 200);
@@ -420,13 +511,17 @@ fn backend_conforms_to_documented_openapi_contract() {
         ],
     );
 
+    let relay_ack_count_before = prometheus_metric_value(
+        &raw_get(&cluster.relay_metrics_addr, "/metrics"),
+        "globacl_relay_ack_count",
+    );
     let relay_ack = raw_post(
         &cluster.relay_addr,
         "/v1/ack",
         "application/json",
         format!(
             r#"{{
-              "agent_id": "agent-contract",
+              "agent_id": "agent-contract-relay-metric",
               "shard_id": {deny_shard},
               "seq": {deny_seq},
               "entries": 1,
@@ -438,6 +533,11 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_status(&relay_ack, 200);
     assert_content_type(&relay_ack, "application/json");
     assert_eq!(form(&relay_ack).get("status").unwrap(), "ok");
+    assert_prometheus_metric_at_least(
+        &cluster.relay_metrics_addr,
+        "globacl_relay_ack_count",
+        relay_ack_count_before + 1.0,
+    );
 
     let relay_acks = raw_get(&cluster.relay_addr, "/v1/acks");
     assert_status(&relay_acks, 200);
@@ -449,7 +549,8 @@ fn backend_conforms_to_documented_openapi_contract() {
         .and_then(JsonValue::as_array)
         .unwrap()
         .iter()
-        .any(|ack| ack.get("agent_id").and_then(JsonValue::as_str) == Some("agent-contract")));
+        .any(|ack| ack.get("agent_id").and_then(JsonValue::as_str)
+            == Some("agent-contract-relay-metric")));
 
     let audit = raw_get(&cluster.control_addr, "/v1/audit");
     assert_status(&audit, 200);
@@ -558,9 +659,17 @@ struct TestCluster {
     _control: ChildGuard,
     _relay: ChildGuard,
     _agent: ChildGuard,
+    _demo: ChildGuard,
     control_addr: String,
     relay_addr: String,
     agent_addr: String,
+    commit_addr: String,
+    demo_addr: String,
+    control_metrics_addr: String,
+    commit_metrics_addr: String,
+    relay_metrics_addr: String,
+    agent_metrics_addr: String,
+    demo_metrics_addr: String,
 }
 
 impl TestCluster {
@@ -574,9 +683,22 @@ impl TestCluster {
         let control_addr = free_addr();
         let relay_addr = free_addr();
         let agent_addr = free_addr();
+        let demo_addr = free_addr();
+        let control_metrics_addr = free_addr();
+        let commit_metrics_addr = free_addr();
+        let relay_metrics_addr = free_addr();
+        let agent_metrics_addr = free_addr();
+        let demo_metrics_addr = free_addr();
         let snapshot_path = root.path.join("agent").join("latest.gacl");
         fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
 
+        let commitd_envs = append_envs(
+            &[
+                ("GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES", "0"),
+                ("GLOBACL_COMMITD_METRICS_ADDR", commit_metrics_addr.as_str()),
+            ],
+            extra_envs,
+        );
         let commitd = spawn(
             "commitd",
             env!("CARGO_BIN_EXE_globacl-contract-commitd"),
@@ -586,29 +708,35 @@ impl TestCluster {
                 "16",
                 "0",
             ],
-            &append_envs(
-                &[("GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES", "0")],
-                extra_envs,
-            ),
+            &commitd_envs,
         );
         wait_for_health("commitd", &commit_addr);
 
+        let control_envs = append_envs(
+            &[(
+                "GLOBACL_CONTROL_METRICS_ADDR",
+                control_metrics_addr.as_str(),
+            )],
+            extra_envs,
+        );
         let control = spawn(
             "control",
             env!("CARGO_BIN_EXE_globacl-contract-control"),
             &[&commit_addr, &control_addr],
-            extra_envs,
+            &control_envs,
         );
         wait_for_health("control", &control_addr);
 
+        let relay_envs = [("GLOBACL_RELAY_METRICS_ADDR", relay_metrics_addr.as_str())];
         let relay = spawn(
             "relay",
             env!("CARGO_BIN_EXE_globacl-contract-relay"),
             &[&control_addr, &relay_addr, "relay-contract", "local"],
-            &[],
+            &relay_envs,
         );
         wait_for_health("relay", &relay_addr);
 
+        let agent_envs = [("GLOBACL_AGENT_METRICS_ADDR", agent_metrics_addr.as_str())];
         let agent = spawn(
             "agent",
             env!("CARGO_BIN_EXE_globacl-contract-agent"),
@@ -620,9 +748,18 @@ impl TestCluster {
                 "agent-contract",
                 "60",
             ],
-            &[],
+            &agent_envs,
         );
         wait_for_health("agent", &agent_addr);
+
+        let demo_envs = [("GLOBACL_DEMO_METRICS_ADDR", demo_metrics_addr.as_str())];
+        let demo = spawn(
+            "demo",
+            env!("CARGO_BIN_EXE_globacl-contract-demo"),
+            &[&agent_addr, &demo_addr],
+            &demo_envs,
+        );
+        wait_for_health("demo", &demo_addr);
 
         Self {
             _root: root,
@@ -630,9 +767,17 @@ impl TestCluster {
             _control: control,
             _relay: relay,
             _agent: agent,
+            _demo: demo,
             control_addr,
             relay_addr,
             agent_addr,
+            commit_addr,
+            demo_addr,
+            control_metrics_addr,
+            commit_metrics_addr,
+            relay_metrics_addr,
+            agent_metrics_addr,
+            demo_metrics_addr,
         }
     }
 }
@@ -867,6 +1012,60 @@ fn assert_content_type(response: &RawResponse, expected: &str) {
         actual.starts_with(expected),
         "expected Content-Type {expected}, got {actual}"
     );
+}
+
+fn assert_prometheus_metric(response: &RawResponse, metric_name: &str) {
+    assert_status(response, 200);
+    assert_content_type(response, "text/plain");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains(&format!("# HELP {metric_name} ")),
+        "missing HELP line for {metric_name}: {body}"
+    );
+    assert!(
+        body.contains(&format!("# TYPE {metric_name} ")),
+        "missing TYPE line for {metric_name}: {body}"
+    );
+    assert!(
+        body.contains(&format!("{metric_name}")),
+        "missing sample for {metric_name}: {body}"
+    );
+}
+
+fn assert_prometheus_metric_at_least(addr: &str, metric_name: &str, minimum: f64) {
+    let response = raw_get(addr, "/metrics");
+    let actual = prometheus_metric_value(&response, metric_name);
+    assert!(
+        actual >= minimum,
+        "expected {metric_name} >= {minimum}, got {actual}; body={}",
+        String::from_utf8_lossy(&response.body)
+    );
+}
+
+fn prometheus_metric_value(response: &RawResponse, metric_name: &str) -> f64 {
+    assert_status(response, 200);
+    assert_content_type(response, "text/plain");
+    let body = String::from_utf8_lossy(&response.body);
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(suffix) = line.strip_prefix(metric_name) else {
+            continue;
+        };
+        if !suffix.starts_with(' ') && !suffix.starts_with('{') {
+            continue;
+        }
+        let value = line
+            .split_whitespace()
+            .last()
+            .unwrap_or_else(|| panic!("metric {metric_name} has no value: {line}"));
+        return value
+            .parse::<f64>()
+            .unwrap_or_else(|err| panic!("metric {metric_name} value {value:?} invalid: {err}"));
+    }
+    panic!("missing sample for {metric_name}: {body}");
 }
 
 fn assert_fields(form: &HashMap<String, String>, fields: &[&str]) {

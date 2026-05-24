@@ -496,3 +496,150 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     Ok(())
 }
+
+fn format_commitd_metrics(app: &App) -> Result<String> {
+    let state = lock_state(app)?;
+    let entries = state.entries_len();
+    let mutations = state.mutations_len();
+    let shard_count = state.shard_count();
+    drop(state);
+
+    let consensus = lock_consensus(app)?.clone();
+    let sync_status = lock_sync_status(app)?.clone();
+    let publisher_status = lock_publisher_status(app)?.clone();
+    let central_ack_count = lock_propagation_acks(app)?.len();
+    let max_published_seq = publisher_status
+        .last_published
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let labels = [
+        ("cluster_id", app.replication.cluster_id.as_str()),
+        ("node_id", app.replication.node_id.as_str()),
+        ("role", consensus.role.as_str()),
+    ];
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_up",
+        "Commitd process is serving requests.",
+        "gauge",
+        &labels,
+        1,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_write_authority",
+        "Whether this commitd node currently has write authority.",
+        "gauge",
+        &labels,
+        prometheus_bool(consensus.role == ConsensusRole::Leader || !app.replication.is_clustered()),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_current_term",
+        "Current fenced-leader consensus term.",
+        "gauge",
+        &labels,
+        consensus.current_term,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_quorum",
+        "Configured commit quorum.",
+        "gauge",
+        &labels,
+        app.replication.quorum,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_peer_count",
+        "Configured commit peer count.",
+        "gauge",
+        &labels,
+        app.replication.peers.len(),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_shard_count",
+        "Number of configured ACL shards.",
+        "gauge",
+        &labels,
+        shard_count,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_entries",
+        "Materialized deny entry count.",
+        "gauge",
+        &labels,
+        entries,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_mutations",
+        "Retained committed mutation count.",
+        "gauge",
+        &labels,
+        mutations,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_jetstream_publisher_enabled",
+        "Whether commitd publishes committed mutations to JetStream.",
+        "gauge",
+        &labels,
+        prometheus_bool(app.publisher.is_some()),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_max_published_seq",
+        "Maximum per-shard sequence published to the configured sink.",
+        "gauge",
+        &labels,
+        max_published_seq,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_last_publish_unix",
+        "Unix timestamp of the last successful publish loop.",
+        "gauge",
+        &labels,
+        publisher_status.last_publish_unix,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_publish_errors_total",
+        "Number of publish loop errors since process start.",
+        "counter",
+        &labels,
+        publisher_status.publish_errors,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_last_peer_sync_unix",
+        "Unix timestamp of the last successful follower catch-up sync.",
+        "gauge",
+        &labels,
+        sync_status.last_peer_sync_unix,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_sync_errors_total",
+        "Number of follower catch-up sync errors since process start.",
+        "counter",
+        &labels,
+        sync_status.sync_errors,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_commitd_central_ack_count",
+        "Number of latest propagation acknowledgements stored centrally.",
+        "gauge",
+        &labels,
+        central_ack_count,
+    );
+    Ok(out)
+}

@@ -193,6 +193,7 @@ impl Node {
             .env("GLOBACL_COMMITD_HEARTBEAT_MS", "50")
             .env("GLOBACL_COMMITD_ELECTION_MS", "250")
             .env("GLOBACL_COMMITD_SYNC_MS", "50")
+            .env("GLOBACL_COMMITD_METRICS_ADDR", "off")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

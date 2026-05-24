@@ -1,9 +1,10 @@
 use globacl_core::{
-    auth_config_from_env_var, deny_requires_blast_radius_override, http_get,
-    http_get_with_headers, http_post_with_headers, parse_form_lines, parse_query_path,
-    read_http_request, rule_requires_blast_radius_override, write_auth_failure_response,
-    write_http_response, AuthConfig, AuthPrincipal, DenyRequest, GlobAclError, HttpRequest, Result,
-    RuleRequest,
+    append_prometheus_metric, auth_config_from_env_var, deny_requires_blast_radius_override,
+    http_get, http_get_with_headers, http_post_with_headers, metrics_bind_addr_from_env,
+    parse_form_lines, parse_query_path, prometheus_bool, read_http_request,
+    rule_requires_blast_radius_override, spawn_prometheus_metrics_listener,
+    write_auth_failure_response, write_http_response, AuthConfig, AuthPrincipal, DenyRequest,
+    GlobAclError, HttpRequest, Result, RuleRequest,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -25,6 +26,14 @@ pub(crate) fn run() -> Result<()> {
     let bind_addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:7000");
     let auth = auth_config_from_env_var("GLOBACL_AUTH_TOKENS")?;
     let app = Arc::new(App { commit_addr, auth });
+
+    {
+        let app = Arc::clone(&app);
+        spawn_prometheus_metrics_listener(
+            metrics_bind_addr_from_env("GLOBACL_CONTROL_METRICS_ADDR", "127.0.0.1:9100"),
+            move || Ok(format_control_metrics(&app)),
+        )?;
+    }
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(

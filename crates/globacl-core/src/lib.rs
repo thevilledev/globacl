@@ -6,6 +6,7 @@ include!("lib/rules.rs");
 include!("lib/snapshots.rs");
 include!("lib/http.rs");
 include!("lib/auth.rs");
+include!("lib/metrics.rs");
 include!("lib/nats.rs");
 include!("lib/codec.rs");
 include!("lib/tests.rs");

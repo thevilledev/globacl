@@ -37,3 +37,55 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     Ok(())
 }
+
+fn format_demo_metrics(app: &App) -> Result<String> {
+    let mut out = String::new();
+    let lookup_mode = app.lookup.mode_name();
+    let labels = [("lookup_mode", lookup_mode)];
+    append_prometheus_metric(
+        &mut out,
+        "globacl_demo_up",
+        "Demo app process is serving requests.",
+        "gauge",
+        &labels,
+        1,
+    );
+
+    if let LookupMode::Embedded { agent } = &app.lookup {
+        let health = agent.health()?;
+        append_prometheus_metric(
+            &mut out,
+            "globacl_demo_embedded_agent_stale",
+            "Whether the embedded agent has exceeded its poll-lag staleness budget.",
+            "gauge",
+            &labels,
+            if health.stale { 1 } else { 0 },
+        );
+        append_prometheus_metric(
+            &mut out,
+            "globacl_demo_embedded_agent_max_seq",
+            "Maximum applied sequence in the embedded agent.",
+            "gauge",
+            &labels,
+            health.max_seq,
+        );
+        append_prometheus_metric(
+            &mut out,
+            "globacl_demo_embedded_agent_entries",
+            "Materialized deny entry count in the embedded agent.",
+            "gauge",
+            &labels,
+            health.entries,
+        );
+        append_prometheus_metric(
+            &mut out,
+            "globacl_demo_embedded_agent_poll_lag_secs",
+            "Seconds since the embedded agent's last successful polling loop.",
+            "gauge",
+            &labels,
+            health.poll_lag_secs,
+        );
+    }
+
+    Ok(out)
+}

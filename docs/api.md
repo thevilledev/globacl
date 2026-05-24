@@ -57,6 +57,57 @@ GET  /v1/acks
 
 Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
+## Metrics
+
+Every runtime component exposes Prometheus text-format metrics on a separate
+metrics listener, not on the client-facing API listener:
+
+```text
+GET /metrics
+```
+
+The endpoint uses `text/plain; version=0.0.4` and is intended for scraping by
+Prometheus-compatible collectors. It is supported by `globacl-control`,
+`globacl-commitd`, `globacl-relay`, `globacl-agent`, and the demo app.
+
+Default local metrics listeners:
+
+```text
+globacl-control   127.0.0.1:9100
+globacl-relay     127.0.0.1:9101
+globacl-agent     127.0.0.1:9102
+globacl-commitd   127.0.0.1:9103
+globacl-demo      127.0.0.1:9180
+```
+
+Use these environment variables to change or disable the listener:
+
+```text
+GLOBACL_CONTROL_METRICS_ADDR
+GLOBACL_COMMITD_METRICS_ADDR
+GLOBACL_RELAY_METRICS_ADDR
+GLOBACL_AGENT_METRICS_ADDR
+GLOBACL_DEMO_METRICS_ADDR
+```
+
+Set a value to `off`, `false`, `disabled`, `none`, or an empty string to
+disable that component's metrics listener.
+
+Important metric families:
+
+```text
+globacl_control_*   control gateway process and commitd reachability
+globacl_commitd_*   write authority, quorum, log, publisher, and ack state
+globacl_relay_*     source health, ack cache, and ack-forwarding state
+globacl_agent_*     edge state size, staleness, repair, canary, and sync state
+globacl_demo_*      demo service health and embedded-agent state
+```
+
+Metrics are operational telemetry, so they are not returned as JSON and are not
+part of the public OpenAPI client contract. The contract tests assert that
+client-facing listeners reject `/metrics` and that each dedicated metrics
+listener returns Prometheus HELP/TYPE/sample lines.
+
 ## Authentication
 
 Authentication is opt-in for local development. Set `GLOBACL_AUTH_TOKENS` on

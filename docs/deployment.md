@@ -193,6 +193,27 @@ GLOBACL_NATS_AUTOCREATE       create stream/consumer when true
 
 When `GLOBACL_COMMITD_PUBLISHER=jetstream` is set on commitd, the leader scans its durable mutation log and publishes committed mutations to JetStream subjects such as `globacl.p0.shard.42`. Relays in JetStream mode consume that durable stream into a local mutation cache. Agents keep using the relay HTTP API in both modes.
 
+## Metrics
+
+All runtime pods expose Prometheus-style metrics on a separate listener from
+their client-facing HTTP API:
+
+```text
+globacl-control   GET :9100/metrics
+globacl-relay     GET :9101/metrics
+globacl-agent     GET :9102/metrics
+globacl-commitd   GET :9103/metrics
+globacl-demo      GET :9180/metrics
+```
+
+The Kubernetes Services in this repo expose only the client-facing HTTP ports.
+The metrics ports are declared as container ports for pod scraping and should
+be reachable only from your monitoring plane.
+
+Use the metrics for scrape-based SLO dashboards and alerts around commit
+quorum, stale agents, relay source health, central ack aggregation, publisher
+errors, repair activity, and edge-state size.
+
 ## Production Notes
 
 These manifests prove the distribution mechanics, but they are intentionally not a complete production platform.
@@ -209,6 +230,7 @@ relays: regional/PoP relay pools with autoscaling
 agents: one per node or service workload depending latency needs
 edge hot path: embed globacl-agent in Rust services when localhost HTTP latency is too expensive; keep the sidecar API for polyglot services
 signing: Ed25519 signatures are implemented; use HSM/KMS-backed key handling and rotation for production
+observability: scrape every component's separate metrics listener and alert on stale propagation, quorum loss, publisher errors, and lagging relays
 ```
 
 The included commitd consensus layer is intentionally ACL-specific rather than a general KV store. It owns term/vote persistence, leader heartbeats, majority election, idempotent mutation application, durable peer replication, and follower catch-up for the committed mutation log.

@@ -83,9 +83,13 @@ spec:
                 secretKeyRef:
                   name: globacl-signature
                   key: private_key
+            - name: GLOBACL_COMMITD_METRICS_ADDR
+              value: "0.0.0.0:9103"
           ports:
             - containerPort: 7003
               name: http
+            - containerPort: 9103
+              name: metrics
           readinessProbe:
             httpGet:
               path: /health
@@ -142,9 +146,14 @@ spec:
           args:
             - "globacl-commitd.globacl.svc.cluster.local:7003"
             - "0.0.0.0:7000"
+          env:
+            - name: GLOBACL_CONTROL_METRICS_ADDR
+              value: "0.0.0.0:9100"
           ports:
             - containerPort: 7000
               name: http
+            - containerPort: 9100
+              name: metrics
           readinessProbe:
             httpGet:
               path: /health

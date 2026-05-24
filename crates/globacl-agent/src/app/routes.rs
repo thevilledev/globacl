@@ -87,3 +87,217 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
+fn format_agent_metrics(app: &App) -> Result<String> {
+    let state = current_state(app);
+    let metrics = lock_metrics(app)?;
+    let max_seq = state.watermarks().iter().copied().max().unwrap_or(0);
+    let stats = state.stats();
+    let now = now_unix();
+    let poll_lag_secs = now.saturating_sub(metrics.last_successful_poll_unix);
+    let state_lag_secs = now.saturating_sub(metrics.last_sync_unix);
+    let stale = poll_lag_secs > app.stale_after_secs;
+    let labels = [("agent_id", app.agent_id.as_str())];
+
+    let mut out = String::new();
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_up",
+        "Agent process is serving requests.",
+        "gauge",
+        &labels,
+        1,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_stale",
+        "Whether the agent has exceeded its poll-lag staleness budget.",
+        "gauge",
+        &labels,
+        if stale { 1 } else { 0 },
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_shard_count",
+        "Number of configured ACL shards.",
+        "gauge",
+        &labels,
+        state.shard_count(),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_entries",
+        "Materialized deny entry count.",
+        "gauge",
+        &labels,
+        state.entries_len(),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_base_entries",
+        "Immutable-base deny entry count.",
+        "gauge",
+        &labels,
+        stats.base_entries,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_delta_adds",
+        "Mutable overlay deny add count.",
+        "gauge",
+        &labels,
+        stats.delta_adds,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_delta_removes",
+        "Mutable overlay deny tombstone count.",
+        "gauge",
+        &labels,
+        stats.delta_removes,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_base_rules",
+        "Immutable-base compiled rule count.",
+        "gauge",
+        &labels,
+        stats.base_rules,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_delta_rule_adds",
+        "Mutable overlay compiled rule add count.",
+        "gauge",
+        &labels,
+        stats.delta_rule_adds,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_delta_rule_removes",
+        "Mutable overlay compiled rule tombstone count.",
+        "gauge",
+        &labels,
+        stats.delta_rule_removes,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_filter_bits",
+        "Negative-filter bit count in the immutable base.",
+        "gauge",
+        &labels,
+        stats.filter_bits,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_filter_hashes",
+        "Negative-filter hash function count.",
+        "gauge",
+        &labels,
+        stats.filter_hashes,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_estimated_state_bytes",
+        "Estimated edge state memory bytes.",
+        "gauge",
+        &labels,
+        stats.estimated_bytes,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_max_seq",
+        "Maximum applied sequence across all shards.",
+        "gauge",
+        &labels,
+        max_seq,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_last_sync_unix",
+        "Unix timestamp of the last mutation application or repair.",
+        "gauge",
+        &labels,
+        metrics.last_sync_unix,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_last_successful_poll_unix",
+        "Unix timestamp of the last successful polling loop.",
+        "gauge",
+        &labels,
+        metrics.last_successful_poll_unix,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_state_lag_secs",
+        "Seconds since the last mutation application or repair.",
+        "gauge",
+        &labels,
+        state_lag_secs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_poll_lag_secs",
+        "Seconds since the last successful polling loop.",
+        "gauge",
+        &labels,
+        poll_lag_secs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_stale_after_secs",
+        "Configured poll-lag staleness budget in seconds.",
+        "gauge",
+        &labels,
+        app.stale_after_secs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_applied_mutations_total",
+        "Number of applied mutations since process start.",
+        "counter",
+        &labels,
+        metrics.applied_mutations,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_repairs_total",
+        "Number of repair attempts since process start.",
+        "counter",
+        &labels,
+        metrics.repairs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_bundle_repairs_total",
+        "Number of delta-bundle repairs since process start.",
+        "counter",
+        &labels,
+        metrics.bundle_repairs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_snapshot_repairs_total",
+        "Number of snapshot repairs since process start.",
+        "counter",
+        &labels,
+        metrics.snapshot_repairs,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_last_canary_seq",
+        "Last observed synthetic canary sequence.",
+        "gauge",
+        &labels,
+        metrics.last_canary_seq,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_agent_last_canary_seen_unix",
+        "Unix timestamp of the last observed synthetic canary.",
+        "gauge",
+        &labels,
+        metrics.last_canary_seen_unix,
+    );
+    Ok(out)
+}

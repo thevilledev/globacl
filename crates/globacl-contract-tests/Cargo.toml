@@ -28,3 +28,8 @@ test = false
 name = "globacl-contract-agent"
 path = "../globacl-agent/src/main.rs"
 test = false
+
+[[bin]]
+name = "globacl-contract-demo"
+path = "../globacl-demo-app/src/main.rs"
+test = false

@@ -54,9 +54,13 @@ spec:
                 secretKeyRef:
                   name: globacl-signature
                   key: private_key
+            - name: GLOBACL_RELAY_METRICS_ADDR
+              value: "0.0.0.0:9101"
           ports:
             - containerPort: 7001
               name: http
+            - containerPort: 9101
+              name: metrics
           readinessProbe:
             httpGet:
               path: /health
@@ -117,9 +121,13 @@ spec:
                 secretKeyRef:
                   name: globacl-signature
                   key: public_key
+            - name: GLOBACL_AGENT_METRICS_ADDR
+              value: "0.0.0.0:9102"
           ports:
             - containerPort: 7002
               name: http
+            - containerPort: 9102
+              name: metrics
           readinessProbe:
             httpGet:
               path: /health
@@ -170,9 +178,14 @@ spec:
           args:
             - "globacl-agent.globacl.svc.cluster.local:7002"
             - "0.0.0.0:8080"
+          env:
+            - name: GLOBACL_DEMO_METRICS_ADDR
+              value: "0.0.0.0:9180"
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 9180
+              name: metrics
           readinessProbe:
             httpGet:
               path: /health

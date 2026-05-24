@@ -1,11 +1,12 @@
 use globacl_core::{
-    decode_mutation, decode_mutation_stream, decode_snapshot, encode_mutation_stream,
-    format_watermarks, http_get, http_post, nats_ack, nats_jetstream_consumer_info,
-    nats_jetstream_ensure_consumer, nats_jetstream_ensure_stream, nats_jetstream_pull, now_unix,
-    parse_form_lines, parse_query_path, parse_watermarks, read_http_request, write_http_response,
-    DeliveryPriority, GlobAclError, HttpResponse, Mutation, PopAck, PropagationAck, Result,
-    SignatureSigner, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION,
-    DEFAULT_SIGNATURE_PRIVATE_KEY,
+    append_prometheus_metric, decode_mutation, decode_mutation_stream, decode_snapshot,
+    encode_mutation_stream, format_watermarks, http_get, http_post, nats_ack,
+    metrics_bind_addr_from_env, nats_jetstream_consumer_info, nats_jetstream_ensure_consumer,
+    nats_jetstream_ensure_stream, nats_jetstream_pull, now_unix, parse_form_lines,
+    parse_query_path, parse_watermarks, prometheus_bool, read_http_request,
+    spawn_prometheus_metrics_listener, write_http_response, DeliveryPriority, GlobAclError,
+    HttpResponse, Mutation, PopAck, PropagationAck, Result, SignatureSigner, DEFAULT_SHARD_COUNT,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::HashMap;
 use std::env;
@@ -110,6 +111,13 @@ pub(crate) fn run() -> Result<()> {
             .unwrap_or(5_000);
         thread::spawn(move || ack_forward_loop(app, Duration::from_millis(interval_ms)));
     }
+    {
+        let app = Arc::clone(&app);
+        spawn_prometheus_metrics_listener(
+            metrics_bind_addr_from_env("GLOBACL_RELAY_METRICS_ADDR", "127.0.0.1:9101"),
+            move || format_relay_metrics(&app),
+        )?;
+    }
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
@@ -154,4 +162,3 @@ fn build_source(upstream_addr: &str, relay_id: &str) -> Result<Arc<dyn RelaySour
         ))),
     }
 }
-

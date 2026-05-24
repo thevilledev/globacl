@@ -1,6 +1,7 @@
 use globacl_agent::{start_embedded, AgentConfig, AgentHandle};
 use globacl_core::{
-    format_decision, http_get, now_unix, parse_form_lines, parse_query_path, read_http_request,
+    append_prometheus_metric, format_decision, http_get, metrics_bind_addr_from_env, now_unix,
+    parse_form_lines, parse_query_path, read_http_request, spawn_prometheus_metrics_listener,
     write_http_response, Decision, GlobAclError, Result,
 };
 use std::env;
@@ -28,6 +29,14 @@ pub(crate) fn run() -> Result<()> {
     let bind_addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:8080");
     let lookup = lookup_mode(upstream_addr)?;
     let app = Arc::new(App { lookup });
+
+    {
+        let app = Arc::clone(&app);
+        spawn_prometheus_metrics_listener(
+            metrics_bind_addr_from_env("GLOBACL_DEMO_METRICS_ADDR", "127.0.0.1:9180"),
+            move || format_demo_metrics(&app),
+        )?;
+    }
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!("globacl-demo-app listening on {bind_addr}; {}", app.lookup.description());
@@ -91,6 +100,13 @@ impl LookupMode {
         match self {
             Self::Http { agent_addr } => format!("lookup_mode=http agent_addr={agent_addr}"),
             Self::Embedded { .. } => "lookup_mode=embedded".to_owned(),
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Http { .. } => "http",
+            Self::Embedded { .. } => "embedded",
         }
     }
 }

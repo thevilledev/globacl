@@ -1,8 +1,9 @@
 fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     let request = read_http_request(&mut stream)?;
+    let (route, _) = parse_query_path(&request.path);
 
     match request.method.as_str() {
-        "GET" if request.path == "/health" => {
+        "GET" if route == "/health" => {
             let health = app.source.health()?;
             let ack_count = lock_acks(&app)?.len();
             let ack_forward_status = lock_ack_forward_status(&app)?.clone();
@@ -20,11 +21,14 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             );
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
-        "GET" if request.path == "/v1/acks" => {
+        "GET" if route == "/metrics" => {
+            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+        }
+        "GET" if route == "/v1/acks" => {
             let body = format_acks(&app)?;
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
-        "POST" if request.path == "/v1/ack" => {
+        "POST" if route == "/v1/ack" => {
             let form = parse_form_lines(&request.body)?;
             let ack = propagation_ack_from_form(&app, &form)?;
             lock_acks(&app)?.insert(ack.key(), ack.clone());
@@ -62,3 +66,95 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
+fn format_relay_metrics(app: &App) -> Result<String> {
+    let health = app.source.health().unwrap_or_else(|_| SourceHealth {
+        ok: false,
+        details: "source_error=1\n".to_owned(),
+    });
+    let ack_count = lock_acks(app)?.len();
+    let ack_forward_status = lock_ack_forward_status(app)?.clone();
+    let labels = [
+        ("relay_id", app.relay_id.as_str()),
+        ("location", app.location.as_str()),
+        ("source", app.source.kind()),
+    ];
+
+    let mut out = String::new();
+    append_prometheus_metric(
+        &mut out,
+        "globacl_relay_up",
+        "Relay process is serving requests.",
+        "gauge",
+        &labels,
+        1,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_relay_source_up",
+        "Whether the relay source is healthy.",
+        "gauge",
+        &labels,
+        prometheus_bool(health.ok),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_relay_ack_count",
+        "Number of latest local propagation acknowledgements.",
+        "gauge",
+        &labels,
+        ack_count,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_relay_last_ack_forward_unix",
+        "Unix timestamp of the last successful upstream ack forward.",
+        "gauge",
+        &labels,
+        ack_forward_status.last_ack_forward_unix,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_relay_ack_forward_errors_total",
+        "Number of upstream ack-forward errors since process start.",
+        "counter",
+        &labels,
+        ack_forward_status.ack_forward_errors,
+    );
+
+    if let Ok(fields) = parse_form_lines(health.details.as_bytes()) {
+        for key in [
+            "http_status",
+            "bootstrap_status",
+            "shard_count",
+            "max_cached_seq",
+            "cached_mutations",
+            "source_lag_max",
+            "source_lag_sum",
+            "lagging_shards",
+            "consumer_num_pending",
+            "consumer_num_ack_pending",
+            "consumer_num_redelivered",
+            "consumer_num_waiting",
+            "last_pull_unix",
+            "applied_messages",
+            "duplicate_messages",
+            "gap_repairs",
+            "jetstream_errors",
+            "source_error",
+        ] {
+            if let Some(value) = fields.get(key).and_then(|value| value.parse::<u64>().ok()) {
+                let metric_name = format!("globacl_relay_source_{key}");
+                append_prometheus_metric(
+                    &mut out,
+                    &metric_name,
+                    "Relay source-specific numeric health field.",
+                    "gauge",
+                    &labels,
+                    value,
+                );
+            }
+        }
+    }
+
+    Ok(out)
+}

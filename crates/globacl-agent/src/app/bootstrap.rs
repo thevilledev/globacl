@@ -1,12 +1,12 @@
 use globacl_core::{
-    decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, encode_snapshot,
-    format_decision, http_get, now_unix, parse_form_lines, parse_query_path,
-    parse_signature_public_keys, parse_watermarks, read_http_request, read_snapshot_file,
+    append_prometheus_metric, decode_mutation_stream, decode_snapshot, decode_snapshot_manifest,
+    encode_snapshot, format_decision, http_get, metrics_bind_addr_from_env, now_unix,
+    parse_form_lines, parse_query_path, parse_signature_public_keys, parse_watermarks,
+    read_http_request, read_snapshot_file, spawn_prometheus_metrics_listener,
     verify_payload_signature_with_verifier, write_http_response, write_snapshot_file, ActiveState,
     ActiveStateHandle, ActiveStateStats, Decision, GlobAclError, PopAck, Result,
     SignatureVerificationKey, SignatureVerifier, Snapshot, DEFAULT_SIGNATURE_KEY_ID,
-    DEFAULT_SIGNATURE_KEY_VERSION,
-    DEFAULT_SIGNATURE_PUBLIC_KEY,
+    DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
 use std::env;
 use std::fs;
@@ -232,6 +232,13 @@ pub fn run() -> Result<()> {
         .with_agent_id(agent_id)
         .with_stale_after(Duration::from_secs(stale_after_secs));
     let handle = start_embedded(config)?;
+    {
+        let app = Arc::clone(&handle.app);
+        spawn_prometheus_metrics_listener(
+            metrics_bind_addr_from_env("GLOBACL_AGENT_METRICS_ADDR", "127.0.0.1:9102"),
+            move || format_agent_metrics(&app),
+        )?;
+    }
     serve_http(&handle, bind_addr)
 }
 

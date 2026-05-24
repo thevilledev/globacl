@@ -26,6 +26,9 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             };
             write_http_response(&mut stream, status_code, "text/plain", body.as_bytes())?;
         }
+        ("GET", "/metrics") => {
+            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+        }
         (_, path) if path.starts_with("/internal/") => {
             write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
         }
@@ -106,4 +109,38 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_control_metrics(app: &App) -> String {
+    let commit_status = http_get(&app.commit_addr, "/health")
+        .map(|response| response.status_code)
+        .unwrap_or(0);
+    let commit_up = commit_status == 200;
+    let mut out = String::new();
+    let labels = [("commit_addr", app.commit_addr.as_str())];
+    append_prometheus_metric(
+        &mut out,
+        "globacl_control_up",
+        "Control gateway process is serving requests.",
+        "gauge",
+        &labels,
+        1,
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_control_commitd_up",
+        "Whether the configured commitd upstream is reachable and healthy.",
+        "gauge",
+        &labels,
+        prometheus_bool(commit_up),
+    );
+    append_prometheus_metric(
+        &mut out,
+        "globacl_control_commitd_status_code",
+        "Last HTTP status code observed from commitd health.",
+        "gauge",
+        &labels,
+        commit_status,
+    );
+    out
 }

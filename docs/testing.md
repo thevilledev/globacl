@@ -12,7 +12,18 @@ Run OpenAPI/backend contract tests:
 cargo test -p globacl-contract-tests --locked
 ```
 
-The contract tests start real commitd, control, relay, and agent processes on loopback ports with a non-default signature keypair. They check the documented OpenAPI paths against backend status codes, `Content-Type` headers, key response fields, binary snapshot/mutation decoding, signatures, propagation acknowledgements, and audit output.
+The contract tests start real commitd, control, relay, agent, and demo app
+processes on loopback ports with a non-default signature keypair. They check
+the documented OpenAPI paths against backend status codes, `Content-Type`
+headers, key response fields, binary snapshot/mutation decoding, signatures,
+propagation acknowledgements, and audit output.
+They also assert that client-facing listeners reject `/metrics`, then scrape
+each component's separate metrics listener and assert Prometheus HELP, TYPE,
+and sample lines for the component's primary `globacl_*_up` metric. The
+end-to-end contract test also checks metric value movement: committed
+mutations increase commitd mutation and entry gauges, propagated state
+increases agent entry/applied counters, and manual acknowledgement writes
+increase central and relay ack gauges.
 
 Run the edge lookup benchmark:
 

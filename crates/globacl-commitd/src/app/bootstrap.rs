@@ -1,16 +1,18 @@
 use globacl_core::{
-    append_mutation_to_log, auth_config_from_env_var, compact_logs_to_watermarks, decode_mutation,
-    decode_mutation_stream, decode_snapshot, deny_requires_blast_radius_override, encode_mutation,
-    encode_mutation_stream, encode_snapshot, encode_snapshot_manifest, format_commit_outcome,
-    format_decision, format_watermarks, http_get, http_post, http_post_with_headers,
-    immutable_snapshot_object_name, is_safe_snapshot_object_name, load_all_logs,
-    nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix, parse_form_lines,
-    parse_query_path, parse_watermarks, read_http_request, rule_requires_blast_radius_override,
-    sanitize_audit_value, snapshot_artifact_sha256_hex, write_auth_failure_response,
-    write_delta_bundle_file, write_http_response, Action, ApplyStatus, AuthConfig, AuthPrincipal,
-    DeliveryPriority, DenyRequest, GlobAclError, HttpRequest, Mutation, PropagationAck, Result,
-    RuleRequest, SignatureSigner, Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
+    append_mutation_to_log, append_prometheus_metric, auth_config_from_env_var,
+    compact_logs_to_watermarks, decode_mutation, decode_mutation_stream, decode_snapshot,
+    deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
+    encode_snapshot_manifest, format_commit_outcome, format_decision, format_watermarks, http_get,
+    http_post, http_post_with_headers, immutable_snapshot_object_name, is_safe_snapshot_object_name,
+    load_all_logs, metrics_bind_addr_from_env, nats_jetstream_ensure_stream,
+    nats_jetstream_publish, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
+    prometheus_bool, read_http_request, rule_requires_blast_radius_override,
+    sanitize_audit_value, snapshot_artifact_sha256_hex, spawn_prometheus_metrics_listener,
+    write_auth_failure_response, write_delta_bundle_file, write_http_response, Action,
+    ApplyStatus, AuthConfig, AuthPrincipal, DeliveryPriority, DenyRequest, GlobAclError,
+    HttpRequest, Mutation, PropagationAck, Result, RuleRequest, SignatureSigner, Snapshot,
+    SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
+    DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -271,6 +273,13 @@ pub(crate) fn run() -> Result<()> {
         let app = Arc::clone(&app);
         let interval = Duration::from_millis(publisher.publish_interval_ms);
         thread::spawn(move || publisher_loop(app, interval));
+    }
+    {
+        let app = Arc::clone(&app);
+        spawn_prometheus_metrics_listener(
+            metrics_bind_addr_from_env("GLOBACL_COMMITD_METRICS_ADDR", "127.0.0.1:9103"),
+            move || format_commitd_metrics(&app),
+        )?;
     }
 
     let listener = TcpListener::bind(bind_addr)?;
