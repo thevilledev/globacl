@@ -80,6 +80,7 @@ jobs:
           bash -n deploy/k3s/jetstream-smoke.sh
           bash -n deploy/k3s/global-smoke.sh
           bash -n deploy/k3s/observability-smoke.sh
+          bash -n deploy/k3s/dev-cluster.sh
 
       - name: Install uv
         # astral-sh/setup-uv v8.1.0

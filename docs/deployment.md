@@ -102,6 +102,75 @@ The script:
    source health, agent entries, applied mutations, and central ack counts.
 ```
 
+## Local Dev Cluster
+
+Use this when you want to keep the observability topology running while you
+iterate on code:
+
+```sh
+./deploy/k3s/dev-cluster.sh up
+```
+
+That command creates or reuses one k3d cluster, builds
+`ghcr.io/thevilledev/globacl:ci`, imports it into the cluster, applies
+`deploy/k8s/local-observability.yaml`, restarts the runtime workloads, waits
+for rollout, and then keeps these local port-forwards open:
+
+```text
+control:    http://127.0.0.1:17200
+demo:       http://127.0.0.1:18280
+prometheus: http://127.0.0.1:19090
+```
+
+By default the dev cluster uses the HTTP pull-proxy relay source. To iterate on
+the NATS JetStream path instead, pass the messaging parameter:
+
+```sh
+./deploy/k3s/dev-cluster.sh up --messaging jetstream
+```
+
+That applies `deploy/k8s/nats-jetstream.yaml`, waits for NATS, configures
+commitd to publish committed mutations to JetStream, and configures relays to
+consume JetStream instead of polling the control API. To switch the same dev
+cluster back to pull-proxy mode, redeploy with:
+
+```sh
+./deploy/k3s/dev-cluster.sh deploy --messaging pull
+```
+
+Leave that process running for local access. The port-forward loops restart
+automatically if a selected pod is replaced during rollout. After changing
+code, redeploy the current tree from another terminal:
+
+```sh
+./deploy/k3s/dev-cluster.sh deploy
+```
+
+`deploy` reuses the same cluster and persistent volumes. It rebuilds the
+image, imports it into k3d, reapplies the manifest, restarts the runtime
+workloads, waits for rollout, and exits. Pass the same `--messaging` value you
+want active after the redeploy. Prometheus stays in the cluster.
+
+Useful commands:
+
+```sh
+./deploy/k3s/dev-cluster.sh ports     # reopen port-forwards only
+./deploy/k3s/dev-cluster.sh status    # show pods and services
+./deploy/k3s/dev-cluster.sh delete    # delete the dev cluster
+```
+
+Useful environment overrides:
+
+```text
+CLUSTER=globacl-dev
+IMAGE=ghcr.io/thevilledev/globacl:ci
+CONTROL_PORT=17200
+DEMO_PORT=18280
+PROMETHEUS_PORT=19090
+SKIP_BUILD=1
+SKIP_RESTART=1
+```
+
 ## Global Topology
 
 Use this to demonstrate the intended production shape with one central source of truth and three independent regions:
