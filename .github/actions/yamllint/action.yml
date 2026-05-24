@@ -21,6 +21,7 @@ inputs:
       deploy/k8s/nats-jetstream.yaml
       deploy/k8s/global/central.yaml
       deploy/k8s/global/region.yaml.tpl
+      docs/openapi.yaml
 
 runs:
   using: composite

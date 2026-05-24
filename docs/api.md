@@ -2,6 +2,9 @@
 
 The API uses newline-delimited `key=value` request bodies instead of JSON.
 
+The machine-readable contract is [OpenAPI](openapi.yaml). It documents the current HTTP surface as it exists today:
+`text/plain` key-value forms for most control requests and `application/octet-stream` for binary snapshots and mutation streams.
+
 Required fields for `POST /v1/deny`:
 
 ```text

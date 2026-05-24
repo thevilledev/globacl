@@ -2,8 +2,13 @@
 uv = "0.11.7"
 
 [env]
+OPENAPI_SPEC_VALIDATOR_VERSION = "0.7.2"
 YAMLLINT_VERSION = "1.38.0"
 
 [tasks.yamllint]
 description = "Lint GitHub workflow and Kubernetes YAML"
-run = "uvx --from yamllint==$YAMLLINT_VERSION yamllint -c .yamllint .github/actions .github/workflows deploy/k8s/local.yaml deploy/k8s/nats-jetstream.yaml deploy/k8s/global/central.yaml deploy/k8s/global/region.yaml.tpl"
+run = "uvx --from yamllint==$YAMLLINT_VERSION yamllint -c .yamllint .github/actions .github/workflows deploy/k8s/local.yaml deploy/k8s/nats-jetstream.yaml deploy/k8s/global/central.yaml deploy/k8s/global/region.yaml.tpl docs/openapi.yaml"
+
+[tasks.openapi]
+description = "Validate the OpenAPI contract"
+run = "uvx --from openapi-spec-validator==$OPENAPI_SPEC_VALIDATOR_VERSION openapi-spec-validator docs/openapi.yaml"

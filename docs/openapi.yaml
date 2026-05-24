@@ -1,0 +1,722 @@
+openapi: 3.1.0
+info:
+  title: globacl HTTP API
+  version: 0.1.0
+  summary: Control-plane, repair, and local lookup API for globacl.
+  description: |
+    globacl currently uses newline-delimited `key=value` request and response bodies for most APIs.
+    Authoring clients should talk to `globacl-control`. Runtime applications should talk to the local
+    `globacl-agent` lookup API. Relays and agents use the mutation, snapshot, and acknowledgement
+    endpoints for propagation and repair.
+
+    The canonical client path is:
+
+    - admin or abuse systems -> `globacl-control`
+    - applications -> local `globacl-agent`
+    - relays and agents -> relay/control repair APIs
+
+    Direct use of `globacl-commitd` internals is not a public client contract.
+
+servers:
+  - url: http://127.0.0.1:7000
+    description: Local `globacl-control` gateway.
+  - url: http://127.0.0.1:7001
+    description: Local relay API for agents.
+  - url: http://127.0.0.1:7002
+    description: Local agent lookup API for applications.
+
+tags:
+  - name: Operations
+    description: Health and operational status endpoints.
+  - name: Authoring
+    description: Public ACL mutation authoring through `globacl-control`.
+  - name: Lookup
+    description: Local request-time ACL decisions.
+  - name: Propagation
+    description: Mutation streams, watermarks, acknowledgements, and propagation status.
+  - name: Snapshots
+    description: Snapshot bootstrap, repair, manifests, and rollback.
+
+paths:
+  /health:
+    get:
+      tags:
+        - Operations
+      summary: Return component health.
+      description: |
+        Supported by control, commitd, relay, agent, and demo app components. Fields vary by component.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Component health as newline-delimited `key=value` text.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+              examples:
+                control:
+                  value: |
+                    status=ok
+                    role=control
+                    commitd=ok
+                    commit_addr=127.0.0.1:7003
+
+  /v1/deny:
+    post:
+      tags:
+        - Authoring
+      summary: Commit a point deny, allow override, or delete mutation.
+      operationId: createDenyMutation
+      requestBody:
+        $ref: "#/components/requestBodies/DenyMutation"
+      responses:
+        "200":
+          $ref: "#/components/responses/CommitOutcome"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+        "503":
+          $ref: "#/components/responses/UnavailableText"
+
+  /v1/mutation:
+    post:
+      tags:
+        - Authoring
+      summary: Alias for `/v1/deny`.
+      operationId: createPointMutation
+      requestBody:
+        $ref: "#/components/requestBodies/DenyMutation"
+      responses:
+        "200":
+          $ref: "#/components/responses/CommitOutcome"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+        "503":
+          $ref: "#/components/responses/UnavailableText"
+
+  /v1/rule:
+    post:
+      tags:
+        - Authoring
+      summary: Commit a compiled rule mutation.
+      description: Supports IPv4 CIDR and domain suffix rules.
+      operationId: createRuleMutation
+      requestBody:
+        $ref: "#/components/requestBodies/RuleMutation"
+      responses:
+        "200":
+          $ref: "#/components/responses/CommitOutcome"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+        "503":
+          $ref: "#/components/responses/UnavailableText"
+
+  /v1/canary:
+    post:
+      tags:
+        - Propagation
+      summary: Commit a synthetic P0 canary deny.
+      operationId: createCanary
+      responses:
+        "200":
+          description: Canary status.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+              examples:
+                committed:
+                  value: |
+                    status=ok
+                    op_id=canary-1760000000
+                    tenant_id=globacl
+                    namespace=canary
+                    key=sentinel-1760000000
+                    shard_id=7
+                    seq=42
+                    delivery_priority=p0
+        "503":
+          $ref: "#/components/responses/UnavailableText"
+
+  /v1/canary/latest:
+    get:
+      tags:
+        - Propagation
+      summary: Return the latest committed canary.
+      operationId: getLatestCanary
+      responses:
+        "200":
+          description: Latest canary or `status=none`.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/lookup:
+    get:
+      tags:
+        - Lookup
+      summary: Check an exact point-key deny decision.
+      operationId: lookupPointDecision
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Key"
+      responses:
+        "200":
+          $ref: "#/components/responses/DecisionText"
+
+  /v1/check:
+    get:
+      tags:
+        - Lookup
+      summary: Check point denies and compiled rules.
+      operationId: checkAclDecision
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Value"
+      responses:
+        "200":
+          $ref: "#/components/responses/DecisionText"
+
+  /v1/watermarks:
+    get:
+      tags:
+        - Propagation
+      summary: Return latest source sequence per shard.
+      operationId: getWatermarks
+      responses:
+        "200":
+          $ref: "#/components/responses/WatermarksText"
+
+  /v1/compaction_watermarks:
+    get:
+      tags:
+        - Propagation
+      summary: Return the compacted mutation-log floor per shard.
+      operationId: getCompactionWatermarks
+      responses:
+        "200":
+          $ref: "#/components/responses/WatermarksText"
+
+  /v1/mutations:
+    get:
+      tags:
+        - Propagation
+      summary: Return committed mutations for one shard after `from_seq`.
+      operationId: getMutations
+      parameters:
+        - $ref: "#/components/parameters/Shard"
+        - $ref: "#/components/parameters/FromSeq"
+        - $ref: "#/components/parameters/DeliveryPriority"
+      responses:
+        "200":
+          $ref: "#/components/responses/MutationStream"
+        "409":
+          $ref: "#/components/responses/HistoryCompacted"
+
+  /v1/mutations.sig:
+    get:
+      tags:
+        - Propagation
+      summary: Return an Ed25519 signature envelope for `/v1/mutations`.
+      operationId: getMutationsSignature
+      parameters:
+        - $ref: "#/components/parameters/Shard"
+        - $ref: "#/components/parameters/FromSeq"
+        - $ref: "#/components/parameters/DeliveryPriority"
+      responses:
+        "200":
+          $ref: "#/components/responses/SignatureEnvelope"
+        "409":
+          $ref: "#/components/responses/HistoryCompacted"
+
+  /v1/delta_bundle:
+    get:
+      tags:
+        - Propagation
+      summary: Return a bounded mutation range for gap repair.
+      operationId: getDeltaBundle
+      parameters:
+        - $ref: "#/components/parameters/Shard"
+        - $ref: "#/components/parameters/FromSeq"
+        - $ref: "#/components/parameters/ToSeq"
+      responses:
+        "200":
+          $ref: "#/components/responses/MutationStream"
+        "409":
+          $ref: "#/components/responses/HistoryCompacted"
+
+  /v1/delta_bundle.sig:
+    get:
+      tags:
+        - Propagation
+      summary: Return an Ed25519 signature envelope for `/v1/delta_bundle`.
+      operationId: getDeltaBundleSignature
+      parameters:
+        - $ref: "#/components/parameters/Shard"
+        - $ref: "#/components/parameters/FromSeq"
+        - $ref: "#/components/parameters/ToSeq"
+      responses:
+        "200":
+          $ref: "#/components/responses/SignatureEnvelope"
+        "409":
+          $ref: "#/components/responses/HistoryCompacted"
+
+  /v1/ack:
+    post:
+      tags:
+        - Propagation
+      summary: Record an agent or relay propagation acknowledgement.
+      operationId: recordAck
+      requestBody:
+        $ref: "#/components/requestBodies/Ack"
+      responses:
+        "200":
+          description: Ack accepted.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+              examples:
+                ok:
+                  value: |
+                    status=ok
+        "503":
+          $ref: "#/components/responses/UnavailableText"
+
+  /v1/acks:
+    get:
+      tags:
+        - Propagation
+      summary: Return relay-local acknowledgement state.
+      operationId: getRelayAcks
+      responses:
+        "200":
+          description: Relay ack table as newline-delimited `key=value` text.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/propagation/status:
+    get:
+      tags:
+        - Propagation
+      summary: Return central propagation acknowledgement coverage.
+      operationId: getPropagationStatus
+      responses:
+        "200":
+          description: Aggregate propagation status.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/snapshot:
+    get:
+      tags:
+        - Snapshots
+      summary: Return the latest binary snapshot.
+      operationId: getSnapshot
+      responses:
+        "200":
+          $ref: "#/components/responses/SnapshotBinary"
+    post:
+      tags:
+        - Snapshots
+      summary: Upload and archive a binary snapshot.
+      operationId: uploadSnapshot
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Snapshot accepted.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/snapshot.sig:
+    get:
+      tags:
+        - Snapshots
+      summary: Return an Ed25519 signature envelope for `/v1/snapshot`.
+      operationId: getSnapshotSignature
+      responses:
+        "200":
+          $ref: "#/components/responses/SignatureEnvelope"
+
+  /v1/snapshot_manifest:
+    get:
+      tags:
+        - Snapshots
+      summary: Return the latest snapshot manifest.
+      operationId: getSnapshotManifest
+      responses:
+        "200":
+          description: Snapshot manifest as newline-delimited `key=value` text.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/snapshot_manifest.sig:
+    get:
+      tags:
+        - Snapshots
+      summary: Return an Ed25519 signature envelope for `/v1/snapshot_manifest`.
+      operationId: getSnapshotManifestSignature
+      responses:
+        "200":
+          $ref: "#/components/responses/SignatureEnvelope"
+
+  /v1/snapshot_artifact:
+    get:
+      tags:
+        - Snapshots
+      summary: Return an immutable snapshot artifact by object name.
+      operationId: getSnapshotArtifact
+      parameters:
+        - $ref: "#/components/parameters/SnapshotObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/SnapshotBinary"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+
+  /v1/snapshot_artifact.sig:
+    get:
+      tags:
+        - Snapshots
+      summary: Return an Ed25519 signature envelope for `/v1/snapshot_artifact`.
+      operationId: getSnapshotArtifactSignature
+      parameters:
+        - $ref: "#/components/parameters/SnapshotObject"
+      responses:
+        "200":
+          $ref: "#/components/responses/SignatureEnvelope"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+
+  /v1/snapshots:
+    get:
+      tags:
+        - Snapshots
+      summary: List archived rollback snapshot targets.
+      operationId: listSnapshots
+      responses:
+        "200":
+          description: Snapshot names as newline-delimited `key=value` text.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+
+  /v1/rollback:
+    post:
+      tags:
+        - Snapshots
+      summary: Restore an archived snapshot through forward compensating mutations.
+      operationId: rollbackToSnapshot
+      requestBody:
+        $ref: "#/components/requestBodies/Rollback"
+      responses:
+        "200":
+          description: Rollback accepted.
+          content:
+            text/plain:
+              schema:
+                $ref: "#/components/schemas/KeyValueText"
+        "400":
+          $ref: "#/components/responses/RejectedText"
+
+  /v1/audit:
+    get:
+      tags:
+        - Operations
+      summary: Return the append-only audit log.
+      operationId: getAuditLog
+      responses:
+        "200":
+          description: Audit log text.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    KeyValueText:
+      type: string
+      description: Newline-delimited `key=value` text.
+    BinaryPayload:
+      type: string
+      format: binary
+
+  parameters:
+    TenantId:
+      name: tenant_id
+      in: query
+      required: true
+      schema:
+        type: string
+      example: tenant-a
+    Namespace:
+      name: namespace
+      in: query
+      required: true
+      schema:
+        type: string
+      example: user
+    Key:
+      name: key
+      in: query
+      required: true
+      schema:
+        type: string
+      example: user-123
+    Value:
+      name: value
+      in: query
+      required: true
+      schema:
+        type: string
+      example: 10.1.2.3
+    Shard:
+      name: shard
+      in: query
+      required: true
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 7
+    FromSeq:
+      name: from_seq
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
+      example: 41
+    ToSeq:
+      name: to_seq
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+      example: 42
+    DeliveryPriority:
+      name: delivery_priority
+      in: query
+      required: false
+      schema:
+        type: string
+        enum:
+          - p0
+          - p1
+          - p2
+      example: p0
+    SnapshotObject:
+      name: object
+      in: query
+      required: true
+      schema:
+        type: string
+      example: snapshots/max_seq_00000000000000000042_sha256_0123456789abcdef.gacl
+
+  requestBodies:
+    DenyMutation:
+      required: true
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            deny:
+              value: |
+                op_id=demo-1
+                tenant_id=tenant-a
+                namespace=user
+                key=user-123
+                action=deny
+                delivery_priority=p0
+                priority=100
+                reason_code=abuse
+                created_by=demo
+            delete:
+              value: |
+                op_id=demo-delete-1
+                tenant_id=tenant-a
+                namespace=user
+                key=user-123
+                action=delete
+                created_by=demo
+    RuleMutation:
+      required: true
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            ipv4:
+              value: |
+                op_id=net-1
+                tenant_id=tenant-a
+                kind=ipv4_cidr
+                pattern=10.0.0.0/8
+                action=deny
+                reason_code=blocked_network
+            domain:
+              value: |
+                op_id=domain-1
+                tenant_id=tenant-a
+                kind=domain_suffix
+                pattern=*.example.com
+                action=deny
+                reason_code=blocked_domain
+    Ack:
+      required: true
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            agent:
+              value: |
+                agent_id=agent-local
+                shard_id=7
+                seq=42
+                entries=100
+                applied_at_unix=1760000000
+    Rollback:
+      required: true
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            snapshot:
+              value: |
+                snapshot=epoch_00000000001760000000_shard_0007_seq_00000000000000000042.gacl
+
+  responses:
+    CommitOutcome:
+      description: Committed mutation outcome.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            committed:
+              value: |
+                duplicate=false
+                shard_id=7
+                seq=42
+                epoch=3
+                action=deny
+                key_hash=123456789
+                delivery_priority=p0
+                committed_at_unix=1760000000
+                entries_changed=1
+    DecisionText:
+      description: ACL decision.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            allow:
+              value: |
+                decision=allow
+            deny:
+              value: |
+                decision=deny
+                reason_code=abuse
+                priority=100
+                shard_id=7
+                seq=42
+                epoch=3
+    WatermarksText:
+      description: Per-shard watermark text.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            watermarks:
+              value: |
+                shard_count=4
+                shard_0000=0
+                shard_0001=42
+                shard_0002=0
+                shard_0003=7
+    MutationStream:
+      description: Binary mutation stream.
+      content:
+        application/octet-stream:
+          schema:
+            $ref: "#/components/schemas/BinaryPayload"
+    SnapshotBinary:
+      description: Binary snapshot payload.
+      content:
+        application/octet-stream:
+          schema:
+            $ref: "#/components/schemas/BinaryPayload"
+    SignatureEnvelope:
+      description: Ed25519 signature envelope over the corresponding payload.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            signature:
+              value: |
+                algorithm=ed25519
+                key_id=dev-ed25519
+                key_version=1
+                signature=abcdef
+    HistoryCompacted:
+      description: Requested mutation history has been compacted; repair from snapshot.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            compacted:
+              value: |
+                status=compacted
+                reason=history_compacted
+                compacted_seq=42
+    RejectedText:
+      description: Request rejected by validation.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            rejected:
+              value: |
+                status=rejected
+                reason=blast_radius_override_required
+    UnavailableText:
+      description: Upstream commit service is unavailable.
+      content:
+        text/plain:
+          schema:
+            $ref: "#/components/schemas/KeyValueText"
+          examples:
+            unavailable:
+              value: |
+                status=unavailable
+                reason=commitd_proxy_failed

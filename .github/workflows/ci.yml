@@ -88,6 +88,14 @@ jobs:
       - name: Lint YAML
         uses: ./.github/actions/yamllint
 
+      - name: Validate OpenAPI
+        env:
+          OPENAPI_SPEC_VALIDATOR_VERSION: "0.7.2"
+        run: |
+          set -euo pipefail
+          uvx --from "openapi-spec-validator==${OPENAPI_SPEC_VALIDATOR_VERSION}" \
+            openapi-spec-validator docs/openapi.yaml
+
       - name: Audit GitHub Actions
         # zizmorcore/zizmor-action v0.5.6
         uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d
