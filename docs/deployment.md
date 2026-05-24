@@ -167,7 +167,7 @@ GLOBACL_COMMITD_COMPACT_ON_STARTUP
                                   rewrite logs behind latest signed checkpoint on startup
 ```
 
-Commitd compaction uses the latest signed snapshot as the checkpoint, rewrites per-shard logs to retain only post-checkpoint mutations, and writes `idempotency.glog` so duplicate `op_id` handling survives restarts. If a follower or edge component asks for a compacted range, it repairs from the snapshot channel. Automatic compaction is skipped while `GLOBACL_COMMITD_PUBLISHER=jetstream` is enabled so unpublished broker events are not removed before publisher-aware cutoffs exist.
+Commitd compaction uses the latest signed snapshot as the checkpoint, rewrites per-shard logs to retain only post-checkpoint mutations, and writes `idempotency.glog` so duplicate `op_id` handling survives restarts. If a follower or edge component asks for a compacted range, it repairs from the snapshot channel. When `GLOBACL_COMMITD_PUBLISHER=jetstream` is enabled, compaction is capped by durable per-shard publisher offsets so unpublished JetStream events remain replayable after restart.
 
 Relay source selection is runtime-configurable:
 

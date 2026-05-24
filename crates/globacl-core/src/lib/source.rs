@@ -88,6 +88,97 @@ impl SourceOfTruth {
         Ok(state)
     }
 
+    pub fn from_snapshot_and_retained_history(
+        shard_count: u16,
+        source_region: impl Into<String>,
+        snapshot: Snapshot,
+        idempotency_mutations: Vec<Mutation>,
+        mut retained_mutations: Vec<Mutation>,
+        compacted_watermarks: Vec<u64>,
+    ) -> Result<Self> {
+        if snapshot.shard_count != shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot shard_count {} does not match expected {}",
+                snapshot.shard_count, shard_count
+            )));
+        }
+        snapshot.validate()?;
+        if compacted_watermarks.len() != shard_count as usize {
+            return Err(GlobAclError::InvalidData(format!(
+                "retained history has {} compacted watermarks for {shard_count} shards",
+                compacted_watermarks.len()
+            )));
+        }
+        for (shard_id, compacted_seq) in compacted_watermarks.iter().copied().enumerate() {
+            if compacted_seq > snapshot.watermarks[shard_id] {
+                return Err(GlobAclError::InvalidData(format!(
+                    "retained history compacted watermark {compacted_seq} exceeds shard {shard_id} snapshot watermark {}",
+                    snapshot.watermarks[shard_id]
+                )));
+            }
+        }
+
+        retained_mutations.sort_by_key(|mutation| {
+            (
+                mutation.commit_id.shard_id,
+                mutation.commit_id.seq,
+                mutation.op_id.clone(),
+            )
+        });
+
+        let mut state = Self::new(shard_count, source_region);
+        state.watermarks = snapshot.watermarks.clone();
+        state.compacted_watermarks = compacted_watermarks.clone();
+        for entry in snapshot.entries {
+            state.entries.insert(entry.acl_key(), entry);
+        }
+        for rule in snapshot.rules {
+            state.rules.insert(rule.rule_key(), rule);
+        }
+        for mutation in idempotency_mutations {
+            state.insert_op_index(mutation)?;
+        }
+
+        let mut expected_history_seq = compacted_watermarks;
+        for mutation in retained_mutations {
+            let shard_id = mutation.commit_id.shard_id;
+            if shard_id >= shard_count {
+                return Err(GlobAclError::InvalidData(format!(
+                    "shard {shard_id} is outside shard_count {shard_count}"
+                )));
+            }
+            let slot = shard_id as usize;
+            let expected_seq = expected_history_seq[slot] + 1;
+            if mutation.commit_id.seq != expected_seq {
+                return Err(GlobAclError::Gap {
+                    shard_id,
+                    expected_seq,
+                    received_seq: mutation.commit_id.seq,
+                });
+            }
+            expected_history_seq[slot] = mutation.commit_id.seq;
+
+            if mutation.commit_id.seq <= state.watermarks[slot] {
+                state.insert_op_index(mutation.clone())?;
+                state.mutations.push(mutation);
+            } else {
+                state.apply_loaded_mutation(mutation)?;
+            }
+        }
+
+        for (shard_id, replayed_seq) in expected_history_seq.iter().copied().enumerate() {
+            if replayed_seq < state.watermarks[shard_id] {
+                return Err(GlobAclError::Gap {
+                    shard_id: shard_id as u16,
+                    expected_seq: replayed_seq + 1,
+                    received_seq: state.watermarks[shard_id],
+                });
+            }
+        }
+
+        Ok(state)
+    }
+
     pub fn commit(&mut self, request: DenyRequest) -> Result<CommitOutcome> {
         let outcome = self.prepare_commit(request)?;
         if !outcome.duplicate {

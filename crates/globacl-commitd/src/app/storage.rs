@@ -30,16 +30,34 @@ fn compact_mutation_logs(app: &App, force: bool) -> Result<()> {
 }
 
 fn compact_mutation_logs_locked(app: &App, state: &mut SourceOfTruth) -> Result<()> {
-    if app.publisher.is_some() {
-        return Ok(());
-    }
-
     let snapshot = state.snapshot();
+    let compaction_watermarks = compaction_watermarks_for_snapshot(app, state, &snapshot)?;
     persist_latest_snapshot(app, &snapshot)?;
     persist_idempotency_snapshot(&app.idempotency_path, &state.idempotency_mutations())?;
-    compact_logs_to_watermarks(&app.log_dir, state.shard_count(), &snapshot.watermarks)?;
-    state.compact_mutation_history(&snapshot.watermarks)?;
+    compact_logs_to_watermarks(&app.log_dir, state.shard_count(), &compaction_watermarks)?;
+    state.compact_mutation_history(&compaction_watermarks)?;
     Ok(())
+}
+
+fn compaction_watermarks_for_snapshot(
+    app: &App,
+    state: &SourceOfTruth,
+    snapshot: &Snapshot,
+) -> Result<Vec<u64>> {
+    let mut watermarks = snapshot.watermarks.clone();
+    if app.publisher.is_some() {
+        let published = lock_publisher_status(app)?.last_published.clone();
+        for (shard_id, watermark) in watermarks.iter_mut().enumerate() {
+            let published_seq = published.get(shard_id).copied().unwrap_or(0);
+            *watermark = (*watermark).min(published_seq);
+        }
+    }
+
+    for (shard_id, watermark) in watermarks.iter_mut().enumerate() {
+        *watermark = (*watermark).max(state.compacted_watermarks()[shard_id]);
+    }
+
+    Ok(watermarks)
 }
 
 fn persist_idempotency_snapshot(path: &Path, mutations: &[Mutation]) -> Result<()> {
@@ -310,4 +328,3 @@ fn blast_radius_override_enabled(form: &std::collections::HashMap<String, String
         })
         .unwrap_or(false)
 }
-

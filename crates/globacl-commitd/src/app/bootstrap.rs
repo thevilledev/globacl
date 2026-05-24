@@ -191,13 +191,14 @@ pub(crate) fn run() -> Result<()> {
         }
     }
     let consensus = load_consensus_state(&consensus_path, &replication)?;
+    let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
     let state = load_source_of_truth(
         &log_dir,
         &snapshot_path,
         &idempotency_path,
         shard_count,
         &replication.cluster_id,
-        publisher.is_some(),
+        publisher.as_ref().map(|_| last_published.as_slice()),
     )?;
     let startup_snapshot = state.snapshot();
     write_signed_snapshot_file(&snapshot_path, &startup_snapshot, &signature_signer)?;
@@ -209,7 +210,6 @@ pub(crate) fn run() -> Result<()> {
         &signature_signer,
     )?;
 
-    let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
     let propagation_acks = load_propagation_acks(&propagation_acks_path)?;
     let app = Arc::new(App {
         state: Mutex::new(state),
@@ -297,4 +297,3 @@ pub(crate) fn run() -> Result<()> {
 
     Ok(())
 }
-

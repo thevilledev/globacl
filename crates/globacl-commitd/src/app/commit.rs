@@ -87,7 +87,7 @@ fn load_source_of_truth(
     idempotency_path: &Path,
     shard_count: u16,
     cluster_id: &str,
-    prefer_full_log_replay: bool,
+    publisher_offsets: Option<&[u64]>,
 ) -> Result<SourceOfTruth> {
     if snapshot_path.exists() {
         let snapshot = decode_snapshot(&fs::read(snapshot_path)?)?;
@@ -100,7 +100,7 @@ fn load_source_of_truth(
         }
 
         let all_log_mutations = load_all_logs(log_dir, shard_count)?;
-        if prefer_full_log_replay && !all_log_mutations.is_empty() {
+        if publisher_offsets.is_some() && !all_log_mutations.is_empty() {
             if let Ok(replayed) =
                 SourceOfTruth::from_mutations(shard_count, cluster_id, all_log_mutations.clone())
             {
@@ -116,6 +116,27 @@ fn load_source_of_truth(
         };
         if idempotency_path.exists() {
             idempotency_mutations.extend(all_log_mutations.iter().cloned());
+        }
+        if let Some(publisher_offsets) = publisher_offsets {
+            if publisher_offsets.len() != shard_count as usize {
+                return Err(GlobAclError::InvalidData(format!(
+                    "publisher offsets has {} watermarks for {shard_count} shards",
+                    publisher_offsets.len()
+                )));
+            }
+            let compacted_watermarks = publisher_offsets
+                .iter()
+                .zip(snapshot.watermarks.iter())
+                .map(|(published, snapshot_seq)| (*published).min(*snapshot_seq))
+                .collect::<Vec<_>>();
+            return SourceOfTruth::from_snapshot_and_retained_history(
+                shard_count,
+                cluster_id,
+                snapshot,
+                idempotency_mutations,
+                all_log_mutations,
+                compacted_watermarks,
+            );
         }
         let tail_mutations = all_log_mutations
             .into_iter()
@@ -372,4 +393,3 @@ fn ensure_mutation_term(app: &App, mutation: &Mutation) -> Result<()> {
     }
     Ok(())
 }
-

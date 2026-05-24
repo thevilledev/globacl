@@ -114,6 +114,40 @@ mod tests {
             .mutation
     }
 
+    fn commit_two_mutations_on_same_shard(app: &App) -> (Mutation, Mutation) {
+        let mut state = lock_state(app).expect("state");
+        let first = state
+            .commit(deny_request("op-1", "user-1"))
+            .expect("first commit")
+            .mutation;
+
+        for suffix in 2..1000 {
+            let op_id = format!("op-{suffix}");
+            let key = format!("user-{suffix}");
+            let request = deny_request(&op_id, &key);
+            let prepared = state
+                .prepare_commit(request.clone())
+                .expect("prepare candidate")
+                .mutation;
+            if prepared.commit_id.shard_id == first.commit_id.shard_id {
+                let second = state.commit(request).expect("second commit").mutation;
+                return (first, second);
+            }
+        }
+
+        panic!("could not find second mutation on shard {}", first.commit_id.shard_id);
+    }
+
+    fn enable_test_publisher(app: &mut App) {
+        app.publisher = Some(PublisherConfig {
+            nats_addr: "nats://127.0.0.1:4222".to_owned(),
+            stream: "GLOBACL".to_owned(),
+            subject_prefix: "globacl".to_owned(),
+            publish_interval_ms: 100,
+            autocreate_stream: false,
+        });
+    }
+
     fn remove_test_dir(path: impl AsRef<Path>) {
         match std::fs::remove_dir_all(path) {
             Ok(()) => {}
@@ -459,7 +493,7 @@ mod tests {
             &app.idempotency_path,
             4,
             &app.replication.cluster_id,
-            false,
+            None,
         )
         .expect("load compacted source");
         let duplicate = loaded
@@ -467,6 +501,109 @@ mod tests {
             .expect("prepare duplicate");
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.mutation, one);
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn publisher_compaction_keeps_unpublished_mutation_tail() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-publisher-compaction-tail-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 1);
+        enable_test_publisher(&mut app);
+
+        let (one, two) = commit_two_mutations_on_same_shard(&app);
+        persist_mutation(&app, &one).expect("persist first");
+        persist_mutation(&app, &two).expect("persist second");
+        {
+            let mut status = lock_publisher_status(&app).expect("publisher status");
+            status.last_published[one.commit_id.shard_id as usize] = one.commit_id.seq;
+        }
+
+        {
+            let mut state = lock_state(&app).expect("state");
+            compact_mutation_logs_locked(&app, &mut state).expect("compact logs");
+            assert_eq!(
+                state.compacted_watermarks()[one.commit_id.shard_id as usize],
+                one.commit_id.seq
+            );
+            assert_eq!(
+                state.watermarks()[one.commit_id.shard_id as usize],
+                two.commit_id.seq
+            );
+            assert_eq!(
+                state.mutations_for_shard(one.commit_id.shard_id, one.commit_id.seq),
+                vec![two.clone()]
+            );
+        }
+
+        let log_tail = load_all_logs(&app.log_dir, 4).expect("load compacted logs");
+        assert!(!log_tail.contains(&one));
+        assert!(log_tail.contains(&two));
+
+        let offsets = {
+            let status = lock_publisher_status(&app).expect("publisher status");
+            status.last_published.clone()
+        };
+        let loaded = load_source_of_truth(
+            &app.log_dir,
+            &app.snapshot_path,
+            &app.idempotency_path,
+            4,
+            &app.replication.cluster_id,
+            Some(offsets.as_slice()),
+        )
+        .expect("load publisher-compacted source");
+        assert_eq!(
+            loaded.compacted_watermarks()[one.commit_id.shard_id as usize],
+            one.commit_id.seq
+        );
+        assert_eq!(
+            loaded.watermarks()[one.commit_id.shard_id as usize],
+            two.commit_id.seq
+        );
+        assert_eq!(
+            loaded.mutations_for_shard(one.commit_id.shard_id, one.commit_id.seq),
+            vec![two]
+        );
+
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn publisher_compaction_rewrites_fully_published_logs() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-publisher-compaction-full-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 1);
+        enable_test_publisher(&mut app);
+
+        let (one, two) = commit_two_mutations_on_same_shard(&app);
+        persist_mutation(&app, &one).expect("persist first");
+        persist_mutation(&app, &two).expect("persist second");
+        {
+            let mut status = lock_publisher_status(&app).expect("publisher status");
+            status.last_published[two.commit_id.shard_id as usize] = two.commit_id.seq;
+        }
+
+        {
+            let mut state = lock_state(&app).expect("state");
+            compact_mutation_logs_locked(&app, &mut state).expect("compact logs");
+            assert_eq!(state.mutations_len(), 0);
+            assert_eq!(
+                state.compacted_watermarks()[two.commit_id.shard_id as usize],
+                two.commit_id.seq
+            );
+        }
+
+        assert!(load_all_logs(&app.log_dir, 4)
+            .expect("load compacted logs")
+            .is_empty());
 
         remove_test_dir(root);
     }
