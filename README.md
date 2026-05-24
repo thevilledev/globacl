@@ -90,7 +90,7 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 | `globacl-commitd` | ACL commit service and source of truth | Elects a fenced leader, assigns shard sequences, replicates committed mutations through quorum, persists and compacts mutation logs behind signed checkpoints, keeps a compacted idempotency stream, aggregates propagation acks, optionally publishes committed mutations to NATS JetStream, writes snapshot archives plus signed immutable-artifact manifests, records audit entries, serves snapshots/deltas, and performs rollback through forward mutations. |
 | `globacl-relay` | Distribution fanout layer | Uses a pluggable source: HTTP pull-proxy from an upstream control/relay or NATS JetStream consumption into a local mutation cache. It serves the same agent-facing HTTP API in both modes, records and forwards PoP acknowledgements, and can be chained into a relay tree. |
 | `globacl-agent` | PoP edge updater and lookup service | Boots from snapshots, verifies Ed25519 signatures, polls/apply deltas, repairs gaps, sends acks, checks canaries, reports stale health, and serves local lookups. |
-| `globacl-demo-app` | Example consumer service | Calls the local agent for request-time ACL decisions and returns `access=allowed` or `access=denied`. |
+| `globacl-demo-app` | Example consumer service | Calls the local agent for request-time ACL decisions and returns JSON access decisions. |
 | `globacl-bench` | Local benchmark tool | Measures edge-state build time, process RSS, sampled p50/p95/p99 lookup latency, filter-positive rate, and memory estimates without external dependencies. |
 
 ## Docs

@@ -118,16 +118,16 @@ DEMO_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
 
 relay_health="$(curl -fsS "http://127.0.0.1:${RELAY_PORT}/health")"
-grep -q "source_lag_max=" <<<"${relay_health}"
-grep -q "consumer_num_pending=" <<<"${relay_health}"
-grep -q "consumer_num_ack_pending=" <<<"${relay_health}"
+grep -q "source_lag_max" <<<"${relay_health}"
+grep -q "consumer_num_pending" <<<"${relay_health}"
+grep -q "consumer_num_ack_pending" <<<"${relay_health}"
 
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/v1/deny" \
-  --data-binary $'op_id=ci-jetstream-user\ntenant_id=tenant-a\nnamespace=user\nkey=user-js-ci\naction=deny\ndelivery_priority=p0\nreason_code=ci_jetstream_smoke\ncreated_by=ci\n' >/tmp/globacl-jetstream-commit.out
+  --header "Content-Type: application/json" --data-binary '{"op_id":"ci-jetstream-user","tenant_id":"tenant-a","namespace":"user","key":"user-js-ci","action":"deny","delivery_priority":"p0","reason_code":"ci_jetstream_smoke","created_by":"ci"}' >/tmp/globacl-jetstream-commit.out
 
 for _ in $(seq 1 120); do
   response="$(curl -sS "http://127.0.0.1:${DEMO_PORT}/access?tenant_id=tenant-a&namespace=user&key=user-js-ci")"
-  if grep -q "access=denied" <<<"${response}"; then
+  if grep -q '"access":"denied"' <<<"${response}"; then
     wait_for_propagation_ack 1
     echo "jetstream smoke passed"
     exit 0

@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   summary: Control-plane, repair, and local lookup API for globacl.
   description: |
-    globacl currently uses newline-delimited `key=value` request and response bodies for most APIs.
+    globacl currently uses JSON request and response bodies for most APIs.
     Authoring clients should talk to `globacl-control`. Runtime applications should talk to the local
     `globacl-agent` lookup API. Relays and agents use the mutation, snapshot, and acknowledgement
     endpoints for propagation and repair.
@@ -48,18 +48,18 @@ paths:
       operationId: getHealth
       responses:
         "200":
-          description: Component health as newline-delimited `key=value` text.
+          description: Component health as JSON object.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
               examples:
                 control:
-                  value: |
-                    status=ok
-                    role=control
-                    commitd=ok
-                    commit_addr=127.0.0.1:7003
+                  value:
+                    status: ok
+                    role: control
+                    commitd: ok
+                    commit_addr: 127.0.0.1:7003
 
   /v1/deny:
     post:
@@ -73,9 +73,9 @@ paths:
         "200":
           $ref: "#/components/responses/CommitOutcome"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
         "503":
-          $ref: "#/components/responses/UnavailableText"
+          $ref: "#/components/responses/UnavailableJson"
 
   /v1/mutation:
     post:
@@ -89,9 +89,9 @@ paths:
         "200":
           $ref: "#/components/responses/CommitOutcome"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
         "503":
-          $ref: "#/components/responses/UnavailableText"
+          $ref: "#/components/responses/UnavailableJson"
 
   /v1/rule:
     post:
@@ -106,9 +106,9 @@ paths:
         "200":
           $ref: "#/components/responses/CommitOutcome"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
         "503":
-          $ref: "#/components/responses/UnavailableText"
+          $ref: "#/components/responses/UnavailableJson"
 
   /v1/canary:
     post:
@@ -120,22 +120,22 @@ paths:
         "200":
           description: Canary status.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
               examples:
                 committed:
-                  value: |
-                    status=ok
-                    op_id=canary-1760000000
-                    tenant_id=globacl
-                    namespace=canary
-                    key=sentinel-1760000000
-                    shard_id=7
-                    seq=42
-                    delivery_priority=p0
+                  value:
+                    status: ok
+                    op_id: canary-1760000000
+                    tenant_id: globacl
+                    namespace: canary
+                    key: sentinel-1760000000
+                    shard_id: 7
+                    seq: 42
+                    delivery_priority: p0
         "503":
-          $ref: "#/components/responses/UnavailableText"
+          $ref: "#/components/responses/UnavailableJson"
 
   /v1/canary/latest:
     get:
@@ -147,9 +147,9 @@ paths:
         "200":
           description: Latest canary or `status=none`.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/lookup:
     get:
@@ -163,7 +163,7 @@ paths:
         - $ref: "#/components/parameters/Key"
       responses:
         "200":
-          $ref: "#/components/responses/DecisionText"
+          $ref: "#/components/responses/DecisionJson"
 
   /v1/check:
     get:
@@ -177,7 +177,7 @@ paths:
         - $ref: "#/components/parameters/Value"
       responses:
         "200":
-          $ref: "#/components/responses/DecisionText"
+          $ref: "#/components/responses/DecisionJson"
 
   /v1/watermarks:
     get:
@@ -187,7 +187,7 @@ paths:
       operationId: getWatermarks
       responses:
         "200":
-          $ref: "#/components/responses/WatermarksText"
+          $ref: "#/components/responses/WatermarksJson"
 
   /v1/compaction_watermarks:
     get:
@@ -197,7 +197,7 @@ paths:
       operationId: getCompactionWatermarks
       responses:
         "200":
-          $ref: "#/components/responses/WatermarksText"
+          $ref: "#/components/responses/WatermarksJson"
 
   /v1/mutations:
     get:
@@ -275,15 +275,15 @@ paths:
         "200":
           description: Ack accepted.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
               examples:
                 ok:
-                  value: |
-                    status=ok
+                  value:
+                    status: ok
         "503":
-          $ref: "#/components/responses/UnavailableText"
+          $ref: "#/components/responses/UnavailableJson"
 
   /v1/acks:
     get:
@@ -293,11 +293,11 @@ paths:
       operationId: getRelayAcks
       responses:
         "200":
-          description: Relay ack table as newline-delimited `key=value` text.
+          description: Relay ack table as JSON object.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/propagation/status:
     get:
@@ -309,9 +309,9 @@ paths:
         "200":
           description: Aggregate propagation status.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/snapshot:
     get:
@@ -338,9 +338,9 @@ paths:
         "200":
           description: Snapshot accepted.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/snapshot.sig:
     get:
@@ -360,11 +360,11 @@ paths:
       operationId: getSnapshotManifest
       responses:
         "200":
-          description: Snapshot manifest as newline-delimited `key=value` text.
+          description: Snapshot manifest as JSON object.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/snapshot_manifest.sig:
     get:
@@ -388,7 +388,7 @@ paths:
         "200":
           $ref: "#/components/responses/SnapshotBinary"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
 
   /v1/snapshot_artifact.sig:
     get:
@@ -402,7 +402,7 @@ paths:
         "200":
           $ref: "#/components/responses/SignatureEnvelope"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
 
   /v1/snapshots:
     get:
@@ -412,11 +412,11 @@ paths:
       operationId: listSnapshots
       responses:
         "200":
-          description: Snapshot names as newline-delimited `key=value` text.
+          description: Snapshot names as JSON object.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
 
   /v1/rollback:
     post:
@@ -430,11 +430,11 @@ paths:
         "200":
           description: Rollback accepted.
           content:
-            text/plain:
+            application/json:
               schema:
-                $ref: "#/components/schemas/KeyValueText"
+                $ref: "#/components/schemas/JsonObject"
         "400":
-          $ref: "#/components/responses/RejectedText"
+          $ref: "#/components/responses/RejectedJson"
 
   /v1/audit:
     get:
@@ -444,17 +444,18 @@ paths:
       operationId: getAuditLog
       responses:
         "200":
-          description: Audit log text.
+          description: Audit log JSON.
           content:
-            text/plain:
+            application/json:
               schema:
-                type: string
+                $ref: "#/components/schemas/JsonObject"
 
 components:
   schemas:
-    KeyValueText:
-      type: string
-      description: Newline-delimited `key=value` text.
+    JsonObject:
+      type: object
+      description: JSON object response. Numeric and boolean fields use JSON scalar types where available.
+      additionalProperties: true
     BinaryPayload:
       type: string
       format: binary
@@ -539,128 +540,128 @@ components:
     DenyMutation:
       required: true
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             deny:
-              value: |
-                op_id=demo-1
-                tenant_id=tenant-a
-                namespace=user
-                key=user-123
-                action=deny
-                delivery_priority=p0
-                priority=100
-                reason_code=abuse
-                created_by=demo
+              value:
+                op_id: demo-1
+                tenant_id: tenant-a
+                namespace: user
+                key: user-123
+                action: deny
+                delivery_priority: p0
+                priority: 100
+                reason_code: abuse
+                created_by: demo
             delete:
-              value: |
-                op_id=demo-delete-1
-                tenant_id=tenant-a
-                namespace=user
-                key=user-123
-                action=delete
-                created_by=demo
+              value:
+                op_id: demo-delete-1
+                tenant_id: tenant-a
+                namespace: user
+                key: user-123
+                action: delete
+                created_by: demo
     RuleMutation:
       required: true
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             ipv4:
-              value: |
-                op_id=net-1
-                tenant_id=tenant-a
-                kind=ipv4_cidr
-                pattern=10.0.0.0/8
-                action=deny
-                reason_code=blocked_network
+              value:
+                op_id: net-1
+                tenant_id: tenant-a
+                kind: ipv4_cidr
+                pattern: 10.0.0.0/8
+                action: deny
+                reason_code: blocked_network
             domain:
-              value: |
-                op_id=domain-1
-                tenant_id=tenant-a
-                kind=domain_suffix
-                pattern=*.example.com
-                action=deny
-                reason_code=blocked_domain
+              value:
+                op_id: domain-1
+                tenant_id: tenant-a
+                kind: domain_suffix
+                pattern: "*.example.com"
+                action: deny
+                reason_code: blocked_domain
     Ack:
       required: true
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             agent:
-              value: |
-                agent_id=agent-local
-                shard_id=7
-                seq=42
-                entries=100
-                applied_at_unix=1760000000
+              value:
+                agent_id: agent-local
+                shard_id: 7
+                seq: 42
+                entries: 100
+                applied_at_unix: 1760000000
     Rollback:
       required: true
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             snapshot:
-              value: |
-                snapshot=epoch_00000000001760000000_shard_0007_seq_00000000000000000042.gacl
+              value:
+                snapshot: epoch_00000000001760000000_shard_0007_seq_00000000000000000042.gacl
 
   responses:
     CommitOutcome:
       description: Committed mutation outcome.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             committed:
-              value: |
-                duplicate=false
-                shard_id=7
-                seq=42
-                epoch=3
-                action=deny
-                key_hash=123456789
-                delivery_priority=p0
-                committed_at_unix=1760000000
-                entries_changed=1
-    DecisionText:
+              value:
+                duplicate: false
+                shard_id: 7
+                seq: 42
+                epoch: 3
+                action: deny
+                key_hash: 123456789
+                delivery_priority: p0
+                committed_at_unix: 1760000000
+                entries_changed: 1
+    DecisionJson:
       description: ACL decision.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             allow:
-              value: |
-                decision=allow
+              value:
+                decision: allow
             deny:
-              value: |
-                decision=deny
-                reason_code=abuse
-                priority=100
-                shard_id=7
-                seq=42
-                epoch=3
-    WatermarksText:
+              value:
+                decision: deny
+                reason_code: abuse
+                priority: 100
+                shard_id: 7
+                seq: 42
+                epoch: 3
+    WatermarksJson:
       description: Per-shard watermark text.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             watermarks:
-              value: |
-                shard_count=4
-                shard_0000=0
-                shard_0001=42
-                shard_0002=0
-                shard_0003=7
+              value:
+                shard_count: 4
+                shard_0000: 0
+                shard_0001: 42
+                shard_0002: 0
+                shard_0003: 7
     MutationStream:
       description: Binary mutation stream.
       content:
@@ -676,47 +677,47 @@ components:
     SignatureEnvelope:
       description: Ed25519 signature envelope over the corresponding payload.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             signature:
-              value: |
-                algorithm=ed25519
-                key_id=dev-ed25519
-                key_version=1
-                signature=abcdef
+              value:
+                algorithm: ed25519
+                key_id: dev-ed25519
+                key_version: 1
+                signature: abcdef
     HistoryCompacted:
       description: Requested mutation history has been compacted; repair from snapshot.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             compacted:
-              value: |
-                status=compacted
-                reason=history_compacted
-                compacted_seq=42
-    RejectedText:
+              value:
+                status: compacted
+                reason: history_compacted
+                compacted_seq: 42
+    RejectedJson:
       description: Request rejected by validation.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             rejected:
-              value: |
-                status=rejected
-                reason=blast_radius_override_required
-    UnavailableText:
+              value:
+                status: rejected
+                reason: blast_radius_override_required
+    UnavailableJson:
       description: Upstream commit service is unavailable.
       content:
-        text/plain:
+        application/json:
           schema:
-            $ref: "#/components/schemas/KeyValueText"
+            $ref: "#/components/schemas/JsonObject"
           examples:
             unavailable:
-              value: |
-                status=unavailable
-                reason=commitd_proxy_failed
+              value:
+                status: unavailable
+                reason: commitd_proxy_failed

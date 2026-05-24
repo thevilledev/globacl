@@ -71,7 +71,8 @@ Commit a deny mutation:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/deny \
-  --data-binary $'op_id=demo-1\ntenant_id=tenant-a\nnamespace=user\nkey=user-123\naction=deny\ndelivery_priority=p0\npriority=100\nreason_code=abuse\ncreated_by=demo\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"op_id":"demo-1","tenant_id":"tenant-a","namespace":"user","key":"user-123","action":"deny","delivery_priority":"p0","priority":100,"reason_code":"abuse","created_by":"demo"}'
 ```
 
 Query the agent:
@@ -90,7 +91,8 @@ Commit an IPv4 CIDR rule:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/rule \
-  --data-binary $'op_id=net-1\ntenant_id=tenant-a\nkind=ipv4_cidr\npattern=10.0.0.0/8\naction=deny\nreason_code=blocked_network\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"op_id":"net-1","tenant_id":"tenant-a","kind":"ipv4_cidr","pattern":"10.0.0.0/8","action":"deny","reason_code":"blocked_network"}'
 ```
 
 Check the compiled rule at the agent:
@@ -103,7 +105,8 @@ Commit a domain suffix rule:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/rule \
-  --data-binary $'op_id=domain-1\ntenant_id=tenant-a\nkind=domain_suffix\npattern=*.example.com\naction=deny\nreason_code=blocked_domain\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"op_id":"domain-1","tenant_id":"tenant-a","kind":"domain_suffix","pattern":"*.example.com","action":"deny","reason_code":"blocked_domain"}'
 ```
 
 Check the domain rule:
@@ -116,14 +119,16 @@ Broad denies require an explicit blast-radius override:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/rule \
-  --data-binary $'op_id=net-all\ntenant_id=tenant-a\nkind=ipv4_cidr\npattern=0.0.0.0/0\naction=deny\noverride_blast_radius=true\nreason_code=emergency_all_ipv4\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"op_id":"net-all","tenant_id":"tenant-a","kind":"ipv4_cidr","pattern":"0.0.0.0/0","action":"deny","override_blast_radius":true,"reason_code":"emergency_all_ipv4"}'
 ```
 
 Delete/unblock with a higher sequence:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/deny \
-  --data-binary $'op_id=demo-2\ntenant_id=tenant-a\nnamespace=user\nkey=user-123\naction=delete\ncreated_by=demo\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"op_id":"demo-2","tenant_id":"tenant-a","namespace":"user","key":"user-123","action":"delete","created_by":"demo"}'
 ```
 
 Inspect relay acknowledgements:
@@ -143,7 +148,8 @@ Rollback to a listed snapshot by filename:
 
 ```sh
 curl -sS http://127.0.0.1:7000/v1/rollback \
-  --data-binary $'snapshot=<snapshot-from-v1-snapshots>\n'
+  --header 'Content-Type: application/json' \
+  --data-binary '{"snapshot":"<snapshot-from-v1-snapshots>"}'
 ```
 
 Commit a synthetic P0 canary manually:

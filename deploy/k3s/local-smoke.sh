@@ -96,11 +96,11 @@ DEMO_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
 
 curl -fsS "http://127.0.0.1:${CONTROL_PORT}/v1/deny" \
-  --data-binary $'op_id=ci-local-user\ntenant_id=tenant-a\nnamespace=user\nkey=user-ci\naction=deny\ndelivery_priority=p0\nreason_code=ci_smoke\ncreated_by=ci\n' >/tmp/globacl-local-commit.out
+  --header "Content-Type: application/json" --data-binary '{"op_id":"ci-local-user","tenant_id":"tenant-a","namespace":"user","key":"user-ci","action":"deny","delivery_priority":"p0","reason_code":"ci_smoke","created_by":"ci"}' >/tmp/globacl-local-commit.out
 
 for _ in $(seq 1 120); do
   response="$(curl -sS "http://127.0.0.1:${DEMO_PORT}/access?tenant_id=tenant-a&namespace=user&key=user-ci")"
-  if grep -q "access=denied" <<<"${response}"; then
+  if grep -q '"access":"denied"' <<<"${response}"; then
     wait_for_propagation_ack 1
     echo "local smoke passed"
     exit 0

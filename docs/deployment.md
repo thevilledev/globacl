@@ -53,7 +53,7 @@ The script:
 3. Imports the image into the cluster.
 4. Deploys commitd, control, relay, agent, and demo app.
 5. Commits a P0 deny to control.
-6. Calls the demo app until it returns access=denied.
+6. Calls the demo app until it returns `"access": "denied"`.
 ```
 
 ## Global Topology
@@ -112,7 +112,7 @@ The script:
 6. Exposes central control on host port 17000.
 7. Points regional HA relays at the central k3d server node's NodePort address on the shared Docker network.
 8. Commits a P0 deny to central control.
-9. Calls every regional demo app until each returns access=denied.
+9. Calls every regional demo app until each returns `"access": "denied"`.
 ```
 
 ## CI

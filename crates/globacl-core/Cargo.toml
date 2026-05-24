@@ -12,3 +12,4 @@ path = "src/lib.rs"
 arc-swap = "=1.9.1"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["fast", "zeroize"] }
 sha2 = "=0.11.0"
+serde_json = "=1.0.145"

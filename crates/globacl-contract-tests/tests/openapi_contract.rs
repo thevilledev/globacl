@@ -1,6 +1,6 @@
 use globacl_core::{
     decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, parse_form_lines,
-    GlobAclError,
+    parse_json_body, GlobAclError, JsonValue,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -98,7 +98,7 @@ fn backend_conforms_to_documented_openapi_contract() {
 
     let health = raw_get(&cluster.control_addr, "/health");
     assert_status(&health, 200);
-    assert_content_type(&health, "text/plain");
+    assert_content_type(&health, "application/json");
     assert_fields(
         &form(&health),
         &["status", "role", "commitd", "commit_addr"],
@@ -107,19 +107,21 @@ fn backend_conforms_to_documented_openapi_contract() {
     let deny = raw_post(
         &cluster.control_addr,
         "/v1/deny",
-        "text/plain",
-        b"op_id=contract-deny-1\n\
-          tenant_id=tenant-a\n\
-          namespace=user\n\
-          key=user-123\n\
-          action=deny\n\
-          delivery_priority=p0\n\
-          priority=100\n\
-          reason_code=contract\n\
-          created_by=contract-test\n",
+        "application/json",
+        br#"{
+          "op_id": "contract-deny-1",
+          "tenant_id": "tenant-a",
+          "namespace": "user",
+          "key": "user-123",
+          "action": "deny",
+          "delivery_priority": "p0",
+          "priority": 100,
+          "reason_code": "contract",
+          "created_by": "contract-test"
+        }"#,
     );
     assert_status(&deny, 200);
-    assert_content_type(&deny, "text/plain");
+    assert_content_type(&deny, "application/json");
     let deny_form = form(&deny);
     assert_fields(
         &deny_form,
@@ -142,17 +144,19 @@ fn backend_conforms_to_documented_openapi_contract() {
     let mutation = raw_post(
         &cluster.control_addr,
         "/v1/mutation",
-        "text/plain",
-        b"op_id=contract-mutation-1\n\
-          tenant_id=tenant-a\n\
-          namespace=user\n\
-          key=user-alias\n\
-          action=delete\n\
-          reason_code=contract_alias\n\
-          created_by=contract-test\n",
+        "application/json",
+        br#"{
+          "op_id": "contract-mutation-1",
+          "tenant_id": "tenant-a",
+          "namespace": "user",
+          "key": "user-alias",
+          "action": "delete",
+          "reason_code": "contract_alias",
+          "created_by": "contract-test"
+        }"#,
     );
     assert_status(&mutation, 200);
-    assert_content_type(&mutation, "text/plain");
+    assert_content_type(&mutation, "application/json");
     assert_fields(
         &form(&mutation),
         &["duplicate", "shard_id", "seq", "action"],
@@ -161,17 +165,19 @@ fn backend_conforms_to_documented_openapi_contract() {
     let rule = raw_post(
         &cluster.control_addr,
         "/v1/rule",
-        "text/plain",
-        b"op_id=contract-rule-1\n\
-          tenant_id=tenant-a\n\
-          kind=ipv4_cidr\n\
-          pattern=10.0.0.0/8\n\
-          action=deny\n\
-          reason_code=contract_rule\n\
-          created_by=contract-test\n",
+        "application/json",
+        br#"{
+          "op_id": "contract-rule-1",
+          "tenant_id": "tenant-a",
+          "kind": "ipv4_cidr",
+          "pattern": "10.0.0.0/8",
+          "action": "deny",
+          "reason_code": "contract_rule",
+          "created_by": "contract-test"
+        }"#,
     );
     assert_status(&rule, 200);
-    assert_content_type(&rule, "text/plain");
+    assert_content_type(&rule, "application/json");
     assert_fields(
         &form(&rule),
         &[
@@ -184,9 +190,9 @@ fn backend_conforms_to_documented_openapi_contract() {
         ],
     );
 
-    let canary = raw_post(&cluster.control_addr, "/v1/canary", "text/plain", b"");
+    let canary = raw_post(&cluster.control_addr, "/v1/canary", "application/json", b"");
     assert_status(&canary, 200);
-    assert_content_type(&canary, "text/plain");
+    assert_content_type(&canary, "application/json");
     assert_fields(
         &form(&canary),
         &[
@@ -203,7 +209,7 @@ fn backend_conforms_to_documented_openapi_contract() {
 
     let latest_canary = raw_get(&cluster.control_addr, "/v1/canary/latest");
     assert_status(&latest_canary, 200);
-    assert_content_type(&latest_canary, "text/plain");
+    assert_content_type(&latest_canary, "application/json");
     assert_fields(&form(&latest_canary), &["status", "op_id", "key", "seq"]);
 
     let lookup = wait_for_form(
@@ -230,12 +236,12 @@ fn backend_conforms_to_documented_openapi_contract() {
 
     let watermarks = raw_get(&cluster.control_addr, "/v1/watermarks");
     assert_status(&watermarks, 200);
-    assert_content_type(&watermarks, "text/plain");
+    assert_content_type(&watermarks, "application/json");
     assert_fields(&form(&watermarks), &["shard_count", "shard_0000"]);
 
     let compaction_watermarks = raw_get(&cluster.control_addr, "/v1/compaction_watermarks");
     assert_status(&compaction_watermarks, 200);
-    assert_content_type(&compaction_watermarks, "text/plain");
+    assert_content_type(&compaction_watermarks, "application/json");
     assert_fields(
         &form(&compaction_watermarks),
         &["shard_count", "shard_0000"],
@@ -258,7 +264,7 @@ fn backend_conforms_to_documented_openapi_contract() {
         &format!("/v1/mutations.sig?shard={deny_shard}&from_seq=0"),
     );
     assert_status(&mutation_sig, 200);
-    assert_content_type(&mutation_sig, "text/plain");
+    assert_content_type(&mutation_sig, "application/json");
     assert_signature_fields(&form(&mutation_sig));
 
     let delta_path = format!("/v1/delta_bundle?shard={deny_shard}&from_seq=0&to_seq={deny_seq}");
@@ -272,7 +278,7 @@ fn backend_conforms_to_documented_openapi_contract() {
         &format!("/v1/delta_bundle.sig?shard={deny_shard}&from_seq=0&to_seq={deny_seq}"),
     );
     assert_status(&delta_sig, 200);
-    assert_content_type(&delta_sig, "text/plain");
+    assert_content_type(&delta_sig, "application/json");
     assert_signature_fields(&form(&delta_sig));
 
     let snapshot = raw_get(&cluster.control_addr, "/v1/snapshot");
@@ -287,17 +293,17 @@ fn backend_conforms_to_documented_openapi_contract() {
         &snapshot.body,
     );
     assert_status(&upload, 200);
-    assert_content_type(&upload, "text/plain");
+    assert_content_type(&upload, "application/json");
     assert_eq!(form(&upload).get("status").unwrap(), "ok");
 
     let snapshot_sig = raw_get(&cluster.control_addr, "/v1/snapshot.sig");
     assert_status(&snapshot_sig, 200);
-    assert_content_type(&snapshot_sig, "text/plain");
+    assert_content_type(&snapshot_sig, "application/json");
     assert_signature_fields(&form(&snapshot_sig));
 
     let manifest = raw_get(&cluster.control_addr, "/v1/snapshot_manifest");
     assert_status(&manifest, 200);
-    assert_content_type(&manifest, "text/plain");
+    assert_content_type(&manifest, "application/json");
     let manifest_body = form(&manifest);
     assert_fields(
         &manifest_body,
@@ -313,7 +319,7 @@ fn backend_conforms_to_documented_openapi_contract() {
 
     let manifest_sig = raw_get(&cluster.control_addr, "/v1/snapshot_manifest.sig");
     assert_status(&manifest_sig, 200);
-    assert_content_type(&manifest_sig, "text/plain");
+    assert_content_type(&manifest_sig, "application/json");
     assert_signature_fields(&form(&manifest_sig));
 
     let artifact = raw_get(
@@ -335,12 +341,12 @@ fn backend_conforms_to_documented_openapi_contract() {
         ),
     );
     assert_status(&artifact_sig, 200);
-    assert_content_type(&artifact_sig, "text/plain");
+    assert_content_type(&artifact_sig, "application/json");
     assert_signature_fields(&form(&artifact_sig));
 
     let snapshots = raw_get(&cluster.control_addr, "/v1/snapshots");
     assert_status(&snapshots, 200);
-    assert_content_type(&snapshots, "text/plain");
+    assert_content_type(&snapshots, "application/json");
     let snapshots_form = form(&snapshots);
     assert_fields(&snapshots_form, &["snapshot_count", "manifest_count"]);
     let rollback_target = first_value_for_key(&snapshots.body, "snapshot")
@@ -349,36 +355,38 @@ fn backend_conforms_to_documented_openapi_contract() {
     let rollback = raw_post(
         &cluster.control_addr,
         "/v1/rollback",
-        "text/plain",
-        format!("snapshot={rollback_target}\n").as_bytes(),
+        "application/json",
+        format!(r#"{{"snapshot":"{rollback_target}"}}"#).as_bytes(),
     );
     assert_status(&rollback, 200);
-    assert_content_type(&rollback, "text/plain");
+    assert_content_type(&rollback, "application/json");
     assert_fields(&form(&rollback), &["status", "snapshot", "mutations"]);
 
     let central_ack = raw_post(
         &cluster.control_addr,
         "/v1/ack",
-        "text/plain",
+        "application/json",
         format!(
-            "relay_id=relay-contract\n\
-             location=local\n\
-             agent_id=agent-contract\n\
-             shard_id={deny_shard}\n\
-             seq={deny_seq}\n\
-             entries=1\n\
-             applied_at_unix=1760000000\n\
-             relay_received_at_unix=1760000001\n"
+            r#"{{
+              "relay_id": "relay-contract",
+              "location": "local",
+              "agent_id": "agent-contract",
+              "shard_id": {deny_shard},
+              "seq": {deny_seq},
+              "entries": 1,
+              "applied_at_unix": 1760000000,
+              "relay_received_at_unix": 1760000001
+            }}"#
         )
         .as_bytes(),
     );
     assert_status(&central_ack, 200);
-    assert_content_type(&central_ack, "text/plain");
+    assert_content_type(&central_ack, "application/json");
     assert_eq!(form(&central_ack).get("status").unwrap(), "ok");
 
     let propagation = raw_get(&cluster.control_addr, "/v1/propagation/status");
     assert_status(&propagation, 200);
-    assert_content_type(&propagation, "text/plain");
+    assert_content_type(&propagation, "application/json");
     assert_fields(
         &form(&propagation),
         &[
@@ -395,33 +403,46 @@ fn backend_conforms_to_documented_openapi_contract() {
     let relay_ack = raw_post(
         &cluster.relay_addr,
         "/v1/ack",
-        "text/plain",
+        "application/json",
         format!(
-            "agent_id=agent-contract\n\
-             shard_id={deny_shard}\n\
-             seq={deny_seq}\n\
-             entries=1\n\
-             applied_at_unix=1760000002\n"
+            r#"{{
+              "agent_id": "agent-contract",
+              "shard_id": {deny_shard},
+              "seq": {deny_seq},
+              "entries": 1,
+              "applied_at_unix": 1760000002
+            }}"#
         )
         .as_bytes(),
     );
     assert_status(&relay_ack, 200);
-    assert_content_type(&relay_ack, "text/plain");
+    assert_content_type(&relay_ack, "application/json");
     assert_eq!(form(&relay_ack).get("status").unwrap(), "ok");
 
     let relay_acks = raw_get(&cluster.relay_addr, "/v1/acks");
     assert_status(&relay_acks, 200);
-    assert_content_type(&relay_acks, "text/plain");
-    let relay_acks_body = String::from_utf8_lossy(&relay_acks.body);
-    assert!(relay_acks_body.contains("ack_count="));
-    assert!(relay_acks_body.contains("agent_id=agent-contract"));
+    assert_content_type(&relay_acks, "application/json");
+    let relay_acks_body = parse_json_body(&relay_acks.body).unwrap();
+    assert!(relay_acks_body.get("ack_count").is_some());
+    assert!(relay_acks_body
+        .get("acks")
+        .and_then(JsonValue::as_array)
+        .unwrap()
+        .iter()
+        .any(|ack| ack.get("agent_id").and_then(JsonValue::as_str) == Some("agent-contract")));
 
     let audit = raw_get(&cluster.control_addr, "/v1/audit");
     assert_status(&audit, 200);
-    assert_content_type(&audit, "text/plain");
-    let audit_body = String::from_utf8_lossy(&audit.body);
-    assert!(audit_body.contains("event=deny"));
-    assert!(audit_body.contains("contract-deny-1"));
+    assert_content_type(&audit, "application/json");
+    let audit_body = parse_json_body(&audit.body).unwrap();
+    let audit_items = audit_body
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("audit response should contain items");
+    assert!(audit_items.iter().any(|item| {
+        item.get("event").and_then(JsonValue::as_str) == Some("deny")
+            && item.get("op_id").and_then(JsonValue::as_str) == Some("contract-deny-1")
+    }));
 }
 
 struct TestCluster {
@@ -593,7 +614,7 @@ fn wait_for_form(
     while Instant::now() < deadline {
         let response = raw_get(addr, path);
         assert_status(&response, 200);
-        assert_content_type(&response, "text/plain");
+        assert_content_type(&response, "application/json");
         let parsed = form(&response);
         if parsed.get(expected_key).map(String::as_str) == Some(expected_value) {
             return parsed;
@@ -679,7 +700,7 @@ fn parse_raw_http_response(bytes: &[u8]) -> Result<RawResponse, GlobAclError> {
 
 fn form(response: &RawResponse) -> HashMap<String, String> {
     parse_form_lines(&response.body)
-        .unwrap_or_else(|err| panic!("response body is not key=value form: {err:?}"))
+        .unwrap_or_else(|err| panic!("response body is not parseable JSON/form fields: {err:?}"))
 }
 
 fn assert_status(response: &RawResponse, expected: u16) {
@@ -720,10 +741,12 @@ fn assert_signature_fields(form: &HashMap<String, String>) {
 }
 
 fn first_value_for_key(body: &[u8], key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    std::str::from_utf8(body).ok()?.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(&prefix)
-            .map(|value| value.trim().to_owned())
-    })
+    let value = parse_json_body(body).ok()?;
+    match value.get(key)? {
+        JsonValue::String(value) => Some(value.clone()),
+        JsonValue::Array(values) => values
+            .iter()
+            .find_map(|value| value.as_str().map(str::to_owned)),
+        _ => None,
+    }
 }

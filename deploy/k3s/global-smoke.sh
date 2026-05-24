@@ -128,7 +128,7 @@ for region in "${REGIONS[@]}"; do
 done
 
 curl -fsS "http://127.0.0.1:${CENTRAL_HOST_PORT}/v1/deny" \
-  --data-binary $'op_id=ci-global-user\ntenant_id=tenant-a\nnamespace=user\nkey=user-global\naction=deny\ndelivery_priority=p0\nreason_code=ci_global_smoke\ncreated_by=ci\n' >/tmp/globacl-global-commit.out
+  --header "Content-Type: application/json" --data-binary '{"op_id":"ci-global-user","tenant_id":"tenant-a","namespace":"user","key":"user-global","action":"deny","delivery_priority":"p0","reason_code":"ci_global_smoke","created_by":"ci"}' >/tmp/globacl-global-commit.out
 
 index=1
 for region in "${REGIONS[@]}"; do
@@ -141,7 +141,7 @@ for region in "${REGIONS[@]}"; do
   observed="0"
   for _ in $(seq 1 120); do
     response="$(curl -sS "http://127.0.0.1:${port}/access?tenant_id=tenant-a&namespace=user&key=user-global")"
-    if grep -q "access=denied" <<<"${response}"; then
+    if grep -q '"access":"denied"' <<<"${response}"; then
       observed="1"
       break
     fi
