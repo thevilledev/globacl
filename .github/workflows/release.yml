@@ -15,6 +15,84 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  binaries:
+    name: binaries (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: globacl-linux-amd64
+            runner: ubuntu-24.04
+          - artifact: globacl-linux-arm64
+            runner: ubuntu-24.04-arm
+          - artifact: globacl-macos-amd64
+            runner: macos-15-intel
+          - artifact: globacl-macos-arm64
+            runner: macos-15
+    steps:
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cargo cache
+        # actions/cache v5.0.5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ matrix.artifact }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ matrix.artifact }}-
+
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            -p globacl-agent \
+            -p globacl-bench \
+            -p globacl-commitd \
+            -p globacl-control \
+            -p globacl-demo-app \
+            -p globacl-relay
+
+      - name: Package binaries
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          bins=(
+            globacl-agent
+            globacl-bench
+            globacl-commitd
+            globacl-control
+            globacl-demo-app
+            globacl-relay
+          )
+          mkdir -p "dist/${ARTIFACT}"
+          for bin in "${bins[@]}"; do
+            install -m 0755 "target/release/${bin}" "dist/${ARTIFACT}/${bin}"
+          done
+          tar -C dist -czf "dist/${ARTIFACT}.tar.gz" "${ARTIFACT}"
+
+      - name: Upload binaries
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
   image:
     name: image
     runs-on: ubuntu-24.04
@@ -30,6 +108,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+
+      - name: Set up QEMU
+        # docker/setup-qemu-action v4.0.0
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         # docker/setup-buildx-action v4.1.0
@@ -64,7 +148,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
