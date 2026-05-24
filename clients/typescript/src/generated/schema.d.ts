@@ -539,7 +539,7 @@ export interface components {
             seq: components["schemas"]["Sequence"];
             epoch: components["schemas"]["Sequence"];
             action: components["schemas"]["Action"];
-            /** Format: int64 */
+            /** Format: uint64 */
             key_hash: number;
             delivery_priority: components["schemas"]["DeliveryPriorityValue"];
             committed_at_unix: components["schemas"]["UnixTimestamp"];
@@ -547,7 +547,7 @@ export interface components {
             entries_changed: number;
             rule_kind?: components["schemas"]["RuleKind"];
             pattern?: string;
-            /** Format: int64 */
+            /** Format: uint64 */
             rule_hash?: number;
         };
         AllowDecision: {

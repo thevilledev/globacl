@@ -210,9 +210,9 @@ type CommitOutcomeResponse struct {
 
 	// Epoch Monotonic per-shard sequence number.
 	Epoch    Sequence  `json:"epoch"`
-	KeyHash  int64     `json:"key_hash"`
+	KeyHash  uint64    `json:"key_hash"`
 	Pattern  *string   `json:"pattern,omitempty"`
-	RuleHash *int64    `json:"rule_hash,omitempty"`
+	RuleHash *uint64   `json:"rule_hash,omitempty"`
 	RuleKind *RuleKind `json:"rule_kind,omitempty"`
 
 	// Seq Monotonic per-shard sequence number.

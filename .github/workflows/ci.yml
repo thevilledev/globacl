@@ -103,6 +103,10 @@ jobs:
           OAPI_CODEGEN_VERSION: "v2.5.0"
         run: scripts/check-generated-clients.sh
 
+      - name: Test Go clients
+        working-directory: clients/go
+        run: go test ./...
+
       - name: Audit GitHub Actions
         # zizmorcore/zizmor-action v0.5.6
         uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d

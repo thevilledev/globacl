@@ -93,7 +93,7 @@ generates successfully. If a future schema change needs unsupported 3.1 features
 add a generated `docs/openapi.codegen.yaml` compatibility artifact rather than
 weakening `docs/openapi.yaml`.
 
-## TypeScript Int64 Policy
+## TypeScript Large Integer Policy
 
 The API emits sequence numbers, key hashes, and timestamps as JSON numbers. Go can
 represent those exactly. TypeScript clients should avoid arithmetic on sequence
