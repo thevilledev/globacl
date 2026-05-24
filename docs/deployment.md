@@ -5,7 +5,7 @@ This repo includes Kubernetes manifests and k3d-backed k3s smoke scripts for pro
 The manifests are intentionally small and dependency-free:
 
 ```text
-Docker image:      globacl:ci
+Docker image:      ghcr.io/thevilledev/globacl:ci
 Namespace:         globacl
 Control port:      7000
 Commitd port:      7003
@@ -48,7 +48,7 @@ Run it in CI or locally with k3d:
 The script:
 
 ```text
-1. Builds Docker image globacl:ci.
+1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
 2. Creates one k3d-backed k3s cluster.
 3. Imports the image into the cluster.
 4. Deploys commitd, control, relay, agent, and demo app.
@@ -104,7 +104,7 @@ Run the global smoke:
 The script:
 
 ```text
-1. Builds Docker image globacl:ci.
+1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
 2. Creates a shared Docker network for k3d clusters.
 3. Creates one central k3s cluster.
 4. Creates three regional k3s clusters.
@@ -138,7 +138,7 @@ Run it from GitHub Actions with `workflow_dispatch`. The workflow installs `kube
 The smoke scripts are parameterized with environment variables:
 
 ```text
-IMAGE=globacl:ci
+IMAGE=ghcr.io/thevilledev/globacl:ci
 CLUSTER=globacl-local
 CENTRAL_CLUSTER=globacl-central
 REGIONS="region-a region-b region-c"

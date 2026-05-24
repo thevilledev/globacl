@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER="${CLUSTER:-globacl-local}"
-IMAGE="${IMAGE:-globacl:ci}"
+IMAGE="${IMAGE:-ghcr.io/thevilledev/globacl:ci}"
 NAMESPACE="${NAMESPACE:-globacl}"
 CONTROL_PORT="${CONTROL_PORT:-17000}"
 DEMO_PORT="${DEMO_PORT:-18080}"

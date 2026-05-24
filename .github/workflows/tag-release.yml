@@ -32,7 +32,7 @@ jobs:
         id: image
         run: |
           set -euo pipefail
-          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >>"${GITHUB_OUTPUT}"
+          echo "name=ghcr.io/thevilledev/globacl" >>"${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         # docker/setup-buildx-action v4.1.0

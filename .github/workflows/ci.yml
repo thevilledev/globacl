@@ -129,4 +129,4 @@ jobs:
           persist-credentials: false
 
       - name: Build image
-        run: docker build -t globacl:ci .
+        run: docker build -t ghcr.io/thevilledev/globacl:ci .
