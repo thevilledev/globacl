@@ -99,6 +99,7 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 - [API](docs/api.md)
 - [Deployment](docs/deployment.md)
 - [Testing](docs/testing.md)
+- [Production readiness](docs/production-readiness.md)
 
 ## License
 

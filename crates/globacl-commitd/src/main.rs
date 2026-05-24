@@ -1333,8 +1333,14 @@ fn handle_request_vote(
 
     let up_to_date = candidate_last_seq > local_last_seq
         || (candidate_last_seq == local_last_seq && candidate_log_len >= local_log_len);
+    let no_conflicting_leader = consensus
+        .leader_id
+        .as_ref()
+        .map(|leader_id| leader_id == candidate_id)
+        .unwrap_or(true);
     let can_vote = candidate_term == consensus.current_term
         && up_to_date
+        && no_conflicting_leader
         && consensus
             .voted_for
             .as_ref()
@@ -1365,16 +1371,32 @@ fn handle_heartbeat(app: &App, form: &std::collections::HashMap<String, String>)
     let leader_term = parse_form_u64(form, "term", 0)?;
     let leader_id = required_form(form, "leader_id")?;
     let mut consensus = lock_consensus(app)?;
-    let accepted = leader_term >= consensus.current_term;
+    let higher_term = leader_term > consensus.current_term;
+    let same_term = leader_term == consensus.current_term;
+    let conflicting_leader = same_term
+        && consensus
+            .leader_id
+            .as_ref()
+            .map(|known_leader| known_leader != leader_id)
+            .unwrap_or(false);
+    let conflicting_vote = same_term
+        && consensus
+            .voted_for
+            .as_ref()
+            .map(|voted_for| voted_for != leader_id)
+            .unwrap_or(false);
+    let accepted = higher_term || (same_term && !conflicting_leader && !conflicting_vote);
 
     if accepted {
-        let term_changed = leader_term > consensus.current_term;
         consensus.current_term = leader_term;
-        if term_changed {
+        if higher_term {
             consensus.voted_for = None;
         }
         consensus.role = ConsensusRole::Follower;
         consensus.leader_id = Some(leader_id.to_owned());
+        if consensus.voted_for.is_none() {
+            consensus.voted_for = Some(leader_id.to_owned());
+        }
         consensus.last_leader_contact_ms = now_unix_millis();
         consensus.election_deadline_ms = next_election_deadline_ms(
             &app.replication.node_id,
@@ -2381,6 +2403,268 @@ fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn consensus_test_app(root: &Path, node_id: &str, role: ConsensusRole, term: u64) -> App {
+        let shard_count = 4u16;
+        App {
+            state: Mutex::new(SourceOfTruth::new(shard_count, "cluster-a")),
+            log_dir: root.join("logs"),
+            consensus_path: root.join("consensus.state"),
+            pending_dir: root.join("pending"),
+            bundle_dir: root.join("bundles"),
+            snapshot_dir: root.join("snapshots"),
+            snapshot_object_dir: root.join("snapshots").join("objects"),
+            snapshot_manifest_dir: root.join("snapshots").join("manifests"),
+            snapshot_path: root.join("snapshots").join("latest.gacl"),
+            snapshot_manifest_path: root
+                .join("snapshots")
+                .join("manifests")
+                .join("latest.manifest"),
+            audit_path: root.join("audit.log"),
+            publisher_offsets_path: root.join("publisher_offsets.state"),
+            propagation_acks_path: root.join("propagation_acks.log"),
+            signature_signer: SignatureSigner::ed25519_private_key(
+                DEFAULT_SIGNATURE_KEY_ID,
+                DEFAULT_SIGNATURE_KEY_VERSION,
+                DEFAULT_SIGNATURE_PRIVATE_KEY,
+            )
+            .expect("test signer"),
+            latest_canary: Mutex::new(None),
+            replication: ReplicationConfig {
+                cluster_id: "cluster-a".to_owned(),
+                node_id: node_id.to_owned(),
+                initial_leader_id: None,
+                peers: vec![
+                    ControlPeer {
+                        node_id: "node-a".to_owned(),
+                        addr: "127.0.0.1:7101".to_owned(),
+                    },
+                    ControlPeer {
+                        node_id: "node-b".to_owned(),
+                        addr: "127.0.0.1:7102".to_owned(),
+                    },
+                    ControlPeer {
+                        node_id: "node-c".to_owned(),
+                        addr: "127.0.0.1:7103".to_owned(),
+                    },
+                ],
+                quorum: 2,
+                heartbeat_interval_ms: 250,
+                election_timeout_ms: 1200,
+                sync_interval_ms: 1000,
+            },
+            consensus: Mutex::new(ConsensusState {
+                current_term: term,
+                voted_for: None,
+                role,
+                leader_id: (role == ConsensusRole::Leader).then(|| node_id.to_owned()),
+                last_leader_contact_ms: 0,
+                election_deadline_ms: u64::MAX,
+            }),
+            sync_status: Mutex::new(SyncStatus {
+                last_peer_sync_unix: 0,
+                sync_errors: 0,
+            }),
+            publisher: None,
+            publisher_status: Mutex::new(PublisherStatus {
+                last_published: vec![0; shard_count as usize],
+                last_publish_unix: 0,
+                publish_errors: 0,
+            }),
+            propagation_acks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn test_form(fields: &[(&str, &str)]) -> HashMap<String, String> {
+        fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn response_bool(body: &str, key: &str) -> bool {
+        let form = parse_form_lines(body.as_bytes()).expect("parse response form");
+        form_bool(&form, key)
+    }
+
+    fn deny_request(op_id: &str, key: &str) -> DenyRequest {
+        DenyRequest {
+            op_id: op_id.to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            namespace: "user".to_owned(),
+            key: key.to_owned(),
+            action: Action::Deny,
+            priority: 0,
+            reason_code: "test".to_owned(),
+            expires_at: 0,
+            created_by: "test".to_owned(),
+            delivery_priority: DeliveryPriority::P1,
+        }
+    }
+
+    fn remove_test_dir(path: impl AsRef<Path>) {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("remove temp dir: {err}"),
+        }
+    }
+
+    #[test]
+    fn vote_request_rejects_stale_candidate_term() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-vote-stale-term-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        let response = handle_request_vote(
+            &app,
+            &test_form(&[
+                ("term", "2"),
+                ("candidate_id", "node-b"),
+                ("last_seq", "0"),
+                ("log_len", "0"),
+            ]),
+        )
+        .expect("vote response");
+
+        assert!(!response_bool(&response, "vote_granted"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 3);
+        assert_eq!(consensus.voted_for, None);
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn vote_request_rejects_stale_candidate_log() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-vote-stale-log-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        {
+            let mut state = lock_state(&app).expect("state");
+            state.set_epoch(1);
+            state
+                .commit(deny_request("op-1", "user-1"))
+                .expect("commit local mutation");
+        }
+
+        let response = handle_request_vote(
+            &app,
+            &test_form(&[
+                ("term", "2"),
+                ("candidate_id", "node-b"),
+                ("last_seq", "0"),
+                ("log_len", "0"),
+            ]),
+        )
+        .expect("vote response");
+
+        assert!(!response_bool(&response, "vote_granted"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 2);
+        assert_eq!(consensus.voted_for, None);
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn vote_request_grants_only_one_vote_per_term() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-vote-once-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+
+        let first = handle_request_vote(
+            &app,
+            &test_form(&[
+                ("term", "2"),
+                ("candidate_id", "node-b"),
+                ("last_seq", "0"),
+                ("log_len", "0"),
+            ]),
+        )
+        .expect("first vote response");
+        let second = handle_request_vote(
+            &app,
+            &test_form(&[
+                ("term", "2"),
+                ("candidate_id", "node-c"),
+                ("last_seq", "0"),
+                ("log_len", "0"),
+            ]),
+        )
+        .expect("second vote response");
+
+        assert!(response_bool(&first, "vote_granted"));
+        assert!(!response_bool(&second, "vote_granted"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 2);
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn heartbeat_rejects_conflicting_leader_in_same_term() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-heartbeat-conflict-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 5);
+        {
+            let mut consensus = lock_consensus(&app).expect("consensus");
+            consensus.voted_for = Some("node-b".to_owned());
+            consensus.leader_id = Some("node-b".to_owned());
+        }
+
+        let conflicting =
+            handle_heartbeat(&app, &test_form(&[("term", "5"), ("leader_id", "node-c")]))
+                .expect("conflicting heartbeat");
+        let accepted =
+            handle_heartbeat(&app, &test_form(&[("term", "5"), ("leader_id", "node-b")]))
+                .expect("accepted heartbeat");
+
+        assert!(!response_bool(&conflicting, "success"));
+        assert!(response_bool(&accepted, "success"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 5);
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn higher_term_heartbeat_steps_down_current_leader() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-heartbeat-stepdown-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 5);
+
+        let response =
+            handle_heartbeat(&app, &test_form(&[("term", "6"), ("leader_id", "node-b")]))
+                .expect("heartbeat response");
+
+        assert!(response_bool(&response, "success"));
+        assert!(ensure_write_authority(&app).is_err());
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 6);
+        assert_eq!(consensus.role, ConsensusRole::Follower);
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
 
     #[test]
     fn publisher_offsets_round_trip() {
