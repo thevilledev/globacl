@@ -57,27 +57,30 @@ fn start_election(app: &App) -> Result<()> {
 
     let mut votes = 1usize;
     for peer in app.replication.remote_peers() {
-        let body = format!(
-            "term={term}\ncandidate_id={}\nlast_seq={last_seq}\nlog_len={log_len}\n",
-            app.replication.node_id
-        );
+        let body = json!({
+            "term": term,
+            "candidate_id": app.replication.node_id,
+            "last_seq": last_seq,
+            "log_len": log_len
+        })
+        .to_string();
         match http_post(&peer.addr, "/internal/raft/request_vote", body.as_bytes()) {
             Ok(response) if response.status_code == 200 => {
-                let form = parse_form_lines(&response.body)?;
-                let peer_term = parse_form_u64(&form, "term", term)?;
+                let fields = parse_json_fields(&response.body)?;
+                let peer_term = parse_json_u64(&fields, "term", term)?;
                 if peer_term > term {
                     step_down_to_term(app, peer_term, None)?;
                     return Ok(());
                 }
-                if form_bool(&form, "vote_granted") {
+                if json_bool(&fields, "vote_granted") {
                     votes += 1;
                 }
             }
             Ok(response) => eprintln!(
-                "vote request failed: peer={} status={}",
+                "vote request failed: peer {} returned HTTP status {}",
                 peer.node_id, response.status_code
             ),
-            Err(err) => eprintln!("vote request failed: peer={} error={err}", peer.node_id),
+            Err(err) => eprintln!("vote request failed: peer {} error {err}", peer.node_id),
         }
     }
 
@@ -105,12 +108,16 @@ fn send_heartbeats(app: &App) {
         _ => return,
     };
 
-    let body = format!("term={term}\nleader_id={}\n", app.replication.node_id);
+    let body = json!({
+        "term": term,
+        "leader_id": app.replication.node_id
+    })
+    .to_string();
     for peer in app.replication.remote_peers() {
         match http_post(&peer.addr, "/internal/raft/heartbeat", body.as_bytes()) {
             Ok(response) if response.status_code == 200 => {
-                if let Ok(form) = parse_form_lines(&response.body) {
-                    if let Ok(peer_term) = parse_form_u64(&form, "term", term) {
+                if let Ok(fields) = parse_json_fields(&response.body) {
+                    if let Ok(peer_term) = parse_json_u64(&fields, "term", term) {
                         if peer_term > term {
                             let _ = step_down_to_term(app, peer_term, None);
                             return;
@@ -119,22 +126,22 @@ fn send_heartbeats(app: &App) {
                 }
             }
             Ok(response) => eprintln!(
-                "heartbeat failed: peer={} status={}",
+                "heartbeat failed: peer {} returned HTTP status {}",
                 peer.node_id, response.status_code
             ),
-            Err(err) => eprintln!("heartbeat failed: peer={} error={err}", peer.node_id),
+            Err(err) => eprintln!("heartbeat failed: peer {} error {err}", peer.node_id),
         }
     }
 }
 
 fn handle_request_vote(
     app: &App,
-    form: &std::collections::HashMap<String, String>,
+    fields: &std::collections::HashMap<String, String>,
 ) -> Result<String> {
-    let candidate_term = parse_form_u64(form, "term", 0)?;
-    let candidate_id = required_form(form, "candidate_id")?;
-    let candidate_last_seq = parse_form_u64(form, "last_seq", 0)?;
-    let candidate_log_len = parse_form_u64(form, "log_len", 0)?;
+    let candidate_term = parse_json_u64(fields, "term", 0)?;
+    let candidate_id = required_json_field(fields, "candidate_id")?;
+    let candidate_last_seq = parse_json_u64(fields, "last_seq", 0)?;
+    let candidate_log_len = parse_json_u64(fields, "log_len", 0)?;
     let (local_last_seq, local_log_len) = local_log_status(app)?;
 
     let mut consensus = lock_consensus(app)?;
@@ -175,15 +182,19 @@ fn handle_request_vote(
         persist_consensus_state(&app.consensus_path, &consensus)?;
     }
 
-    Ok(format!(
-        "term={}\nvote_granted={}\n",
-        consensus.current_term, can_vote
-    ))
+    Ok(json!({
+        "term": consensus.current_term,
+        "vote_granted": can_vote
+    })
+    .to_string())
 }
 
-fn handle_heartbeat(app: &App, form: &std::collections::HashMap<String, String>) -> Result<String> {
-    let leader_term = parse_form_u64(form, "term", 0)?;
-    let leader_id = required_form(form, "leader_id")?;
+fn handle_heartbeat(
+    app: &App,
+    fields: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    let leader_term = parse_json_u64(fields, "term", 0)?;
+    let leader_id = required_json_field(fields, "leader_id")?;
     let mut consensus = lock_consensus(app)?;
     let higher_term = leader_term > consensus.current_term;
     let same_term = leader_term == consensus.current_term;
@@ -219,10 +230,11 @@ fn handle_heartbeat(app: &App, form: &std::collections::HashMap<String, String>)
         persist_consensus_state(&app.consensus_path, &consensus)?;
     }
 
-    Ok(format!(
-        "term={}\nsuccess={}\n",
-        consensus.current_term, accepted
-    ))
+    Ok(json!({
+        "term": consensus.current_term,
+        "success": accepted
+    })
+    .to_string())
 }
 
 fn step_down_to_term(app: &App, term: u64, leader_id: Option<String>) -> Result<()> {
@@ -379,4 +391,3 @@ fn install_snapshot_from_leader(app: &App, leader_addr: &str) -> Result<()> {
     *state = rebuilt;
     Ok(())
 }
-

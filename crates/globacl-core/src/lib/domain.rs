@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-pub use serde_json::Value as JsonValue;
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value};
+pub use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -248,7 +248,7 @@ pub struct DenyRequest {
 }
 
 impl DenyRequest {
-    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+    pub fn from_json_fields(form: &HashMap<String, String>) -> Result<Self> {
         let op_id = required(form, "op_id")?;
         let tenant_id = required(form, "tenant_id")?;
         let namespace = required(form, "namespace")?;
@@ -302,7 +302,7 @@ pub struct RuleRequest {
 }
 
 impl RuleRequest {
-    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+    pub fn from_json_fields(form: &HashMap<String, String>) -> Result<Self> {
         let op_id = required(form, "op_id")?;
         let tenant_id = required(form, "tenant_id")?;
         let kind = RuleKind::from_name(
@@ -451,4 +451,3 @@ pub enum ApplyStatus {
     Applied,
     DuplicateOrOld,
 }
-

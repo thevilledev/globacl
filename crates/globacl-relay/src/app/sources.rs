@@ -11,7 +11,7 @@ impl RelaySource for HttpPullSource {
         let upstream = http_get(&self.upstream_addr, "/health")?;
         Ok(SourceHealth {
             ok: upstream.status_code == 200,
-            details: format!("http_status={}\n", upstream.status_code),
+            details: json!({"http_status": upstream.status_code}).to_string(),
         })
     }
 
@@ -259,24 +259,28 @@ impl RelaySource for JetStreamSource {
         drop(cache);
         Ok(SourceHealth {
             ok: status.errors == 0 || status.last_pull_unix > 0,
-            details: format!(
-                "nats_addr={}\nstream={}\nconsumer={}\nbootstrap_status={bootstrap_status}\nshard_count={shard_count}\nmax_cached_seq={max_cached_seq}\ncached_mutations={cached_mutations}\nsource_lag_max={}\nsource_lag_sum={}\nlagging_shards={}\nconsumer_num_pending={}\nconsumer_num_ack_pending={}\nconsumer_num_redelivered={}\nconsumer_num_waiting={}\nlast_pull_unix={}\napplied_messages={}\nduplicate_messages={}\ngap_repairs={}\njetstream_errors={}\n",
-                self.nats_addr,
-                self.stream,
-                self.durable,
-                status.source_lag_max,
-                status.source_lag_sum,
-                status.lagging_shards,
-                status.consumer_num_pending,
-                status.consumer_num_ack_pending,
-                status.consumer_num_redelivered,
-                status.consumer_num_waiting,
-                status.last_pull_unix,
-                status.applied_messages,
-                status.duplicate_messages,
-                status.gap_repairs,
-                status.errors
-            ),
+            details: json!({
+                "nats_addr": self.nats_addr.as_str(),
+                "stream": self.stream.as_str(),
+                "consumer": self.durable.as_str(),
+                "bootstrap_status": bootstrap_status,
+                "shard_count": shard_count,
+                "max_cached_seq": max_cached_seq,
+                "cached_mutations": cached_mutations,
+                "source_lag_max": status.source_lag_max,
+                "source_lag_sum": status.source_lag_sum,
+                "lagging_shards": status.lagging_shards,
+                "consumer_num_pending": status.consumer_num_pending,
+                "consumer_num_ack_pending": status.consumer_num_ack_pending,
+                "consumer_num_redelivered": status.consumer_num_redelivered,
+                "consumer_num_waiting": status.consumer_num_waiting,
+                "last_pull_unix": status.last_pull_unix,
+                "applied_messages": status.applied_messages,
+                "duplicate_messages": status.duplicate_messages,
+                "gap_repairs": status.gap_repairs,
+                "jetstream_errors": status.errors
+            })
+            .to_string(),
         })
     }
 
@@ -410,4 +414,3 @@ impl RelayCache {
         Ok(Some(mutations))
     }
 }
-

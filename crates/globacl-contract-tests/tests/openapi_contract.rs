@@ -1,6 +1,6 @@
 use globacl_core::{
-    decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, parse_form_lines,
-    parse_json_body, GlobAclError, JsonValue,
+    decode_mutation_stream, decode_snapshot, decode_snapshot_manifest, parse_json_body,
+    parse_json_fields, GlobAclError, JsonValue,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -450,8 +450,11 @@ fn backend_conforms_to_documented_openapi_contract() {
     assert_status(&snapshots, 200);
     assert_content_type(&snapshots, "application/json");
     let snapshots_form = form(&snapshots);
-    assert_fields(&snapshots_form, &["snapshot_count", "manifest_count"]);
-    let rollback_target = first_value_for_key(&snapshots.body, "snapshot")
+    assert_fields(
+        &snapshots_form,
+        &["snapshot_count", "snapshots", "manifest_count", "manifests"],
+    );
+    let rollback_target = first_value_for_key(&snapshots.body, "snapshots")
         .expect("expected at least one archived snapshot");
 
     let rollback = raw_post(
@@ -868,7 +871,7 @@ fn wait_for_health(name: &str, addr: &str) {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("{name} at {addr} did not become healthy; last_status={last_status:?}");
+    panic!("{name} at {addr} did not become healthy; last status {last_status:?}");
 }
 
 fn wait_for_form(
@@ -990,8 +993,8 @@ fn parse_raw_http_response(bytes: &[u8]) -> Result<RawResponse, GlobAclError> {
 }
 
 fn form(response: &RawResponse) -> HashMap<String, String> {
-    parse_form_lines(&response.body)
-        .unwrap_or_else(|err| panic!("response body is not parseable JSON/form fields: {err:?}"))
+    parse_json_fields(&response.body)
+        .unwrap_or_else(|err| panic!("response body is not parseable JSON object: {err:?}"))
 }
 
 fn assert_status(response: &RawResponse, expected: u16) {

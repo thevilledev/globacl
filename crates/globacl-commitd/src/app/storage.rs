@@ -285,18 +285,16 @@ fn format_snapshot_list(snapshot_dir: &Path) -> Result<String> {
     }
     names.sort();
     manifests.sort();
-    let mut body = format!("snapshot_count={}\n", names.len());
-    for name in names {
-        body.push_str(&format!("snapshot={name}\n"));
-    }
-    body.push_str(&format!("manifest_count={}\n", manifests.len()));
-    for name in manifests {
-        body.push_str(&format!("manifest={name}\n"));
-    }
-    Ok(body)
+    Ok(json!({
+        "snapshot_count": names.len(),
+        "snapshots": names,
+        "manifest_count": manifests.len(),
+        "manifests": manifests
+    })
+    .to_string())
 }
 
-fn append_audit(app: &App, event: &str, result: &str, detail: &str) -> Result<()> {
+fn append_audit(app: &App, event: &str, result: &str, details: JsonValue) -> Result<()> {
     if let Some(parent) = app.audit_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -304,14 +302,21 @@ fn append_audit(app: &App, event: &str, result: &str, detail: &str) -> Result<()
         .create(true)
         .append(true)
         .open(&app.audit_path)?;
-    writeln!(
-        file,
-        "ts={} event={} result={} {}",
-        now_unix(),
-        event,
-        result,
-        detail
-    )?;
+    let mut record = json!({
+        "ts": now_unix(),
+        "event": event,
+        "result": result
+    });
+    if let Some(record) = record.as_object_mut() {
+        if let Some(details) = details.as_object() {
+            for (key, value) in details {
+                record.insert(key.clone(), value.clone());
+            }
+        } else {
+            record.insert("details".to_owned(), details);
+        }
+    }
+    writeln!(file, "{record}")?;
     file.sync_data()?;
     Ok(())
 }

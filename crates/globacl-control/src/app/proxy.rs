@@ -22,28 +22,33 @@ fn proxy_post(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Resul
         .collect::<Vec<_>>();
     match http_post_with_headers(&app.commit_addr, &request.path, &request.body, &headers) {
         Ok(response) => {
-            write_http_response(stream, response.status_code, "text/plain", &response.body)
+            write_http_response(stream, response.status_code, "application/json", &response.body)
         }
         Err(err) => write_proxy_error(stream, err),
     }
 }
 
 fn write_proxy_error(stream: &mut TcpStream, err: GlobAclError) -> Result<()> {
-    let body = format!("status=unavailable\nreason=commitd_proxy_failed\nerror={err}\n");
-    write_http_response(stream, 503, "text/plain", body.as_bytes())
+    write_json_response(
+        stream,
+        503,
+        &json!({
+            "status": "unavailable",
+            "reason": "commitd_proxy_failed",
+            "error": err.to_string()
+        }),
+    )
 }
 
 fn content_type_for(path: &str) -> &'static str {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
-    if route.ends_with(".sig") || route == "/v1/snapshot_manifest" || route == "/v1/snapshots" {
-        "text/plain"
-    } else if matches!(
+    if matches!(
         route,
         "/v1/mutations" | "/v1/snapshot" | "/v1/snapshot_artifact" | "/v1/delta_bundle"
     ) {
         "application/octet-stream"
     } else {
-        "text/plain"
+        "application/json"
     }
 }
 

@@ -6,24 +6,41 @@ The machine-readable contract is [OpenAPI](openapi.yaml). It documents the curre
 `application/json` for control, lookup, status, signature, acknowledgement, and audit endpoints, plus `application/octet-stream` for binary snapshots and mutation streams.
 The generated-client plan is in [client-generation.md](client-generation.md).
 
-Required fields for `POST /v1/deny`:
+Required JSON fields for `POST /v1/deny`:
 
 ```text
 op_id
 tenant_id
 namespace
 key
-action=deny|allow_override|delete
+action
 ```
 
 Optional fields:
 
 ```text
-delivery_priority=p0|p1|p2
-priority=0
-reason_code=unspecified
-expires_at=0
-created_by=unknown
+delivery_priority
+priority
+reason_code
+expires_at
+created_by
+override_blast_radius
+```
+
+Example:
+
+```json
+{
+  "op_id": "demo-1",
+  "tenant_id": "tenant-a",
+  "namespace": "user",
+  "key": "user-123",
+  "action": "deny",
+  "delivery_priority": "p0",
+  "priority": 100,
+  "reason_code": "abuse",
+  "created_by": "demo"
+}
 ```
 
 Useful endpoints:

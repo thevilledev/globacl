@@ -5,47 +5,60 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
             let (status_code, body) = match http_get(&app.commit_addr, "/health") {
-                Ok(response) if response.status_code == 200 => {
-                    (200, format!(
-                        "status=ok\nrole=control\ncommitd=ok\ncommit_addr={}\n",
-                        app.commit_addr
-                    ))
-                }
-                Ok(response) => {
-                    (503, format!(
-                        "status=degraded\nrole=control\ncommitd=bad\ncommit_addr={}\ncommit_status={}\n",
-                        app.commit_addr, response.status_code
-                    ))
-                }
-                Err(err) => {
-                    (503, format!(
-                        "status=degraded\nrole=control\ncommitd=unreachable\ncommit_addr={}\nerror={err}\n",
-                        app.commit_addr
-                    ))
-                }
+                Ok(response) if response.status_code == 200 => (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "role": "control",
+                        "commitd": "ok",
+                        "commit_addr": app.commit_addr.as_str()
+                    }),
+                ),
+                Ok(response) => (
+                    503,
+                    json!({
+                        "status": "degraded",
+                        "role": "control",
+                        "commitd": "bad",
+                        "commit_addr": app.commit_addr.as_str(),
+                        "commit_status": response.status_code
+                    }),
+                ),
+                Err(err) => (
+                    503,
+                    json!({
+                        "status": "degraded",
+                        "role": "control",
+                        "commitd": "unreachable",
+                        "commit_addr": app.commit_addr.as_str(),
+                        "error": err.to_string()
+                    }),
+                ),
             };
-            write_http_response(&mut stream, status_code, "text/plain", body.as_bytes())?;
+            write_json_response(&mut stream, status_code, &body)?;
         }
         ("GET", "/metrics") => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
         (_, path) if path.starts_with("/internal/") => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
         ("POST", "/v1/deny") | ("POST", "/v1/mutation") => {
             if require_scope(&mut stream, &app, &request, "acl:write")?.is_none() {
                 return Ok(());
             }
-            let form = parse_form_lines(&request.body)?;
-            let deny_request = DenyRequest::from_form(&form)?;
+            let form = parse_json_fields(&request.body)?;
+            let deny_request = DenyRequest::from_json_fields(&form)?;
             if deny_requires_blast_radius_override(&deny_request)
                 && !blast_radius_override_enabled(&form)
             {
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=blast_radius_override_required\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "blast_radius_override_required"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -55,16 +68,18 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             if require_scope(&mut stream, &app, &request, "acl:write")?.is_none() {
                 return Ok(());
             }
-            let form = parse_form_lines(&request.body)?;
-            let rule_request = RuleRequest::from_form(&form)?;
+            let form = parse_json_fields(&request.body)?;
+            let rule_request = RuleRequest::from_json_fields(&form)?;
             if rule_requires_blast_radius_override(&rule_request)
                 && !blast_radius_override_enabled(&form)
             {
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=blast_radius_override_required\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "blast_radius_override_required"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -99,7 +114,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", _) => proxy_get(&mut stream, &app, &request)?,
         ("POST", _) => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
         (method, _) => {
             return Err(GlobAclError::Parse(format!(

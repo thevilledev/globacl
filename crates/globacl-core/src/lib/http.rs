@@ -1,26 +1,14 @@
-pub fn parse_form_lines(body: &[u8]) -> Result<HashMap<String, String>> {
+pub fn parse_json_fields(body: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(body)
         .map_err(|err| GlobAclError::Parse(format!("request body is not utf8: {err}")))?;
     let trimmed = text.trim();
-    if trimmed.starts_with('{') {
-        return json_object_to_string_map(serde_json::from_str(trimmed)?);
+    if !trimmed.starts_with('{') {
+        return Err(GlobAclError::Parse("expected JSON object body".to_owned()));
     }
-
-    let mut form = HashMap::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| GlobAclError::Parse(format!("expected key=value line, got {line:?}")))?;
-        form.insert(key.trim().to_owned(), value.trim().to_owned());
-    }
-    Ok(form)
+    json_object_to_string_map(serde_json::from_str(trimmed)?)
 }
 
-fn json_object_to_string_map(value: Value) -> Result<HashMap<String, String>> {
+pub fn json_object_to_string_map(value: Value) -> Result<HashMap<String, String>> {
     let object = value
         .as_object()
         .ok_or_else(|| GlobAclError::Parse("expected JSON object body".to_owned()))?;
@@ -43,113 +31,6 @@ fn json_field_to_string(value: &Value) -> Result<String> {
 
 pub fn parse_json_body(body: &[u8]) -> Result<Value> {
     Ok(serde_json::from_slice(body)?)
-}
-
-pub fn key_value_body_to_json(body: &[u8]) -> Result<Value> {
-    let text = std::str::from_utf8(body)
-        .map_err(|err| GlobAclError::Parse(format!("response body is not utf8: {err}")))?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(Value::Object(JsonMap::new()));
-    }
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return Ok(serde_json::from_str(trimmed)?);
-    }
-
-    let mut root = JsonMap::new();
-    let mut items = Vec::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((kind, fields)) = parse_key_value_tokens(line) else {
-            push_json_array_item(&mut root, "messages", Value::String(line.to_owned()));
-            continue;
-        };
-        if let Some(kind) = kind {
-            if kind == "ack" {
-                push_json_array_item(&mut root, "acks", Value::Object(fields));
-            } else {
-                let mut item = fields;
-                item.insert("type".to_owned(), Value::String(kind));
-                items.push(Value::Object(item));
-            }
-        } else if fields.len() == 1 {
-            for (key, value) in fields {
-                insert_json_field(&mut root, key, value);
-            }
-        } else {
-            items.push(Value::Object(fields));
-        }
-    }
-    if !items.is_empty() {
-        root.insert("items".to_owned(), Value::Array(items));
-    }
-    Ok(Value::Object(root))
-}
-
-fn parse_key_value_tokens(line: &str) -> Option<(Option<String>, JsonMap<String, Value>)> {
-    let mut kind = None;
-    let mut fields = JsonMap::new();
-    for token in line.split_whitespace() {
-        if let Some((key, value)) = token.split_once('=') {
-            fields.insert(key.to_owned(), json_scalar(value));
-        } else if kind.is_none() && fields.is_empty() {
-            kind = Some(token.to_owned());
-        } else {
-            return None;
-        }
-    }
-    if fields.is_empty() {
-        None
-    } else {
-        Some((kind, fields))
-    }
-}
-
-fn json_scalar(value: &str) -> Value {
-    let trimmed = value.trim();
-    match trimmed {
-        "true" => return Value::Bool(true),
-        "false" => return Value::Bool(false),
-        "null" => return Value::Null,
-        _ => {}
-    }
-    if let Ok(value) = trimmed.parse::<u64>() {
-        return Value::Number(JsonNumber::from(value));
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return Value::Number(JsonNumber::from(value));
-    }
-    Value::String(trimmed.to_owned())
-}
-
-fn insert_json_field(root: &mut JsonMap<String, Value>, key: String, value: Value) {
-    if let Some(existing) = root.get_mut(&key) {
-        match existing {
-            Value::Array(values) => values.push(value),
-            current => {
-                let old = std::mem::replace(current, Value::Null);
-                *current = Value::Array(vec![old, value]);
-            }
-        }
-    } else {
-        root.insert(key, value);
-    }
-}
-
-fn push_json_array_item(root: &mut JsonMap<String, Value>, key: &str, value: Value) {
-    match root.get_mut(key) {
-        Some(Value::Array(values)) => values.push(value),
-        Some(existing) => {
-            let old = std::mem::replace(existing, Value::Null);
-            *existing = Value::Array(vec![old, value]);
-        }
-        None => {
-            root.insert(key.to_owned(), Value::Array(vec![value]));
-        }
-    }
 }
 
 pub fn parse_query_path(path: &str) -> (String, HashMap<String, String>) {
@@ -189,7 +70,7 @@ pub fn http_post_with_headers(
 ) -> Result<HttpResponse> {
     let extra_headers = format_extra_headers(headers)?;
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         body.len(),
         extra_headers
     )
@@ -312,36 +193,42 @@ pub struct PopAck {
 }
 
 impl PopAck {
-    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+    pub fn from_json_fields(fields: &HashMap<String, String>) -> Result<Self> {
         Ok(Self {
-            agent_id: required(form, "agent_id")?,
+            agent_id: required(fields, "agent_id")?,
             shard_id: parse_u16(
-                form.get("shard_id")
-                    .or_else(|| form.get("shard"))
+                fields
+                    .get("shard_id")
+                    .or_else(|| fields.get("shard"))
                     .map(String::as_str),
                 "shard_id",
             )?,
             seq: parse_u64(
-                form.get("seq")
-                    .or_else(|| form.get("watermark"))
+                fields
+                    .get("seq")
+                    .or_else(|| fields.get("watermark"))
                     .map(String::as_str),
                 0,
                 "seq",
             )?,
-            entries: parse_usize(form.get("entries").map(String::as_str), 0, "entries")?,
+            entries: parse_usize(fields.get("entries").map(String::as_str), 0, "entries")?,
             applied_at_unix: parse_u64(
-                form.get("applied_at_unix").map(String::as_str),
+                fields.get("applied_at_unix").map(String::as_str),
                 now_unix(),
                 "applied_at_unix",
             )?,
         })
     }
 
-    pub fn to_form_body(&self) -> String {
-        format!(
-            "agent_id={}\nshard_id={}\nseq={}\nentries={}\napplied_at_unix={}\n",
-            self.agent_id, self.shard_id, self.seq, self.entries, self.applied_at_unix
-        )
+    pub fn to_json_body(&self) -> String {
+        json!({
+            "agent_id": self.agent_id.as_str(),
+            "shard_id": self.shard_id,
+            "seq": self.seq,
+            "entries": self.entries,
+            "applied_at_unix": self.applied_at_unix
+        })
+        .to_string()
     }
 }
 
@@ -376,32 +263,34 @@ impl PropagationAck {
         }
     }
 
-    pub fn from_form(form: &HashMap<String, String>) -> Result<Self> {
+    pub fn from_json_fields(fields: &HashMap<String, String>) -> Result<Self> {
         Ok(Self {
-            relay_id: required(form, "relay_id")?,
-            location: required(form, "location")?,
-            agent_id: required(form, "agent_id")?,
+            relay_id: required(fields, "relay_id")?,
+            location: required(fields, "location")?,
+            agent_id: required(fields, "agent_id")?,
             shard_id: parse_u16(
-                form.get("shard_id")
-                    .or_else(|| form.get("shard"))
+                fields
+                    .get("shard_id")
+                    .or_else(|| fields.get("shard"))
                     .map(String::as_str),
                 "shard_id",
             )?,
             seq: parse_u64(
-                form.get("seq")
-                    .or_else(|| form.get("watermark"))
+                fields
+                    .get("seq")
+                    .or_else(|| fields.get("watermark"))
                     .map(String::as_str),
                 0,
                 "seq",
             )?,
-            entries: parse_usize(form.get("entries").map(String::as_str), 0, "entries")?,
+            entries: parse_usize(fields.get("entries").map(String::as_str), 0, "entries")?,
             applied_at_unix: parse_u64(
-                form.get("applied_at_unix").map(String::as_str),
+                fields.get("applied_at_unix").map(String::as_str),
                 now_unix(),
                 "applied_at_unix",
             )?,
             relay_received_at_unix: parse_u64(
-                form.get("relay_received_at_unix").map(String::as_str),
+                fields.get("relay_received_at_unix").map(String::as_str),
                 now_unix(),
                 "relay_received_at_unix",
             )?,
@@ -412,18 +301,18 @@ impl PropagationAck {
         format!("{}:{}:{}", self.relay_id, self.agent_id, self.shard_id)
     }
 
-    pub fn to_form_body(&self) -> String {
-        format!(
-            "relay_id={}\nlocation={}\nagent_id={}\nshard_id={}\nseq={}\nentries={}\napplied_at_unix={}\nrelay_received_at_unix={}\n",
-            self.relay_id,
-            self.location,
-            self.agent_id,
-            self.shard_id,
-            self.seq,
-            self.entries,
-            self.applied_at_unix,
-            self.relay_received_at_unix
-        )
+    pub fn to_json_body(&self) -> String {
+        json!({
+            "relay_id": self.relay_id.as_str(),
+            "location": self.location.as_str(),
+            "agent_id": self.agent_id.as_str(),
+            "shard_id": self.shard_id,
+            "seq": self.seq,
+            "entries": self.entries,
+            "applied_at_unix": self.applied_at_unix,
+            "relay_received_at_unix": self.relay_received_at_unix
+        })
+        .to_string()
     }
 }
 
@@ -510,10 +399,6 @@ pub fn write_http_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
-    if content_type == "text/plain" {
-        let value = key_value_body_to_json(body)?;
-        return write_json_response(stream, status_code, &value);
-    }
     let reason = match status_code {
         200 => "OK",
         201 => "Created",
@@ -540,13 +425,4 @@ pub fn write_http_response(
 pub fn write_json_response(stream: &mut TcpStream, status_code: u16, value: &Value) -> Result<()> {
     let body = serde_json::to_vec(value)?;
     write_http_response(stream, status_code, "application/json", &body)
-}
-
-pub fn write_json_response_from_text(
-    stream: &mut TcpStream,
-    status_code: u16,
-    body: &[u8],
-) -> Result<()> {
-    let value = key_value_body_to_json(body)?;
-    write_json_response(stream, status_code, &value)
 }

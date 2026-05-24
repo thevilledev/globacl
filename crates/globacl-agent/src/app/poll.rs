@@ -187,7 +187,7 @@ fn send_ack(app: &Arc<App>, shard_id: u16, seq: u64, entries: usize) -> Result<(
         applied_at_unix: now_unix(),
     };
     let response =
-        globacl_core::http_post(&app.relay_addr, "/v1/ack", ack.to_form_body().as_bytes())?;
+        globacl_core::http_post(&app.relay_addr, "/v1/ack", ack.to_json_body().as_bytes())?;
     if response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(
             "relay returned status {} for ack",
@@ -202,7 +202,7 @@ fn check_canary(app: &Arc<App>) -> Result<()> {
     if response.status_code != 200 {
         return Ok(());
     }
-    let form = parse_form_lines(&response.body)?;
+    let form = parse_json_fields(&response.body)?;
     if form.get("status").map(String::as_str) != Some("ok") {
         return Ok(());
     }

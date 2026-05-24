@@ -68,7 +68,9 @@ Start one PoP agent:
 cargo run -p globacl-agent -- 127.0.0.1:7001 127.0.0.1:7002 data/agent/latest.gacl 1000 agent-local 60
 ```
 
-The final argument is `stale_after_secs`; the agent reports `status=stale` if it cannot successfully poll the relay within that window.
+The final argument is `stale_after_secs`; the agent reports JSON health with
+`"status": "stale"` if it cannot successfully poll the relay within that
+window.
 
 Start the demo consumer app:
 

@@ -1,14 +1,12 @@
 fn content_type_for(path: &str) -> &'static str {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
-    if route.ends_with(".sig") || route == "/v1/snapshot_manifest" || route == "/v1/snapshots" {
-        "text/plain"
-    } else if matches!(
+    if matches!(
         route,
         "/v1/mutations" | "/v1/snapshot" | "/v1/snapshot_artifact" | "/v1/delta_bundle"
     ) {
         "application/octet-stream"
     } else {
-        "text/plain"
+        "application/json"
     }
 }
 
@@ -87,28 +85,28 @@ fn format_acks(app: &App) -> Result<String> {
             .then(left.shard_id.cmp(&right.shard_id))
     });
 
-    let mut body = format!(
-        "relay_id={}\nlocation={}\nack_count={}\n",
-        app.relay_id,
-        app.location,
-        acks.len()
-    );
+    let mut items = Vec::new();
     for ack in acks {
         let lag_secs = now.saturating_sub(ack.applied_at_unix);
-        body.push_str(&format!(
-            "ack relay_id={} location={} agent_id={} shard_id={} seq={} entries={} applied_at_unix={} relay_received_at_unix={} lag_secs={}\n",
-            ack.relay_id,
-            ack.location,
-            ack.agent_id,
-            ack.shard_id,
-            ack.seq,
-            ack.entries,
-            ack.applied_at_unix,
-            ack.relay_received_at_unix,
-            lag_secs
-        ));
+        items.push(json!({
+            "relay_id": ack.relay_id.as_str(),
+            "location": ack.location.as_str(),
+            "agent_id": ack.agent_id.as_str(),
+            "shard_id": ack.shard_id,
+            "seq": ack.seq,
+            "entries": ack.entries,
+            "applied_at_unix": ack.applied_at_unix,
+            "relay_received_at_unix": ack.relay_received_at_unix,
+            "lag_secs": lag_secs
+        }));
     }
-    Ok(body)
+    Ok(json!({
+        "relay_id": app.relay_id.as_str(),
+        "location": app.location.as_str(),
+        "ack_count": items.len(),
+        "acks": items
+    })
+    .to_string())
 }
 
 fn required_query_u16(query: &HashMap<String, String>, key: &str) -> Result<u16> {

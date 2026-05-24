@@ -72,10 +72,10 @@ fn load_publisher_offsets(path: &Path, shard_count: u16) -> Result<Vec<u64>> {
         return Ok(offsets);
     }
     let bytes = fs::read(path)?;
-    let form = parse_form_lines(&bytes)?;
+    let fields = parse_json_fields(&bytes)?;
     for (shard_id, offset) in offsets.iter_mut().enumerate() {
         let key = format!("shard_{shard_id:04}");
-        if let Some(value) = form.get(&key) {
+        if let Some(value) = fields.get(&key) {
             *offset = parse_query_u64(value, &key)?;
         }
     }
@@ -93,10 +93,13 @@ fn persist_publisher_offsets(path: &Path, offsets: &[u64]) -> Result<()> {
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        writeln!(file, "shard_count={}", offsets.len())?;
+        let mut body = json!({"shard_count": offsets.len()});
         for (shard_id, seq) in offsets.iter().enumerate() {
-            writeln!(file, "shard_{shard_id:04}={seq}")?;
+            if let Some(object) = body.as_object_mut() {
+                object.insert(format!("shard_{shard_id:04}"), json!(seq));
+            }
         }
+        file.write_all(body.to_string().as_bytes())?;
         file.sync_all()?;
     }
     fs::rename(tmp, path)?;
@@ -137,14 +140,17 @@ fn replicate_propagation_ack_on_quorum(app: &App, ack: &PropagationAck) -> Resul
         return Ok(());
     }
 
-    let payload = ack.to_form_body();
+    let payload = ack.to_json_body();
     let mut replicated = 1usize;
     let mut failures = Vec::new();
     for peer in app.replication.remote_peers() {
         match http_post(&peer.addr, "/internal/replication/ack", payload.as_bytes()) {
             Ok(response) if response.status_code == 200 => replicated += 1,
             Ok(response) => {
-                failures.push(format!("{}:status={}", peer.node_id, response.status_code))
+                failures.push(format!(
+                    "{}:http_status:{}",
+                    peer.node_id, response.status_code
+                ))
             }
             Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
         }
@@ -169,7 +175,7 @@ fn load_propagation_acks(path: &Path) -> Result<HashMap<String, PropagationAck>>
     let text = String::from_utf8(fs::read(path)?)
         .map_err(|err| GlobAclError::Parse(format!("ack log is not utf8: {err}")))?;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let ack = parse_propagation_ack_log_line(line)?;
+        let ack = parse_propagation_ack_json(parse_json_body(line.as_bytes())?)?;
         let key = ack.key();
         if acks
             .get(&key)
@@ -187,34 +193,26 @@ fn append_propagation_ack(path: &Path, ack: &PropagationAck) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{}", format_propagation_ack_log_line(ack))?;
+    writeln!(file, "{}", ack.to_json_body())?;
     file.sync_all()?;
     Ok(())
 }
 
-fn format_propagation_ack_log_line(ack: &PropagationAck) -> String {
-    format!(
-        "relay_id={}\tlocation={}\tagent_id={}\tshard_id={}\tseq={}\tentries={}\tapplied_at_unix={}\trelay_received_at_unix={}",
-        encode_ack_field(&ack.relay_id),
-        encode_ack_field(&ack.location),
-        encode_ack_field(&ack.agent_id),
-        ack.shard_id,
-        ack.seq,
-        ack.entries,
-        ack.applied_at_unix,
-        ack.relay_received_at_unix,
-    )
+fn propagation_ack_json(ack: &PropagationAck) -> JsonValue {
+    json!({
+        "relay_id": ack.relay_id.as_str(),
+        "location": ack.location.as_str(),
+        "agent_id": ack.agent_id.as_str(),
+        "shard_id": ack.shard_id,
+        "seq": ack.seq,
+        "entries": ack.entries,
+        "applied_at_unix": ack.applied_at_unix,
+        "relay_received_at_unix": ack.relay_received_at_unix
+    })
 }
 
-fn parse_propagation_ack_log_line(line: &str) -> Result<PropagationAck> {
-    let mut form = HashMap::new();
-    for part in line.split('\t') {
-        let (key, value) = part
-            .split_once('=')
-            .ok_or_else(|| GlobAclError::Parse(format!("invalid ack log field {part:?}")))?;
-        form.insert(key.to_owned(), decode_ack_field(value)?);
-    }
-    PropagationAck::from_form(&form)
+fn parse_propagation_ack_json(value: JsonValue) -> Result<PropagationAck> {
+    PropagationAck::from_json_fields(&globacl_core::json_object_to_string_map(value)?)
 }
 
 fn format_propagation_ack_log_snapshot(app: &App) -> Result<String> {
@@ -228,21 +226,22 @@ fn format_propagation_ack_log_snapshot(app: &App) -> Result<String> {
             .then(left.agent_id.cmp(&right.agent_id))
             .then(left.shard_id.cmp(&right.shard_id))
     });
-    let mut body = String::new();
-    for ack in acks {
-        body.push_str(&format_propagation_ack_log_line(&ack));
-        body.push('\n');
-    }
-    Ok(body)
+    Ok(json!({
+        "acks": acks.iter().map(propagation_ack_json).collect::<Vec<_>>()
+    })
+    .to_string())
 }
 
 fn apply_propagation_ack_log_snapshot(app: &App, body: &[u8]) -> Result<usize> {
-    let text = String::from_utf8(body.to_vec())
-        .map_err(|err| GlobAclError::Parse(format!("ack snapshot is not utf8: {err}")))?;
+    let value = parse_json_body(body)?;
+    let ack_values = value
+        .get("acks")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| GlobAclError::Parse("ack snapshot missing acks array".to_owned()))?;
     let mut applied = 0usize;
     let mut acks = lock_propagation_acks(app)?;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let ack = parse_propagation_ack_log_line(line)?;
+    for value in ack_values {
+        let ack = parse_propagation_ack_json(value.clone())?;
         if apply_propagation_ack_to_store(&app.propagation_acks_path, &mut acks, ack)? {
             applied += 1;
         }
@@ -336,10 +335,7 @@ fn format_propagation_status(app: &App) -> Result<String> {
         "ok"
     };
 
-    let mut body = format!(
-        "status={status}\nshard_count={}\nsource_max_seq={source_max_seq}\nack_count={ack_count}\nrelay_count={relay_count}\nagent_count={agent_count}\nacked_shards={acked_shards}\nmin_ack_seq={min_ack_seq}\nmax_ack_seq={max_ack_seq}\nmax_seq_lag={max_seq_lag}\nlagging_ack_count={lagging_ack_count}\nmax_ack_age_secs={max_ack_age_secs}\n",
-        watermarks.len()
-    );
+    let mut ack_items = Vec::new();
     for ack in acks {
         let source_seq = watermarks
             .get(ack.shard_id as usize)
@@ -347,61 +343,34 @@ fn format_propagation_status(app: &App) -> Result<String> {
             .unwrap_or_default();
         let seq_lag = source_seq.saturating_sub(ack.seq);
         let ack_age_secs = now.saturating_sub(ack.applied_at_unix);
-        body.push_str(&format!(
-            "ack relay_id={} location={} agent_id={} shard_id={} seq={} source_seq={} seq_lag={} entries={} applied_at_unix={} relay_received_at_unix={} ack_age_secs={}\n",
-            ack.relay_id,
-            ack.location,
-            ack.agent_id,
-            ack.shard_id,
-            ack.seq,
-            source_seq,
-            seq_lag,
-            ack.entries,
-            ack.applied_at_unix,
-            ack.relay_received_at_unix,
-            ack_age_secs
-        ));
+        ack_items.push(json!({
+            "relay_id": ack.relay_id.as_str(),
+            "location": ack.location.as_str(),
+            "agent_id": ack.agent_id.as_str(),
+            "shard_id": ack.shard_id,
+            "seq": ack.seq,
+            "source_seq": source_seq,
+            "seq_lag": seq_lag,
+            "entries": ack.entries,
+            "applied_at_unix": ack.applied_at_unix,
+            "relay_received_at_unix": ack.relay_received_at_unix,
+            "ack_age_secs": ack_age_secs
+        }));
     }
-    Ok(body)
+    Ok(json!({
+        "status": status,
+        "shard_count": watermarks.len(),
+        "source_max_seq": source_max_seq,
+        "ack_count": ack_count,
+        "relay_count": relay_count,
+        "agent_count": agent_count,
+        "acked_shards": acked_shards,
+        "min_ack_seq": min_ack_seq,
+        "max_ack_seq": max_ack_seq,
+        "max_seq_lag": max_seq_lag,
+        "lagging_ack_count": lagging_ack_count,
+        "max_ack_age_secs": max_ack_age_secs,
+        "acks": ack_items
+    })
+    .to_string())
 }
-
-fn encode_ack_field(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
-fn decode_ack_field(value: &str) -> Result<String> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        let escaped = chars
-            .next()
-            .ok_or_else(|| GlobAclError::Parse("dangling ack field escape".to_owned()))?;
-        match escaped {
-            '\\' => out.push('\\'),
-            't' => out.push('\t'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            other => {
-                return Err(GlobAclError::Parse(format!(
-                    "unknown ack field escape \\{other}"
-                )));
-            }
-        }
-    }
-    Ok(out)
-}
-

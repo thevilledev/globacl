@@ -1,8 +1,8 @@
 use globacl_agent::{start_embedded, AgentConfig, AgentHandle};
 use globacl_core::{
-    append_prometheus_metric, format_decision, http_get, metrics_bind_addr_from_env, now_unix,
-    parse_form_lines, parse_query_path, read_http_request, spawn_prometheus_metrics_listener,
-    write_http_response, Decision, GlobAclError, Result,
+    append_prometheus_metric, http_get, json, metrics_bind_addr_from_env, now_unix,
+    parse_json_fields, parse_query_path, read_http_request, spawn_prometheus_metrics_listener,
+    write_json_response, Decision, GlobAclError, Result,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};

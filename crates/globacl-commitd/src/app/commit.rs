@@ -267,7 +267,10 @@ fn prepare_on_quorum(app: &App, mutation: &Mutation) -> Result<()> {
         match http_post(&peer.addr, "/internal/replication/prepare", &payload) {
             Ok(response) if response.status_code == 200 => prepared += 1,
             Ok(response) => {
-                failures.push(format!("{}:status={}", peer.node_id, response.status_code))
+                failures.push(format!(
+                    "{}:http_status:{}",
+                    peer.node_id, response.status_code
+                ))
             }
             Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
         }
@@ -295,10 +298,10 @@ fn commit_on_peers(app: &App, mutation: &Mutation) {
         match http_post(&peer.addr, "/internal/replication/commit", &payload) {
             Ok(response) if response.status_code == 200 => {}
             Ok(response) => eprintln!(
-                "peer commit failed: peer={} status={}",
+                "peer commit failed: peer {} returned HTTP status {}",
                 peer.node_id, response.status_code
             ),
-            Err(err) => eprintln!("peer commit failed: peer={} error={err}", peer.node_id),
+            Err(err) => eprintln!("peer commit failed: peer {} error {err}", peer.node_id),
         }
     }
 }
@@ -307,7 +310,7 @@ fn abort_on_peers(app: &App, mutation: &Mutation) {
     let payload = encode_mutation(mutation);
     for peer in app.replication.remote_peers() {
         if let Err(err) = http_post(&peer.addr, "/internal/replication/abort", &payload) {
-            eprintln!("peer abort failed: peer={} error={err}", peer.node_id);
+            eprintln!("peer abort failed: peer {} error {err}", peer.node_id);
         }
     }
 }

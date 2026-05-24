@@ -163,52 +163,63 @@ pub fn nats_request(
 
 pub fn format_commit_outcome(outcome: &CommitOutcome) -> String {
     let entries_changed = if outcome.duplicate { 0 } else { 1 };
-    let mut body = format!(
-        "duplicate={}\nshard_id={}\nseq={}\nepoch={}\naction={}\nkey_hash={}\ndelivery_priority={}\ncommitted_at_unix={}\nentries_changed={entries_changed}\n",
-        outcome.duplicate,
-        outcome.mutation.commit_id.shard_id,
-        outcome.mutation.commit_id.seq,
-        outcome.mutation.commit_id.epoch,
-        outcome.mutation.entry.action.as_str(),
-        outcome.mutation.entry.key_hash,
-        outcome.mutation.delivery_priority.as_str(),
-        outcome.mutation.committed_at_unix
-    );
+    let mut body = json!({
+        "duplicate": outcome.duplicate,
+        "shard_id": outcome.mutation.commit_id.shard_id,
+        "seq": outcome.mutation.commit_id.seq,
+        "epoch": outcome.mutation.commit_id.epoch,
+        "action": outcome.mutation.entry.action.as_str(),
+        "key_hash": outcome.mutation.entry.key_hash,
+        "delivery_priority": outcome.mutation.delivery_priority.as_str(),
+        "committed_at_unix": outcome.mutation.committed_at_unix,
+        "entries_changed": entries_changed
+    });
     if let Some(rule) = &outcome.mutation.rule {
-        body.push_str(&format!(
-            "rule_kind={}\npattern={}\nrule_hash={}\n",
-            rule.kind.as_str(),
-            rule.pattern,
-            rule.rule_hash
-        ));
+        if let Some(object) = body.as_object_mut() {
+            object.insert("rule_kind".to_owned(), json!(rule.kind.as_str()));
+            object.insert("pattern".to_owned(), json!(rule.pattern.as_str()));
+            object.insert("rule_hash".to_owned(), json!(rule.rule_hash));
+        }
     }
-    body
+    body.to_string()
 }
 
 pub fn format_decision(decision: &Decision) -> String {
     match decision {
-        Decision::Allow => "decision=allow\n".to_owned(),
+        Decision::Allow => json!({"decision": "allow"}).to_string(),
         Decision::Deny {
             reason_code,
             priority,
             commit_id,
-        } => format!(
-            "decision=deny\nreason_code={reason_code}\npriority={priority}\nshard_id={}\nseq={}\nepoch={}\n",
-            commit_id.shard_id, commit_id.seq, commit_id.epoch
-        ),
+        } => json!({
+            "decision": "deny",
+            "reason_code": reason_code.as_str(),
+            "priority": priority,
+            "shard_id": commit_id.shard_id,
+            "seq": commit_id.seq,
+            "epoch": commit_id.epoch
+        })
+        .to_string(),
     }
 }
 
 pub fn format_watermarks(watermarks: &[u64]) -> String {
-    let mut body = format!("shard_count={}\n", watermarks.len());
+    let mut body = JsonMap::new();
+    body.insert(
+        "shard_count".to_owned(),
+        JsonValue::Number(JsonNumber::from(watermarks.len() as u64)),
+    );
     for (shard_id, seq) in watermarks.iter().enumerate() {
-        body.push_str(&format!("shard_{shard_id:04}={seq}\n"));
+        body.insert(
+            format!("shard_{shard_id:04}"),
+            JsonValue::Number(JsonNumber::from(*seq)),
+        );
     }
-    body
+    JsonValue::Object(body).to_string()
 }
 
 pub fn parse_watermarks(body: &[u8]) -> Result<Vec<u64>> {
-    let form = parse_form_lines(body)?;
+    let form = parse_json_fields(body)?;
     let shard_count = parse_usize(
         form.get("shard_count").map(String::as_str),
         0,
@@ -556,4 +567,3 @@ fn now_unix_millis_for_nats() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-

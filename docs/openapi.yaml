@@ -169,7 +169,7 @@ paths:
       operationId: getLatestCanary
       responses:
         "200":
-          description: Latest canary or `status=none`.
+          description: 'Latest canary or a JSON response with `"status": "none"`.'
           content:
             application/json:
               schema:
@@ -1099,30 +1099,30 @@ components:
         "^shard_[0-9]{4}$":
           $ref: "#/components/schemas/Sequence"
       additionalProperties: false
-    SnapshotNameOrList:
-      oneOf:
-        - type: string
-        - type: array
-          items:
-            type: string
     SnapshotListResponse:
       type: object
       required:
         - snapshot_count
+        - snapshots
         - manifest_count
+        - manifests
       properties:
         snapshot_count:
           type: integer
           format: int64
           minimum: 0
-        snapshot:
-          $ref: "#/components/schemas/SnapshotNameOrList"
+        snapshots:
+          type: array
+          items:
+            type: string
         manifest_count:
           type: integer
           format: int64
           minimum: 0
-        manifest:
-          $ref: "#/components/schemas/SnapshotNameOrList"
+        manifests:
+          type: array
+          items:
+            type: string
       additionalProperties: false
     RollbackRequest:
       type: object

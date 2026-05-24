@@ -704,14 +704,13 @@ export interface components {
         } & {
             [key: string]: components["schemas"]["Sequence"];
         };
-        SnapshotNameOrList: string | string[];
         SnapshotListResponse: {
             /** Format: int64 */
             snapshot_count: number;
-            snapshot?: components["schemas"]["SnapshotNameOrList"];
+            snapshots: string[];
             /** Format: int64 */
             manifest_count: number;
-            manifest?: components["schemas"]["SnapshotNameOrList"];
+            manifests: string[];
         };
         RollbackRequest: {
             snapshot: string;
@@ -994,7 +993,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Latest canary or `status=none`. */
+            /** @description Latest canary or a JSON response with `"status": "none"`. */
             200: {
                 headers: {
                     [name: string]: unknown;

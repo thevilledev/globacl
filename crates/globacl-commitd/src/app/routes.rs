@@ -23,29 +23,32 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 .copied()
                 .max()
                 .unwrap_or(0);
-            let body = format!(
-                "status=ok\nrole={}\nnode_id={}\ncluster_id={}\nleader_id={}\nterm={}\nvoted_for={}\nwrite_authority={}\nquorum={}\npeer_count={}\nshard_count={}\nentries={}\nmutations={}\njetstream_publisher={}\nmax_published_seq={}\ncentral_ack_count={}\nlast_publish_unix={}\npublish_errors={}\nlast_peer_sync_unix={}\nsync_errors={}\n",
-                consensus.role.as_str(),
-                app.replication.node_id,
-                app.replication.cluster_id,
-                consensus.leader_id.as_deref().unwrap_or(""),
-                consensus.current_term,
-                consensus.voted_for.as_deref().unwrap_or(""),
-                consensus.role == ConsensusRole::Leader,
-                app.replication.quorum,
-                app.replication.peers.len(),
-                state.shard_count(),
-                state.entries_len(),
-                state.mutations_len(),
-                app.publisher.is_some(),
-                max_published_seq,
-                central_ack_count,
-                publisher_status.last_publish_unix,
-                publisher_status.publish_errors,
-                sync_status.last_peer_sync_unix,
-                sync_status.sync_errors
-            );
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "status": "ok",
+                    "role": consensus.role.as_str(),
+                    "node_id": app.replication.node_id.as_str(),
+                    "cluster_id": app.replication.cluster_id.as_str(),
+                    "leader_id": consensus.leader_id.as_deref().unwrap_or(""),
+                    "term": consensus.current_term,
+                    "voted_for": consensus.voted_for.as_deref().unwrap_or(""),
+                    "write_authority": consensus.role == ConsensusRole::Leader,
+                    "quorum": app.replication.quorum,
+                    "peer_count": app.replication.peers.len(),
+                    "shard_count": state.shard_count(),
+                    "entries": state.entries_len(),
+                    "mutations": state.mutations_len(),
+                    "jetstream_publisher": app.publisher.is_some(),
+                    "max_published_seq": max_published_seq,
+                    "central_ack_count": central_ack_count,
+                    "last_publish_unix": publisher_status.last_publish_unix,
+                    "publish_errors": publisher_status.publish_errors,
+                    "last_peer_sync_unix": sync_status.last_peer_sync_unix,
+                    "sync_errors": sync_status.sync_errors
+                }),
+            )?;
         }
         ("GET", "/v1/propagation/status") => {
             if app.replication.is_clustered() && !is_write_leader(&app)? {
@@ -53,57 +56,57 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 return Ok(());
             }
             let body = format_propagation_status(&app)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("POST", "/v1/ack") => {
-            let form = parse_form_lines(&request.body)?;
-            let ack = PropagationAck::from_form(&form)?;
+            let fields = parse_json_fields(&request.body)?;
+            let ack = PropagationAck::from_json_fields(&fields)?;
             record_propagation_ack(&app, ack)?;
-            write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
+            write_json_response(&mut stream, 200, &json!({"status": "ok"}))?;
         }
         ("POST", "/internal/raft/request_vote") => {
-            let form = parse_form_lines(&request.body)?;
-            let response = handle_request_vote(&app, &form)?;
-            write_http_response(&mut stream, 200, "text/plain", response.as_bytes())?;
+            let fields = parse_json_fields(&request.body)?;
+            let response = handle_request_vote(&app, &fields)?;
+            write_http_response(&mut stream, 200, "application/json", response.as_bytes())?;
         }
         ("POST", "/internal/raft/heartbeat") => {
-            let form = parse_form_lines(&request.body)?;
-            let response = handle_heartbeat(&app, &form)?;
-            write_http_response(&mut stream, 200, "text/plain", response.as_bytes())?;
+            let fields = parse_json_fields(&request.body)?;
+            let response = handle_heartbeat(&app, &fields)?;
+            write_http_response(&mut stream, 200, "application/json", response.as_bytes())?;
         }
         ("POST", "/internal/replication/prepare") => {
             let mutation = decode_mutation(&request.body)?;
             prepare_replicated_mutation(&app, &mutation)?;
-            write_http_response(&mut stream, 200, "text/plain", b"status=prepared\n")?;
+            write_json_response(&mut stream, 200, &json!({"status": "prepared"}))?;
         }
         ("POST", "/internal/replication/commit") => {
             let mutation = decode_mutation(&request.body)?;
             let status = commit_replicated_mutation(&app, mutation, true)?;
-            let body = match status {
-                ApplyStatus::Applied => "status=applied\n",
-                ApplyStatus::DuplicateOrOld => "status=duplicate\n",
+            let status = match status {
+                ApplyStatus::Applied => "applied",
+                ApplyStatus::DuplicateOrOld => "duplicate",
             };
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(&mut stream, 200, &json!({"status": status}))?;
         }
         ("POST", "/internal/replication/abort") => {
             let mutation = decode_mutation(&request.body)?;
             remove_pending_mutation(&app.pending_dir, &mutation)?;
-            write_http_response(&mut stream, 200, "text/plain", b"status=aborted\n")?;
+            write_json_response(&mut stream, 200, &json!({"status": "aborted"}))?;
         }
         ("POST", "/internal/replication/ack") => {
-            let form = parse_form_lines(&request.body)?;
-            let ack = PropagationAck::from_form(&form)?;
+            let fields = parse_json_fields(&request.body)?;
+            let ack = PropagationAck::from_json_fields(&fields)?;
             let applied = apply_propagation_ack(&app, ack)?;
-            let body = if applied {
-                "status=applied\n"
+            let status = if applied {
+                "applied"
             } else {
-                "status=duplicate\n"
+                "duplicate"
             };
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(&mut stream, 200, &json!({"status": status}))?;
         }
         ("GET", "/internal/replication/acks") => {
             let body = format_propagation_ack_log_snapshot(&app)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/internal/replication/idempotency") => {
             let mutations = {
@@ -118,28 +121,30 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 Some(principal) => principal,
                 None => return Ok(()),
             };
-            let form = parse_form_lines(&request.body)?;
-            let deny_request = DenyRequest::from_form(&form)?;
+            let fields = parse_json_fields(&request.body)?;
+            let deny_request = DenyRequest::from_json_fields(&fields)?;
             if deny_requires_blast_radius_override(&deny_request)
-                && !blast_radius_override_enabled(&form)
+                && !blast_radius_override_enabled(&fields)
             {
                 append_audit(
                     &app,
                     "deny",
                     "rejected",
-                    &format!(
-                        "op_id={} reason=blast_radius_override_required namespace={} key={} actor={}",
-                        deny_request.op_id,
-                        deny_request.namespace,
-                        deny_request.key,
-                        audit_actor(&principal, &deny_request.created_by)
-                    ),
+                    json!({
+                        "op_id": deny_request.op_id.as_str(),
+                        "reason": "blast_radius_override_required",
+                        "namespace": deny_request.namespace.as_str(),
+                        "key": deny_request.key.as_str(),
+                        "actor": audit_actor(&principal, &deny_request.created_by)
+                    }),
                 )?;
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=blast_radius_override_required\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "blast_radius_override_required"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -148,45 +153,46 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "deny",
                 "committed",
-                &format!(
-                    "op_id={} shard_id={} seq={} duplicate={} actor={}",
-                    outcome.mutation.op_id,
-                    outcome.mutation.commit_id.shard_id,
-                    outcome.mutation.commit_id.seq,
-                    outcome.duplicate,
-                    audit_actor(&principal, &outcome.mutation.entry.created_by)
-                ),
+                json!({
+                    "op_id": outcome.mutation.op_id.as_str(),
+                    "shard_id": outcome.mutation.commit_id.shard_id,
+                    "seq": outcome.mutation.commit_id.seq,
+                    "duplicate": outcome.duplicate,
+                    "actor": audit_actor(&principal, &outcome.mutation.entry.created_by)
+                }),
             )?;
             let body = format_commit_outcome(&outcome);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("POST", "/v1/rule") => {
             let principal = match require_scope(&mut stream, &app, &request, "acl:write")? {
                 Some(principal) => principal,
                 None => return Ok(()),
             };
-            let form = parse_form_lines(&request.body)?;
-            let rule_request = RuleRequest::from_form(&form)?;
+            let fields = parse_json_fields(&request.body)?;
+            let rule_request = RuleRequest::from_json_fields(&fields)?;
             if rule_requires_blast_radius_override(&rule_request)
-                && !blast_radius_override_enabled(&form)
+                && !blast_radius_override_enabled(&fields)
             {
                 append_audit(
                     &app,
                     "rule",
                     "rejected",
-                    &format!(
-                        "op_id={} reason=blast_radius_override_required kind={} pattern={} actor={}",
-                        rule_request.op_id,
-                        rule_request.kind.as_str(),
-                        rule_request.pattern,
-                        audit_actor(&principal, &rule_request.created_by)
-                    ),
+                    json!({
+                        "op_id": rule_request.op_id.as_str(),
+                        "reason": "blast_radius_override_required",
+                        "kind": rule_request.kind.as_str(),
+                        "pattern": rule_request.pattern.as_str(),
+                        "actor": audit_actor(&principal, &rule_request.created_by)
+                    }),
                 )?;
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=blast_radius_override_required\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "blast_radius_override_required"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -195,13 +201,12 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "rule",
                 "committed",
-                &format!(
-                    "op_id={} shard_id={} seq={} duplicate={} actor={}",
-                    outcome.mutation.op_id,
-                    outcome.mutation.commit_id.shard_id,
-                    outcome.mutation.commit_id.seq,
-                    outcome.duplicate,
-                    audit_actor(
+                json!({
+                    "op_id": outcome.mutation.op_id.as_str(),
+                    "shard_id": outcome.mutation.commit_id.shard_id,
+                    "seq": outcome.mutation.commit_id.seq,
+                    "duplicate": outcome.duplicate,
+                    "actor": audit_actor(
                         &principal,
                         outcome
                             .mutation
@@ -210,10 +215,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                             .map(|rule| rule.created_by.as_str())
                             .unwrap_or(&outcome.mutation.entry.created_by)
                     )
-                ),
+                }),
             )?;
             let body = format_commit_outcome(&outcome);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("POST", "/v1/canary") => {
             let principal = match require_scope(&mut stream, &app, &request, "acl:write")? {
@@ -225,31 +230,35 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "canary",
                 "committed",
-                &format!(
-                    "op_id={} shard_id={} seq={} actor={}",
-                    canary.op_id,
-                    canary.shard_id,
-                    canary.seq,
-                    audit_actor(&principal, "globacl-commitd")
-                ),
+                json!({
+                    "op_id": canary.op_id.as_str(),
+                    "shard_id": canary.shard_id,
+                    "seq": canary.seq,
+                    "actor": audit_actor(&principal, "globacl-commitd")
+                }),
             )?;
             let body = format_canary_status(&canary);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/canary/latest") => {
             let latest = lock_canary(&app)?.clone();
             let body = latest
                 .as_ref()
                 .map(format_canary_status)
-                .unwrap_or_else(|| "status=none\n".to_owned());
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+                .unwrap_or_else(|| json!({"status": "none"}).to_string());
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/mutations") => {
             if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
-                let body = format!(
-                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
-                );
-                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                write_json_response(
+                    &mut stream,
+                    409,
+                    &json!({
+                        "status": "compacted",
+                        "reason": "history_compacted",
+                        "compacted_seq": compacted_seq
+                    }),
+                )?;
                 return Ok(());
             }
             let mutations = mutations_for_query(&app, &query)?;
@@ -258,37 +267,47 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/mutations.sig") => {
             if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
-                let body = format!(
-                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
-                );
-                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                write_json_response(
+                    &mut stream,
+                    409,
+                    &json!({
+                        "status": "compacted",
+                        "reason": "history_compacted",
+                        "compacted_seq": compacted_seq
+                    }),
+                )?;
                 return Ok(());
             }
             let mutations = mutations_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
             let body = sign_payload(&app, &payload)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/watermarks") => {
             let body = {
                 let state = lock_state(&app)?;
                 format_watermarks(state.watermarks())
             };
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/compaction_watermarks") => {
             let body = {
                 let state = lock_state(&app)?;
                 format_watermarks(state.compacted_watermarks())
             };
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/delta_bundle") => {
             if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
-                let body = format!(
-                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
-                );
-                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                write_json_response(
+                    &mut stream,
+                    409,
+                    &json!({
+                        "status": "compacted",
+                        "reason": "history_compacted",
+                        "compacted_seq": compacted_seq
+                    }),
+                )?;
                 return Ok(());
             }
             let mutations = delta_bundle_for_query(&app, &query)?;
@@ -297,16 +316,21 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/delta_bundle.sig") => {
             if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
-                let body = format!(
-                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
-                );
-                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                write_json_response(
+                    &mut stream,
+                    409,
+                    &json!({
+                        "status": "compacted",
+                        "reason": "history_compacted",
+                        "compacted_seq": compacted_seq
+                    }),
+                )?;
                 return Ok(());
             }
             let mutations = delta_bundle_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
             let body = sign_payload(&app, &payload)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/snapshot") => {
             let body = match fs::read(&app.snapshot_path) {
@@ -326,26 +350,28 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                     Err(_) => Vec::new(),
                 },
             };
-            write_http_response(&mut stream, 200, "text/plain", &body)?;
+            write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshot_manifest") => {
             ensure_latest_snapshot_manifest(&app)?;
             let body = fs::read(&app.snapshot_manifest_path)?;
-            write_http_response(&mut stream, 200, "text/plain", &body)?;
+            write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshot_manifest.sig") => {
             ensure_latest_snapshot_manifest(&app)?;
             let body = fs::read(signature_path(&app.snapshot_manifest_path))?;
-            write_http_response(&mut stream, 200, "text/plain", &body)?;
+            write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshot_artifact") => {
             let object = required_query(&query, "object")?;
             if !is_safe_snapshot_object_name(object) {
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=invalid_snapshot_object\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "invalid_snapshot_object"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -355,20 +381,22 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         ("GET", "/v1/snapshot_artifact.sig") => {
             let object = required_query(&query, "object")?;
             if !is_safe_snapshot_object_name(object) {
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=invalid_snapshot_object\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "invalid_snapshot_object"
+                    }),
                 )?;
                 return Ok(());
             }
             let body = fs::read(signature_path(app.snapshot_object_dir.join(object)))?;
-            write_http_response(&mut stream, 200, "text/plain", &body)?;
+            write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshots") => {
             let body = format_snapshot_list(&app.snapshot_dir)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("POST", "/v1/snapshot") => {
             let principal = match require_scope(&mut stream, &app, &request, "snapshot:write")? {
@@ -383,30 +411,32 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "snapshot",
                 "uploaded",
-                &format!(
-                    "snapshot={archive_name}.gacl actor={}",
-                    audit_actor(&principal, "unknown")
-                ),
+                json!({
+                    "snapshot": format!("{archive_name}.gacl"),
+                    "actor": audit_actor(&principal, "unknown")
+                }),
             )?;
-            write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
+            write_json_response(&mut stream, 200, &json!({"status": "ok"}))?;
         }
         ("POST", "/v1/rollback") => {
             let principal = match require_scope(&mut stream, &app, &request, "admin:rollback")? {
                 Some(principal) => principal,
                 None => return Ok(()),
             };
-            let form = parse_form_lines(&request.body)?;
-            let snapshot_name = form
+            let fields = parse_json_fields(&request.body)?;
+            let snapshot_name = fields
                 .get("snapshot")
                 .map(String::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| GlobAclError::Parse("missing required field snapshot".to_owned()))?;
             if !is_safe_snapshot_name(snapshot_name) {
-                write_http_response(
+                write_json_response(
                     &mut stream,
                     400,
-                    "text/plain",
-                    b"status=rejected\nreason=invalid_snapshot_name\n",
+                    &json!({
+                        "status": "rejected",
+                        "reason": "invalid_snapshot_name"
+                    }),
                 )?;
                 return Ok(());
             }
@@ -441,26 +471,33 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "rollback",
                 "committed",
-                &format!(
-                    "snapshot={} mutations={} actor={}",
-                    snapshot_name,
-                    mutations.len(),
-                    audit_actor(&principal, "unknown")
-                ),
+                json!({
+                    "snapshot": snapshot_name,
+                    "mutations": mutations.len(),
+                    "actor": audit_actor(&principal, "unknown")
+                }),
             )?;
-            let body = format!(
-                "status=ok\nsnapshot={}\nmutations={}\n",
-                snapshot_name,
-                mutations.len()
-            );
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "status": "ok",
+                    "snapshot": snapshot_name,
+                    "mutations": mutations.len()
+                }),
+            )?;
         }
         ("GET", "/v1/audit") => {
             if require_scope(&mut stream, &app, &request, "audit:read")?.is_none() {
                 return Ok(());
             }
-            let body = fs::read(&app.audit_path).unwrap_or_default();
-            write_http_response(&mut stream, 200, "text/plain", &body)?;
+            let audit = String::from_utf8_lossy(&fs::read(&app.audit_path).unwrap_or_default())
+                .into_owned();
+            let mut items = Vec::new();
+            for line in audit.lines().filter(|line| !line.trim().is_empty()) {
+                items.push(parse_json_body(line.as_bytes())?);
+            }
+            write_json_response(&mut stream, 200, &json!({"items": items}))?;
         }
         ("GET", "/v1/lookup") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -471,7 +508,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.lookup(tenant_id, namespace, key, now_unix())
             };
             let body = format_decision(&decision);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/check") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -487,10 +524,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.check(tenant_id, namespace, value, now_unix())
             };
             let body = format_decision(&decision);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         _ => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
     }
 

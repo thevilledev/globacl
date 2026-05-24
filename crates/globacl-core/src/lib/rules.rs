@@ -51,9 +51,13 @@ pub fn format_payload_signature_from_hex(
     signature_hex: &str,
 ) -> Result<String> {
     let signature = hex_encode(&decode_hex_array::<64>(signature_hex, "ed25519 signature")?);
-    Ok(format!(
-        "algorithm={SIGNATURE_ALGORITHM}\nkey_id={key_id}\nkey_version={key_version}\nsignature={signature}\n"
-    ))
+    Ok(json!({
+        "algorithm": SIGNATURE_ALGORITHM,
+        "key_id": key_id,
+        "key_version": key_version,
+        "signature": signature
+    })
+    .to_string())
 }
 
 pub fn verify_payload_signature(
@@ -70,15 +74,15 @@ pub fn verify_payload_signature(
 }
 
 pub fn parse_payload_signature(body: &[u8]) -> Result<SignatureEnvelope> {
-    let form = parse_form_lines(body)?;
-    let algorithm = required(&form, "algorithm")?;
-    let key_id = required(&form, "key_id")?;
+    let fields = parse_json_fields(body)?;
+    let algorithm = required(&fields, "algorithm")?;
+    let key_id = required(&fields, "key_id")?;
     let key_version = parse_u64(
-        form.get("key_version").map(String::as_str),
+        fields.get("key_version").map(String::as_str),
         0,
         "key_version",
     )?;
-    let signature = required(&form, "signature")?;
+    let signature = required(&fields, "signature")?;
     Ok(SignatureEnvelope {
         algorithm,
         key_id,
@@ -528,4 +532,3 @@ fn action_rank(action: Action) -> u8 {
         Action::Delete => 0,
     }
 }
-

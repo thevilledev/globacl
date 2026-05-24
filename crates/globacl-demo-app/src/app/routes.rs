@@ -4,8 +4,15 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
-            let body = format!("status=ok\n{}\n", app.lookup.description());
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "status": "ok",
+                    "lookup_mode": app.lookup.mode_name(),
+                    "lookup": app.lookup.description()
+                }),
+            )?;
         }
         ("GET", "/access") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -31,7 +38,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             )?;
         }
         _ => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
     }
 

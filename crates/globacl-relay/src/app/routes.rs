@@ -9,34 +9,42 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let ack_forward_status = lock_ack_forward_status(&app)?.clone();
             let status = if health.ok { "ok" } else { "degraded" };
             let upstream = if health.ok { "ok" } else { "bad" };
-            let body = format!(
-                "status={status}\nrole=relay\nrelay_id={}\nlocation={}\nsource={}\nupstream={upstream}\nupstream_addr={}\nack_count={ack_count}\nlast_ack_forward_unix={}\nack_forward_errors={}\n{}\n",
-                app.relay_id,
-                app.location,
-                app.source.kind(),
-                app.source.upstream_addr(),
-                ack_forward_status.last_ack_forward_unix,
-                ack_forward_status.ack_forward_errors,
-                health.details.trim_end()
-            );
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            let source_details = parse_json_body(health.details.as_bytes())
+                .unwrap_or_else(|_| json!({"parse_error": true}));
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "status": status,
+                    "role": "relay",
+                    "relay_id": app.relay_id.as_str(),
+                    "location": app.location.as_str(),
+                    "source": app.source.kind(),
+                    "upstream": upstream,
+                    "upstream_addr": app.source.upstream_addr(),
+                    "ack_count": ack_count,
+                    "last_ack_forward_unix": ack_forward_status.last_ack_forward_unix,
+                    "ack_forward_errors": ack_forward_status.ack_forward_errors,
+                    "source_details": source_details
+                }),
+            )?;
         }
         "GET" if route == "/metrics" => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
         "GET" if route == "/v1/acks" => {
             let body = format_acks(&app)?;
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         "POST" if route == "/v1/ack" => {
-            let form = parse_form_lines(&request.body)?;
-            let ack = propagation_ack_from_form(&app, &form)?;
+            let form = parse_json_fields(&request.body)?;
+            let ack = propagation_ack_from_json_fields(&app, &form)?;
             lock_acks(&app)?.insert(ack.key(), ack.clone());
             if let Err(err) = forward_ack(&app, &ack) {
                 eprintln!("central ack forward failed: {err}");
                 lock_ack_forward_status(&app)?.ack_forward_errors += 1;
             }
-            write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
+            write_json_response(&mut stream, 200, &json!({"status": "ok"}))?;
         }
         "GET" => {
             let upstream = app.source.get(&request.path)?;
@@ -49,12 +57,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         "POST" => {
             let upstream = app.source.post(&request.path, &request.body)?;
-            write_http_response(
-                &mut stream,
-                upstream.status_code,
-                "text/plain",
-                &upstream.body,
-            )?;
+            write_http_response(&mut stream, upstream.status_code, "application/json", &upstream.body)?;
         }
         method => {
             return Err(GlobAclError::Parse(format!(
@@ -69,7 +72,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 fn format_relay_metrics(app: &App) -> Result<String> {
     let health = app.source.health().unwrap_or_else(|_| SourceHealth {
         ok: false,
-        details: "source_error=1\n".to_owned(),
+        details: json!({"source_error": 1}).to_string(),
     });
     let ack_count = lock_acks(app)?.len();
     let ack_forward_status = lock_ack_forward_status(app)?.clone();
@@ -121,7 +124,7 @@ fn format_relay_metrics(app: &App) -> Result<String> {
         ack_forward_status.ack_forward_errors,
     );
 
-    if let Ok(fields) = parse_form_lines(health.details.as_bytes()) {
+    if let Ok(fields) = parse_json_fields(health.details.as_bytes()) {
         for key in [
             "http_status",
             "bootstrap_status",

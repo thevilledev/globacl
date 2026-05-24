@@ -1,10 +1,11 @@
 use globacl_core::{
     append_prometheus_metric, decode_mutation_stream, decode_snapshot, decode_snapshot_manifest,
-    encode_snapshot, format_decision, http_get, metrics_bind_addr_from_env, now_unix,
-    parse_form_lines, parse_query_path, parse_signature_public_keys, parse_watermarks,
+    encode_snapshot, format_decision, http_get, json, metrics_bind_addr_from_env, now_unix,
+    parse_json_fields, parse_query_path, parse_signature_public_keys, parse_watermarks,
     read_http_request, read_snapshot_file, spawn_prometheus_metrics_listener,
-    verify_payload_signature_with_verifier, write_http_response, write_snapshot_file, ActiveState,
-    ActiveStateHandle, ActiveStateStats, Decision, GlobAclError, PopAck, Result,
+    verify_payload_signature_with_verifier, write_http_response, write_json_response,
+    write_snapshot_file, ActiveState, ActiveStateHandle, ActiveStateStats, Decision, GlobAclError,
+    PopAck, Result,
     SignatureVerificationKey, SignatureVerifier, Snapshot, DEFAULT_SIGNATURE_KEY_ID,
     DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PUBLIC_KEY,
 };
@@ -174,7 +175,7 @@ pub fn start_embedded(config: AgentConfig) -> Result<AgentHandle> {
 pub fn serve_http(handle: &AgentHandle, bind_addr: &str) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
-        "globacl-agent listening on {bind_addr}; agent_id={}; relay_addr={}",
+        "globacl-agent listening on {bind_addr}; agent {}; relay {}",
         handle.app.agent_id, handle.app.relay_addr
     );
 

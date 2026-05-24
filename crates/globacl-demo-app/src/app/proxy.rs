@@ -43,17 +43,37 @@ fn resolve_acl_decision(
 }
 
 fn write_acl_decision(stream: &mut TcpStream, decision: Decision) -> Result<()> {
-    let denied = matches!(decision, Decision::Deny { .. });
-    let status = if denied { 403 } else { 200 };
-    let access = if denied { "denied" } else { "allowed" };
-    let mut body = format!("access={access}\n");
-    body.push_str(&format_decision(&decision));
-    write_http_response(stream, status, "text/plain", body.as_bytes())?;
-    Ok(())
+    match decision {
+        Decision::Allow => write_json_response(
+            stream,
+            200,
+            &json!({
+                "access": "allowed",
+                "decision": "allow"
+            }),
+        ),
+        Decision::Deny {
+            reason_code,
+            priority,
+            commit_id,
+        } => write_json_response(
+            stream,
+            403,
+            &json!({
+                "access": "denied",
+                "decision": "deny",
+                "reason_code": reason_code,
+                "priority": priority,
+                "shard_id": commit_id.shard_id,
+                "seq": commit_id.seq,
+                "epoch": commit_id.epoch
+            }),
+        ),
+    }
 }
 
 fn decision_from_response_body(body: &[u8]) -> Result<Decision> {
-    let form = parse_form_lines(body)?;
+    let form = parse_json_fields(body)?;
     if form.get("decision").map(String::as_str) != Some("deny") {
         return Ok(Decision::Allow);
     }

@@ -13,36 +13,40 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let state_lag_secs = now.saturating_sub(metrics.last_sync_unix);
             let stale = poll_lag_secs > app.stale_after_secs;
             let status = if stale { "stale" } else { "ok" };
-            let body = format!(
-                "status={status}\nrole=agent\nagent_id={}\nshard_count={}\nentries={}\nbase_entries={}\ndelta_adds={}\ndelta_removes={}\nbase_rules={}\ndelta_rule_adds={}\ndelta_rule_removes={}\nfilter_bits={}\nfilter_hashes={}\nestimated_state_bytes={}\nmax_seq={}\nlast_sync_unix={}\nlast_successful_poll_unix={}\nstate_lag_secs={}\npoll_lag_secs={}\nstale_after_secs={}\nstale={}\napplied_mutations={}\nrepairs={}\nbundle_repairs={}\nsnapshot_repairs={}\nlast_canary_key={}\nlast_canary_seq={}\nlast_canary_seen_unix={}\n",
-                app.agent_id,
-                state.shard_count(),
-                state.entries_len(),
-                stats.base_entries,
-                stats.delta_adds,
-                stats.delta_removes,
-                stats.base_rules,
-                stats.delta_rule_adds,
-                stats.delta_rule_removes,
-                stats.filter_bits,
-                stats.filter_hashes,
-                stats.estimated_bytes,
-                max_seq,
-                metrics.last_sync_unix,
-                metrics.last_successful_poll_unix,
-                state_lag_secs,
-                poll_lag_secs,
-                app.stale_after_secs,
-                stale,
-                metrics.applied_mutations,
-                metrics.repairs,
-                metrics.bundle_repairs,
-                metrics.snapshot_repairs,
-                metrics.last_canary_key,
-                metrics.last_canary_seq,
-                metrics.last_canary_seen_unix
-            );
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "status": status,
+                    "role": "agent",
+                    "agent_id": app.agent_id.as_str(),
+                    "shard_count": state.shard_count(),
+                    "entries": state.entries_len(),
+                    "base_entries": stats.base_entries,
+                    "delta_adds": stats.delta_adds,
+                    "delta_removes": stats.delta_removes,
+                    "base_rules": stats.base_rules,
+                    "delta_rule_adds": stats.delta_rule_adds,
+                    "delta_rule_removes": stats.delta_rule_removes,
+                    "filter_bits": stats.filter_bits,
+                    "filter_hashes": stats.filter_hashes,
+                    "estimated_state_bytes": stats.estimated_bytes,
+                    "max_seq": max_seq,
+                    "last_sync_unix": metrics.last_sync_unix,
+                    "last_successful_poll_unix": metrics.last_successful_poll_unix,
+                    "state_lag_secs": state_lag_secs,
+                    "poll_lag_secs": poll_lag_secs,
+                    "stale_after_secs": app.stale_after_secs,
+                    "stale": stale,
+                    "applied_mutations": metrics.applied_mutations,
+                    "repairs": metrics.repairs,
+                    "bundle_repairs": metrics.bundle_repairs,
+                    "snapshot_repairs": metrics.snapshot_repairs,
+                    "last_canary_key": metrics.last_canary_key.as_str(),
+                    "last_canary_seq": metrics.last_canary_seq,
+                    "last_canary_seen_unix": metrics.last_canary_seen_unix
+                }),
+            )?;
         }
         ("GET", "/v1/lookup") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -53,7 +57,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.lookup(tenant_id, namespace, key, now_unix())
             };
             let body = format_decision(&decision);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/check") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -69,7 +73,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 state.check(tenant_id, namespace, value, now_unix())
             };
             let body = format_decision(&decision);
-            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+            write_http_response(&mut stream, 200, "application/json", body.as_bytes())?;
         }
         ("GET", "/v1/snapshot") => {
             let snapshot = {
@@ -80,7 +84,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         _ => {
-            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+            write_json_response(&mut stream, 404, &json!({"error": "not_found"}))?;
         }
     }
 

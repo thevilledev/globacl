@@ -124,11 +124,15 @@ pub fn write_auth_failure_response(
     failure: AuthFailure,
     required_scope: &str,
 ) -> Result<()> {
-    let body = format!(
-        "status=rejected\nreason={}\nrequired_scope={required_scope}\n",
-        failure.reason()
-    );
-    write_http_response(stream, failure.status_code(), "text/plain", body.as_bytes())
+    write_json_response(
+        stream,
+        failure.status_code(),
+        &json!({
+            "status": "rejected",
+            "reason": failure.reason(),
+            "required_scope": required_scope
+        }),
+    )
 }
 
 fn sanitize_auth_identity(identity: &str) -> Result<String> {

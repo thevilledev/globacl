@@ -37,15 +37,19 @@ fn commit_canary(app: &App) -> Result<CanaryStatus> {
 }
 
 fn format_canary_status(status: &CanaryStatus) -> String {
-    format!(
-        "status=ok\nop_id={}\ntenant_id=globacl\nnamespace=canary\nkey={}\nshard_id={}\nseq={}\ncreated_at_unix={}\nexpires_at={}\ndelivery_priority=p0\n",
-        status.op_id,
-        status.key,
-        status.shard_id,
-        status.seq,
-        status.created_at_unix,
-        status.expires_at
-    )
+    json!({
+        "status": "ok",
+        "op_id": status.op_id.as_str(),
+        "tenant_id": "globacl",
+        "namespace": "canary",
+        "key": status.key.as_str(),
+        "shard_id": status.shard_id,
+        "seq": status.seq,
+        "created_at_unix": status.created_at_unix,
+        "expires_at": status.expires_at,
+        "delivery_priority": "p0"
+    })
+    .to_string()
 }
 
 fn lock_state(app: &App) -> Result<std::sync::MutexGuard<'_, SourceOfTruth>> {
@@ -102,11 +106,13 @@ fn requires_leader(method: &str, route: &str) -> bool {
 
 fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
-        write_http_response(
+        write_json_response(
             stream,
             503,
-            "text/plain",
-            b"status=unavailable\nreason=leader_not_configured\n",
+            &json!({
+                "status": "unavailable",
+                "reason": "leader_not_configured"
+            }),
         )?;
         return Ok(());
     };
@@ -115,23 +121,35 @@ fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest)
         .into_iter()
         .collect::<Vec<_>>();
     match globacl_core::http_get_with_headers(&leader_addr, &request.path, &headers) {
-        Ok(response) => {
-            write_http_response(stream, response.status_code, "text/plain", &response.body)
-        }
+        Ok(response) => write_http_response(
+            stream,
+            response.status_code,
+            "application/json",
+            &response.body,
+        ),
         Err(err) => {
-            let body = format!("status=unavailable\nreason=leader_proxy_failed\nerror={err}\n");
-            write_http_response(stream, 503, "text/plain", body.as_bytes())
+            write_json_response(
+                stream,
+                503,
+                &json!({
+                    "status": "unavailable",
+                    "reason": "leader_proxy_failed",
+                    "error": err.to_string()
+                }),
+            )
         }
     }
 }
 
 fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
-        write_http_response(
+        write_json_response(
             stream,
             503,
-            "text/plain",
-            b"status=unavailable\nreason=leader_not_configured\n",
+            &json!({
+                "status": "unavailable",
+                "reason": "leader_not_configured"
+            }),
         )?;
         return Ok(());
     };
@@ -141,11 +159,23 @@ fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, request: &HttpReques
         .collect::<Vec<_>>();
     match http_post_with_headers(&leader_addr, &request.path, &request.body, &headers) {
         Ok(response) => {
-            write_http_response(stream, response.status_code, "text/plain", &response.body)?;
+            write_http_response(
+                stream,
+                response.status_code,
+                "application/json",
+                &response.body,
+            )?;
         }
         Err(err) => {
-            let body = format!("status=unavailable\nreason=leader_proxy_failed\nerror={err}\n");
-            write_http_response(stream, 503, "text/plain", body.as_bytes())?;
+            write_json_response(
+                stream,
+                503,
+                &json!({
+                    "status": "unavailable",
+                    "reason": "leader_proxy_failed",
+                    "error": err.to_string()
+                }),
+            )?;
         }
     }
     Ok(())
@@ -423,9 +453,9 @@ fn load_consensus_state(path: &Path, replication: &ReplicationConfig) -> Result<
     let mut current_term = 0u64;
     let mut voted_for = None;
     if path.exists() {
-        let form = parse_form_lines(&fs::read(path)?)?;
-        current_term = parse_form_u64(&form, "current_term", 0)?;
-        voted_for = form
+        let fields = parse_json_fields(&fs::read(path)?)?;
+        current_term = parse_json_u64(&fields, "current_term", 0)?;
+        voted_for = fields
             .get("voted_for")
             .map(String::to_owned)
             .filter(|value| !value.is_empty());
@@ -466,11 +496,13 @@ fn persist_consensus_state(path: &Path, consensus: &ConsensusState) -> Result<()
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        write!(
-            file,
-            "current_term={}\nvoted_for={}\n",
-            consensus.current_term,
-            consensus.voted_for.as_deref().unwrap_or("")
+        file.write_all(
+            json!({
+                "current_term": consensus.current_term,
+                "voted_for": consensus.voted_for.as_deref().unwrap_or("")
+            })
+            .to_string()
+            .as_bytes(),
         )?;
         file.sync_all()?;
     }
@@ -506,7 +538,7 @@ fn now_unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn required_form<'a>(
+fn required_json_field<'a>(
     form: &'a std::collections::HashMap<String, String>,
     key: &str,
 ) -> Result<&'a str> {
@@ -516,7 +548,7 @@ fn required_form<'a>(
         .ok_or_else(|| GlobAclError::Parse(format!("missing required field {key}")))
 }
 
-fn parse_form_u64(
+fn parse_json_u64(
     form: &std::collections::HashMap<String, String>,
     key: &str,
     default: u64,
@@ -527,7 +559,7 @@ fn parse_form_u64(
         .map(|value| value.unwrap_or(default))
 }
 
-fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) -> bool {
+fn json_bool(form: &std::collections::HashMap<String, String>, key: &str) -> bool {
     form.get(key)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)

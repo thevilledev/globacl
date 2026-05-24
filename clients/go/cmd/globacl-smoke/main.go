@@ -132,7 +132,16 @@ func deny(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("committed shard_id=%d seq=%d duplicate=%v\n", outcome.ShardId, outcome.Seq, outcome.Duplicate)
+	encoded, err := json.Marshal(map[string]any{
+		"status":    "committed",
+		"shard_id":  outcome.ShardId,
+		"seq":       outcome.Seq,
+		"duplicate": outcome.Duplicate,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(encoded))
 	return nil
 }
 

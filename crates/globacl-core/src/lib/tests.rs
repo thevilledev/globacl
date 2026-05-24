@@ -395,9 +395,9 @@ mod tests {
             payload,
         )
         .unwrap();
-        assert!(formatted.contains("algorithm=ed25519"));
-        assert!(formatted.contains("key_id=dev-ed25519"));
-        assert!(formatted.contains("key_version=1"));
+        assert!(formatted.contains(r#""algorithm":"ed25519""#));
+        assert!(formatted.contains(r#""key_id":"dev-ed25519""#));
+        assert!(formatted.contains(r#""key_version":1"#));
     }
 
     #[test]
@@ -419,9 +419,9 @@ mod tests {
         );
 
         let formatted = format_payload_signature("custom-ed25519", private_key, &payload).unwrap();
-        assert!(formatted.contains("algorithm=ed25519"));
-        assert!(formatted.contains("key_id=custom-ed25519"));
-        assert!(formatted.contains("key_version=1"));
+        assert!(formatted.contains(r#""algorithm":"ed25519""#));
+        assert!(formatted.contains(r#""key_id":"custom-ed25519""#));
+        assert!(formatted.contains(r#""key_version":1"#));
         assert!(formatted.contains(expected_signature));
     }
 
@@ -607,25 +607,25 @@ mod tests {
 
     #[test]
     fn pop_ack_parses_and_formats() {
-        let form = parse_form_lines(
-            b"agent_id=pop-a\nshard_id=7\nseq=42\nentries=12\napplied_at_unix=1000\n",
+        let form = parse_json_fields(
+            br#"{"agent_id":"pop-a","shard_id":7,"seq":42,"entries":12,"applied_at_unix":1000}"#,
         )
         .unwrap();
-        let ack = PopAck::from_form(&form).unwrap();
+        let ack = PopAck::from_json_fields(&form).unwrap();
 
         assert_eq!(ack.agent_id, "pop-a");
         assert_eq!(ack.shard_id, 7);
         assert_eq!(ack.seq, 42);
-        assert!(ack.to_form_body().contains("agent_id=pop-a"));
+        assert!(ack.to_json_body().contains(r#""agent_id":"pop-a""#));
     }
 
     #[test]
     fn propagation_ack_parses_and_formats() {
-        let form = parse_form_lines(
-            b"relay_id=relay-a\nlocation=region-a\nagent_id=pop-a\nshard_id=7\nseq=42\nentries=12\napplied_at_unix=1000\nrelay_received_at_unix=1001\n",
+        let form = parse_json_fields(
+            br#"{"relay_id":"relay-a","location":"region-a","agent_id":"pop-a","shard_id":7,"seq":42,"entries":12,"applied_at_unix":1000,"relay_received_at_unix":1001}"#,
         )
         .unwrap();
-        let ack = PropagationAck::from_form(&form).unwrap();
+        let ack = PropagationAck::from_json_fields(&form).unwrap();
 
         assert_eq!(ack.relay_id, "relay-a");
         assert_eq!(ack.location, "region-a");
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(ack.shard_id, 7);
         assert_eq!(ack.seq, 42);
         assert_eq!(ack.key(), "relay-a:pop-a:7");
-        assert!(ack.to_form_body().contains("relay_id=relay-a"));
+        assert!(ack.to_json_body().contains(r#""relay_id":"relay-a""#));
     }
 
     #[test]

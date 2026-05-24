@@ -143,7 +143,7 @@ pub fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> Vec<u8> {
 }
 
 pub fn decode_snapshot_manifest(bytes: &[u8]) -> Result<SnapshotManifest> {
-    let form = parse_form_lines(bytes)?;
+    let form = parse_json_fields(bytes)?;
     let shard_count = parse_u16_manifest(&form, "shard_count")?;
     let mut watermarks = Vec::with_capacity(shard_count as usize);
     for shard_id in 0..shard_count {

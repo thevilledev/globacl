@@ -87,8 +87,8 @@ mod tests {
     }
 
     fn response_bool(body: &str, key: &str) -> bool {
-        let form = parse_form_lines(body.as_bytes()).expect("parse response form");
-        form_bool(&form, key)
+        let form = parse_json_fields(body.as_bytes()).expect("parse response form");
+        json_bool(&form, key)
     }
 
     fn deny_request(op_id: &str, key: &str) -> DenyRequest {
@@ -758,7 +758,8 @@ mod tests {
             std::process::id(),
             now_unix_millis()
         ));
-        let follower_path = root.join("follower").join("propagation_acks.log");
+        let follower =
+            consensus_test_app(&root.join("follower"), "node-b", ConsensusRole::Follower, 1);
         let first = PropagationAck {
             relay_id: "relay-a".to_owned(),
             location: "region-a".to_owned(),
@@ -776,24 +777,46 @@ mod tests {
             relay_received_at_unix: 1003,
             ..first.clone()
         };
-        let snapshot = format!(
-            "{}\n{}\n",
-            format_propagation_ack_log_line(&first),
-            format_propagation_ack_log_line(&second)
-        );
+        let snapshot = json!({
+            "acks": [
+                propagation_ack_json(&first),
+                propagation_ack_json(&second)
+            ]
+        })
+        .to_string();
 
-        let mut follower_acks = HashMap::new();
-        for line in snapshot.lines().filter(|line| !line.trim().is_empty()) {
-            let ack = parse_propagation_ack_log_line(line).expect("parse ack snapshot line");
-            apply_propagation_ack_to_store(&follower_path, &mut follower_acks, ack)
-                .expect("apply ack snapshot line");
-        }
+        apply_propagation_ack_log_snapshot(&follower, snapshot.as_bytes())
+            .expect("apply ack snapshot");
 
-        let loaded = load_propagation_acks(&follower_path).expect("load follower acks");
-        assert_eq!(follower_acks.len(), 1);
+        let loaded = load_propagation_acks(&follower.propagation_acks_path)
+            .expect("load follower acks");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(&second.key()).expect("ack").seq, 42);
 
         std::fs::remove_dir_all(root).expect("remove temp ack snapshot dir");
+    }
+
+    #[test]
+    fn empty_propagation_ack_snapshot_is_json_array() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-empty-ack-snapshot-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 1);
+
+        let snapshot = format_propagation_ack_log_snapshot(&app).expect("format empty snapshot");
+        let value = parse_json_body(snapshot.as_bytes()).expect("parse empty snapshot JSON");
+        assert_eq!(
+            value.get("acks").and_then(JsonValue::as_array).map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            apply_propagation_ack_log_snapshot(&app, snapshot.as_bytes())
+                .expect("apply empty snapshot"),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

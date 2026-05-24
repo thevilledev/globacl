@@ -1,4 +1,4 @@
-use globacl_core::{http_get, http_post, parse_form_lines, parse_watermarks};
+use globacl_core::{http_get, http_post, parse_json_fields, parse_watermarks};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -47,9 +47,9 @@ fn isolated_leader_cannot_commit_while_majority_side_elects_and_commits() {
     .expect("majority leader commit request should receive a response");
     assert_eq!(committed.status_code, 200, "{}", body_text(&committed.body));
 
-    let form = parse_form_lines(&committed.body).expect("commit response should be form lines");
-    let shard_id = parse_form_usize(&form, "shard_id");
-    let seq = parse_form_u64(&form, "seq");
+    let form = parse_json_fields(&committed.body).expect("commit response should be JSON");
+    let shard_id = parse_json_usize(&form, "shard_id");
+    let seq = parse_json_u64(&form, "seq");
     assert_eq!(seq, 1);
 
     wait_for_watermark_at_least(cluster.addr(NODE_B), shard_id, seq);
@@ -369,7 +369,7 @@ fn assert_all_watermarks_zero(addr: &str) {
 fn health(addr: &str) -> Option<HashMap<String, String>> {
     let response = http_get(addr, "/health").ok()?;
     (response.status_code == 200).then_some(())?;
-    parse_form_lines(&response.body).ok()
+    parse_json_fields(&response.body).ok()
 }
 
 fn watermarks(addr: &str) -> Option<Vec<u64>> {
@@ -393,19 +393,41 @@ fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
 }
 
 fn deny_body(op_id: &str, key: &str) -> String {
-    format!(
-        "op_id={op_id}\ntenant_id=tenant-a\nnamespace=user\nkey={key}\naction=deny\ncreated_by=partition-test\nreason_code=partition\n"
-    )
+    json_body(&[
+        ("op_id", op_id),
+        ("tenant_id", "tenant-a"),
+        ("namespace", "user"),
+        ("key", key),
+        ("action", "deny"),
+        ("created_by", "partition-test"),
+        ("reason_code", "partition"),
+    ])
 }
 
-fn parse_form_usize(form: &HashMap<String, String>, field: &str) -> usize {
+fn json_body(fields: &[(&str, &str)]) -> String {
+    let mut body = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push('"');
+        body.push_str(key);
+        body.push_str("\":\"");
+        body.push_str(value);
+        body.push('"');
+    }
+    body.push('}');
+    body
+}
+
+fn parse_json_usize(form: &HashMap<String, String>, field: &str) -> usize {
     form.get(field)
         .unwrap_or_else(|| panic!("missing field {field}"))
         .parse()
         .unwrap_or_else(|err| panic!("invalid {field}: {err}"))
 }
 
-fn parse_form_u64(form: &HashMap<String, String>, field: &str) -> u64 {
+fn parse_json_u64(form: &HashMap<String, String>, field: &str) -> u64 {
     form.get(field)
         .unwrap_or_else(|| panic!("missing field {field}"))
         .parse()

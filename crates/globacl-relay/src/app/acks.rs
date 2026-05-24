@@ -38,7 +38,7 @@ fn forward_ack(app: &App, ack: &PropagationAck) -> Result<()> {
     let response = http_post(
         app.source.upstream_addr(),
         "/v1/ack",
-        ack.to_form_body().as_bytes(),
+        ack.to_json_body().as_bytes(),
     )?;
     if response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(
@@ -51,11 +51,11 @@ fn forward_ack(app: &App, ack: &PropagationAck) -> Result<()> {
     Ok(())
 }
 
-fn propagation_ack_from_form(app: &App, form: &HashMap<String, String>) -> Result<PropagationAck> {
+fn propagation_ack_from_json_fields(app: &App, form: &HashMap<String, String>) -> Result<PropagationAck> {
     if form.contains_key("relay_id") {
-        return PropagationAck::from_form(form);
+        return PropagationAck::from_json_fields(form);
     }
-    let ack = PopAck::from_form(form)?;
+    let ack = PopAck::from_json_fields(form)?;
     Ok(PropagationAck::from_pop_ack(
         &app.relay_id,
         &app.location,

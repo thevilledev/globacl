@@ -479,10 +479,10 @@ type SignatureEnvelopeAlgorithm string
 
 // SnapshotListResponse defines model for SnapshotListResponse.
 type SnapshotListResponse struct {
-	Manifest      *SnapshotNameOrList `json:"manifest,omitempty"`
-	ManifestCount int64               `json:"manifest_count"`
-	Snapshot      *SnapshotNameOrList `json:"snapshot,omitempty"`
-	SnapshotCount int64               `json:"snapshot_count"`
+	ManifestCount int64    `json:"manifest_count"`
+	Manifests     []string `json:"manifests"`
+	SnapshotCount int64    `json:"snapshot_count"`
+	Snapshots     []string `json:"snapshots"`
 }
 
 // SnapshotManifestResponse defines model for SnapshotManifestResponse.
@@ -503,17 +503,6 @@ type SnapshotManifestResponse struct {
 	RuleCount  int64    `json:"rule_count"`
 	ShardCount int32    `json:"shard_count"`
 }
-
-// SnapshotNameOrList defines model for SnapshotNameOrList.
-type SnapshotNameOrList struct {
-	union json.RawMessage
-}
-
-// SnapshotNameOrList0 defines model for .
-type SnapshotNameOrList0 = string
-
-// SnapshotNameOrList1 defines model for .
-type SnapshotNameOrList1 = []string
 
 // StatusResponse defines model for StatusResponse.
 type StatusResponse struct {
@@ -1360,68 +1349,6 @@ func (t LatestCanaryResponse) MarshalJSON() ([]byte, error) {
 }
 
 func (t *LatestCanaryResponse) UnmarshalJSON(b []byte) error {
-	err := t.union.UnmarshalJSON(b)
-	return err
-}
-
-// AsSnapshotNameOrList0 returns the union data inside the SnapshotNameOrList as a SnapshotNameOrList0
-func (t SnapshotNameOrList) AsSnapshotNameOrList0() (SnapshotNameOrList0, error) {
-	var body SnapshotNameOrList0
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromSnapshotNameOrList0 overwrites any union data inside the SnapshotNameOrList as the provided SnapshotNameOrList0
-func (t *SnapshotNameOrList) FromSnapshotNameOrList0(v SnapshotNameOrList0) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeSnapshotNameOrList0 performs a merge with any union data inside the SnapshotNameOrList, using the provided SnapshotNameOrList0
-func (t *SnapshotNameOrList) MergeSnapshotNameOrList0(v SnapshotNameOrList0) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-// AsSnapshotNameOrList1 returns the union data inside the SnapshotNameOrList as a SnapshotNameOrList1
-func (t SnapshotNameOrList) AsSnapshotNameOrList1() (SnapshotNameOrList1, error) {
-	var body SnapshotNameOrList1
-	err := json.Unmarshal(t.union, &body)
-	return body, err
-}
-
-// FromSnapshotNameOrList1 overwrites any union data inside the SnapshotNameOrList as the provided SnapshotNameOrList1
-func (t *SnapshotNameOrList) FromSnapshotNameOrList1(v SnapshotNameOrList1) error {
-	b, err := json.Marshal(v)
-	t.union = b
-	return err
-}
-
-// MergeSnapshotNameOrList1 performs a merge with any union data inside the SnapshotNameOrList, using the provided SnapshotNameOrList1
-func (t *SnapshotNameOrList) MergeSnapshotNameOrList1(v SnapshotNameOrList1) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	merged, err := runtime.JSONMerge(t.union, b)
-	t.union = merged
-	return err
-}
-
-func (t SnapshotNameOrList) MarshalJSON() ([]byte, error) {
-	b, err := t.union.MarshalJSON()
-	return b, err
-}
-
-func (t *SnapshotNameOrList) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
 	return err
 }
