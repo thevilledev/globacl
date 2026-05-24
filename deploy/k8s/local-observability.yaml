@@ -1,0 +1,590 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: globacl
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: globacl-signature
+  namespace: globacl
+type: Opaque
+stringData:
+  key_id: dev-ed25519
+  private_key: 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+  public_key: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-commitd-peer
+  namespace: globacl
+spec:
+  clusterIP: None
+  selector:
+    app: globacl-commitd
+  ports:
+    - name: http
+      port: 7003
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: globacl-commitd
+  namespace: globacl
+spec:
+  serviceName: globacl-commitd-peer
+  replicas: 3
+  selector:
+    matchLabels:
+      app: globacl-commitd
+  podManagementPolicy: Parallel
+  template:
+    metadata:
+      labels:
+        app: globacl-commitd
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9103"
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: commitd
+          image: ghcr.io/thevilledev/globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-commitd"]
+          args: ["/data/commitd", "0.0.0.0:7003", "64", "0"]
+          env:
+            - name: GLOBACL_COMMITD_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GLOBACL_COMMITD_CLUSTER_ID
+              value: globacl-local-observability
+            - name: GLOBACL_COMMITD_INITIAL_LEADER_ID
+              value: globacl-commitd-0
+            - name: GLOBACL_COMMITD_QUORUM
+              value: "2"
+            - name: GLOBACL_COMMITD_HEARTBEAT_MS
+              value: "250"
+            - name: GLOBACL_COMMITD_ELECTION_MS
+              value: "1200"
+            - name: GLOBACL_COMMITD_SYNC_MS
+              value: "500"
+            - name: GLOBACL_COMMITD_PEERS
+              value: >-
+                globacl-commitd-0=globacl-commitd-0.globacl-commitd-peer.globacl.svc.cluster.local:7003,
+                globacl-commitd-1=globacl-commitd-1.globacl-commitd-peer.globacl.svc.cluster.local:7003,
+                globacl-commitd-2=globacl-commitd-2.globacl-commitd-peer.globacl.svc.cluster.local:7003
+            - name: GLOBACL_SIGNATURE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: key_id
+            - name: GLOBACL_SIGNATURE_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: private_key
+            - name: GLOBACL_COMMITD_METRICS_ADDR
+              value: "0.0.0.0:9103"
+          ports:
+            - containerPort: 7003
+              name: http
+            - containerPort: 9103
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-commitd
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-commitd
+  ports:
+    - name: http
+      port: 7003
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-control
+  namespace: globacl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: globacl-control
+  template:
+    metadata:
+      labels:
+        app: globacl-control
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: control
+          image: ghcr.io/thevilledev/globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-control"]
+          args:
+            - "globacl-commitd.globacl.svc.cluster.local:7003"
+            - "0.0.0.0:7000"
+          env:
+            - name: GLOBACL_CONTROL_METRICS_ADDR
+              value: "0.0.0.0:9100"
+          ports:
+            - containerPort: 7000
+              name: http
+            - containerPort: 9100
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-control
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-control
+  ports:
+    - name: http
+      port: 7000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-relay
+  namespace: globacl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: globacl-relay
+  template:
+    metadata:
+      labels:
+        app: globacl-relay
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9101"
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: relay
+          image: ghcr.io/thevilledev/globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-relay"]
+          args:
+            - "globacl-control.globacl.svc.cluster.local:7000"
+            - "0.0.0.0:7001"
+            - "$(POD_NAME)"
+            - "local-observability"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GLOBACL_ACK_FORWARD_MS
+              value: "1000"
+            - name: GLOBACL_SIGNATURE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: key_id
+            - name: GLOBACL_SIGNATURE_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: private_key
+            - name: GLOBACL_RELAY_METRICS_ADDR
+              value: "0.0.0.0:9101"
+          ports:
+            - containerPort: 7001
+              name: http
+            - containerPort: 9101
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-relay
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-relay
+  ports:
+    - name: http
+      port: 7001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-agent
+  namespace: globacl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: globacl-agent
+  template:
+    metadata:
+      labels:
+        app: globacl-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9102"
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: agent
+          image: ghcr.io/thevilledev/globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-agent"]
+          args:
+            - "globacl-relay.globacl.svc.cluster.local:7001"
+            - "0.0.0.0:7002"
+            - "/data/agent/latest.gacl"
+            - "500"
+            - "$(POD_NAME)"
+            - "60"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GLOBACL_SIGNATURE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: key_id
+            - name: GLOBACL_SIGNATURE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: public_key
+            - name: GLOBACL_AGENT_METRICS_ADDR
+              value: "0.0.0.0:9102"
+          ports:
+            - containerPort: 7002
+              name: http
+            - containerPort: 9102
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-agent
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-agent
+  ports:
+    - name: http
+      port: 7002
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-demo
+  namespace: globacl
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: globacl-demo
+  template:
+    metadata:
+      labels:
+        app: globacl-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9180"
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: demo
+          image: ghcr.io/thevilledev/globacl:ci
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/globacl-demo-app"]
+          args:
+            - "globacl-agent.globacl.svc.cluster.local:7002"
+            - "0.0.0.0:8080"
+          env:
+            - name: GLOBACL_DEMO_METRICS_ADDR
+              value: "0.0.0.0:9180"
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9180
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-demo
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: globacl-prometheus
+  namespace: globacl
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: globacl-prometheus
+  namespace: globacl
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: globacl-prometheus
+  namespace: globacl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: globacl-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: globacl-prometheus
+    namespace: globacl
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: globacl-prometheus-config
+  namespace: globacl
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+
+    scrape_configs:
+      - job_name: globacl-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - globacl
+        relabel_configs:
+          - source_labels:
+              - __meta_kubernetes_pod_annotation_prometheus_io_scrape
+            action: keep
+            regex: "true"
+          - source_labels:
+              - __meta_kubernetes_pod_container_port_name
+            action: keep
+            regex: metrics
+          - source_labels:
+              - __meta_kubernetes_pod_ip
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            separator: ":"
+            target_label: __address__
+          - source_labels:
+              - __meta_kubernetes_pod_annotation_prometheus_io_path
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              - __meta_kubernetes_namespace
+            target_label: namespace
+          - source_labels:
+              - __meta_kubernetes_pod_name
+            target_label: pod
+          - source_labels:
+              - __meta_kubernetes_pod_label_app
+            target_label: component
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: globacl-prometheus-rules
+  namespace: globacl
+data:
+  globacl.rules.yaml: |
+    groups:
+      - name: globacl.local
+        rules:
+          - alert: GlobaclCommitdNoWriteLeader
+            expr: sum(globacl_commitd_write_authority) < 1
+            for: 30s
+            labels:
+              severity: critical
+            annotations:
+              summary: globacl commitd has no write leader
+          - alert: GlobaclAgentStale
+            expr: max(globacl_agent_stale) > 0
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: one or more globacl agents are stale
+          - alert: GlobaclRelaySourceDown
+            expr: max(1 - globacl_relay_source_up) > 0
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: one or more globacl relays cannot reach their source
+          - alert: GlobaclPublisherErrors
+            expr: increase(globacl_commitd_publish_errors_total[5m]) > 0
+            for: 0s
+            labels:
+              severity: warning
+            annotations:
+              summary: commitd publisher errors increased
+          - alert: GlobaclMetricsTargetDown
+            expr: up{job="globacl-pods"} == 0
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: a globacl metrics target is down
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-prometheus
+  namespace: globacl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: globacl-prometheus
+  template:
+    metadata:
+      labels:
+        app: globacl-prometheus
+    spec:
+      serviceAccountName: globacl-prometheus
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.listen-address=0.0.0.0:9090"
+          ports:
+            - containerPort: 9090
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: globacl-prometheus-config
+        - name: rules
+          configMap:
+            name: globacl-prometheus-rules
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-prometheus
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

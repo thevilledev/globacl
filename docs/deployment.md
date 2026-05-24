@@ -56,6 +56,52 @@ The script:
 6. Calls the demo app until it returns `"access": "denied"`.
 ```
 
+## Local Observability Topology
+
+Use this when you want one local cluster that looks closer to the production
+component shape and proves scrape-based observability:
+
+```text
+one k3s cluster
+  globacl-commitd StatefulSet replicas=3
+  globacl-control Deployment replicas=3
+  globacl-relay   Deployment replicas=3
+  globacl-agent   Deployment replicas=3
+  globacl-demo    Deployment replicas=3
+  prometheus      Deployment replicas=1
+```
+
+The Prometheus deployment discovers pods in the `globacl` namespace through
+pod annotations and scrapes only the dedicated metrics listeners. The
+client-facing Services still expose only application ports.
+
+Manifest:
+
+```text
+deploy/k8s/local-observability.yaml
+```
+
+Run it in CI or locally with k3d:
+
+```sh
+./deploy/k3s/observability-smoke.sh
+```
+
+The script:
+
+```text
+1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
+2. Creates one k3d-backed k3s cluster with two worker agents.
+3. Imports the image into the cluster.
+4. Deploys the three-node commitd quorum, three control pods, three relays,
+   three agents, three demo apps, and Prometheus.
+5. Commits a P0 deny to control.
+6. Calls the demo app until it returns `"access": "denied"`.
+7. Waits for central ack aggregation from all three agents.
+8. Queries Prometheus for discovered scrape targets, commit leadership, relay
+   source health, agent entries, applied mutations, and central ack counts.
+```
+
 ## Global Topology
 
 Use this to demonstrate the intended production shape with one central source of truth and three independent regions:
@@ -127,7 +173,9 @@ It supports:
 
 ```text
 local
+jetstream
 global
+observability
 all
 ```
 
@@ -143,6 +191,7 @@ CLUSTER=globacl-local
 CENTRAL_CLUSTER=globacl-central
 REGIONS="region-a region-b region-c"
 CONTROL_UPSTREAM=<optional-control-hostport>
+PROMETHEUS_PORT=19090
 KEEP_CLUSTER=1
 KEEP_CLUSTERS=1
 ```

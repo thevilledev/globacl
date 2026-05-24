@@ -12,6 +12,7 @@ on:
           - local
           - jetstream
           - global
+          - observability
           - all
 
 permissions:
@@ -81,3 +82,23 @@ jobs:
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
       - name: Run global k3s smoke
         run: ./deploy/k3s/global-smoke.sh
+
+  observability:
+    if: ${{ inputs.suite == 'observability' || inputs.suite == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+      - name: Run observability k3s smoke
+        run: ./deploy/k3s/observability-smoke.sh

@@ -83,9 +83,19 @@ Run k3d-backed k3s smoke tests:
 ./deploy/k3s/local-smoke.sh
 ./deploy/k3s/jetstream-smoke.sh
 ./deploy/k3s/global-smoke.sh
+./deploy/k3s/observability-smoke.sh
 ```
 
-The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The JetStream smoke uses the same local shape, adds NATS JetStream, enables commitd publishing, switches the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app observes a deny through the agent. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
+The local smoke deploys one commitd, one control gateway, one relay, one
+agent, and one demo app in a single k3s cluster. The JetStream smoke uses the
+same local shape, adds NATS JetStream, enables commitd publishing, switches
+the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app
+observes a deny through the agent. The global smoke deploys a three-replica
+central commitd StatefulSet with persistent volumes, stateless central control
+gateways, plus three regional k3s clusters with HA relays and demo apps. The
+observability smoke deploys a three-replica local control plane, three relays,
+three agents, three demo apps, and Prometheus, then asserts scrape discovery
+and live propagation metrics after a deny.
 
 The smoke scripts use the Go client smoke runner in `clients/go/cmd/globacl-smoke` for API operations and assertions, so they exercise the generated client model surface instead of shell JSON parsing.
 If a smoke environment enables `GLOBACL_AUTH_TOKENS`, export

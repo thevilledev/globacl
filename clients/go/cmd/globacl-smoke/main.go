@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: globacl-smoke <wait-health|require-health-fields|deny|wait-demo-deny|wait-propagation>")
+		fatalf("usage: globacl-smoke <wait-health|require-health-fields|deny|wait-demo-deny|wait-propagation|wait-prometheus-query>")
 	}
 
 	var err error
@@ -32,6 +33,8 @@ func main() {
 		err = waitDemoDeny(os.Args[2:])
 	case "wait-propagation":
 		err = waitPropagation(os.Args[2:])
+	case "wait-prometheus-query":
+		err = waitPrometheusQuery(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -202,6 +205,124 @@ func waitPropagation(args []string) error {
 		return fmt.Errorf("%w: last propagation status %s", err, encoded)
 	}
 	return err
+}
+
+func waitPrometheusQuery(args []string) error {
+	flags := flag.NewFlagSet("wait-prometheus-query", flag.ExitOnError)
+	baseURL := flags.String("base-url", "", "Prometheus base URL")
+	query := flags.String("query", "", "Prometheus instant query")
+	minimum := flags.Float64("min", 1, "minimum accepted value")
+	timeout := flags.Duration("timeout", 120*time.Second, "wait timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	normalized, err := normalizeBaseURL(*baseURL)
+	if err != nil {
+		return err
+	}
+	queryValue := requireValue("query", *query)
+
+	var lastErr error
+	var lastValue float64
+	var sawValue bool
+	err = waitUntil(*timeout, func(ctx context.Context) (bool, error) {
+		value, ok, err := prometheusInstantValue(ctx, normalized, queryValue)
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+		if ok {
+			lastValue = value
+			sawValue = true
+		}
+		return ok && value >= *minimum, nil
+	})
+	if err == nil {
+		return nil
+	}
+	if sawValue {
+		return fmt.Errorf(
+			"%w: last value %.6g for query %q was below %.6g",
+			err,
+			lastValue,
+			queryValue,
+			*minimum,
+		)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%w: last Prometheus error: %v", err, lastErr)
+	}
+	return fmt.Errorf("%w: query %q returned no samples", err, queryValue)
+}
+
+func prometheusInstantValue(ctx context.Context, baseURL string, query string) (float64, bool, error) {
+	params := url.Values{}
+	params.Set("query", query)
+	endpoint := baseURL + "/api/v1/query?" + params.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0, false, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return 0, false, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return 0, false, fmt.Errorf("Prometheus query returned HTTP %d: %s", response.StatusCode, body)
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+		Data   struct {
+			Result []struct {
+				Value []json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, false, err
+	}
+	if payload.Status != "success" {
+		if strings.TrimSpace(payload.Error) == "" {
+			return 0, false, fmt.Errorf("Prometheus query status %q", payload.Status)
+		}
+		return 0, false, fmt.Errorf("Prometheus query status %q: %s", payload.Status, payload.Error)
+	}
+
+	var maxValue float64
+	sawValue := false
+	for _, result := range payload.Data.Result {
+		if len(result.Value) < 2 {
+			continue
+		}
+		value, err := prometheusSampleValue(result.Value[1])
+		if err != nil {
+			return 0, false, err
+		}
+		if !sawValue || value > maxValue {
+			maxValue = value
+			sawValue = true
+		}
+	}
+	return maxValue, sawValue, nil
+}
+
+func prometheusSampleValue(raw json.RawMessage) (float64, error) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strconv.ParseFloat(text, 64)
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 func newClient(baseURL string) (*globacl.Client, error) {
