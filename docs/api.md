@@ -80,6 +80,14 @@ sync_errors=...
 
 Commitd followers proxy write requests to the elected leader. The leader assigns the per-shard sequence and only makes the mutation locally visible after a quorum of commit peers prepares it.
 
+Commitd exposes the current compacted mutation-log floor:
+
+```text
+GET /v1/compaction_watermarks
+```
+
+The response uses the same format as `/v1/watermarks`. If a caller asks `/v1/mutations` or `/v1/delta_bundle` for a `from_seq` older than the compacted floor for that shard, commitd returns `409` with `reason=history_compacted`; agents and relays should repair from `/v1/snapshot`.
+
 The demo consumer app exposes:
 
 ```text

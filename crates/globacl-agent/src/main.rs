@@ -240,6 +240,10 @@ fn poll_once(app: &Arc<App>) -> Result<()> {
         }
         let path = format!("/v1/mutations?shard={shard_id}&from_seq={from_seq}");
         let response = http_get(&app.relay_addr, &path)?;
+        if response.status_code == 409 || response.status_code == 410 {
+            repair_from_snapshot(app)?;
+            return Ok(());
+        }
         if response.status_code != 200 {
             return Err(GlobAclError::InvalidData(format!(
                 "relay returned status {} for {path}",

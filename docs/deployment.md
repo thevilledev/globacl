@@ -161,7 +161,13 @@ GLOBACL_COMMITD_QUORUM        majority threshold
 GLOBACL_COMMITD_HEARTBEAT_MS  leader heartbeat interval
 GLOBACL_COMMITD_ELECTION_MS   follower election timeout base
 GLOBACL_COMMITD_SYNC_MS       follower mutation catch-up interval
+GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES
+                                  compact retained mutation history after this many entries
+GLOBACL_COMMITD_COMPACT_ON_STARTUP
+                                  rewrite logs behind latest signed checkpoint on startup
 ```
+
+Commitd compaction uses the latest signed snapshot as the checkpoint, rewrites per-shard logs to retain only post-checkpoint mutations, and writes `idempotency.glog` so duplicate `op_id` handling survives restarts. If a follower or edge component asks for a compacted range, it repairs from the snapshot channel. Automatic compaction is skipped while `GLOBACL_COMMITD_PUBLISHER=jetstream` is enabled so unpublished broker events are not removed before publisher-aware cutoffs exist.
 
 Relay source selection is runtime-configurable:
 

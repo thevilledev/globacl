@@ -450,6 +450,7 @@ pub struct SourceOfTruth {
     entries: HashMap<AclKey, DenyEntry>,
     rules: HashMap<RuleKey, RuleEntry>,
     watermarks: Vec<u64>,
+    compacted_watermarks: Vec<u64>,
     mutations: Vec<Mutation>,
     op_index: HashMap<String, Mutation>,
     epoch: u64,
@@ -464,6 +465,7 @@ impl SourceOfTruth {
             entries: HashMap::new(),
             rules: HashMap::new(),
             watermarks: vec![0; shard_count as usize],
+            compacted_watermarks: vec![0; shard_count as usize],
             mutations: Vec::new(),
             op_index: HashMap::new(),
             epoch: 1,
@@ -485,6 +487,47 @@ impl SourceOfTruth {
         });
 
         let mut state = Self::new(shard_count, source_region);
+        for mutation in mutations {
+            state.apply_loaded_mutation(mutation)?;
+        }
+        Ok(state)
+    }
+
+    pub fn from_snapshot_and_mutations(
+        shard_count: u16,
+        source_region: impl Into<String>,
+        snapshot: Snapshot,
+        idempotency_mutations: Vec<Mutation>,
+        mut mutations: Vec<Mutation>,
+    ) -> Result<Self> {
+        if snapshot.shard_count != shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot shard_count {} does not match expected {}",
+                snapshot.shard_count, shard_count
+            )));
+        }
+        snapshot.validate()?;
+
+        mutations.sort_by_key(|mutation| {
+            (
+                mutation.commit_id.shard_id,
+                mutation.commit_id.seq,
+                mutation.op_id.clone(),
+            )
+        });
+
+        let mut state = Self::new(shard_count, source_region);
+        state.watermarks = snapshot.watermarks.clone();
+        state.compacted_watermarks = snapshot.watermarks;
+        for entry in snapshot.entries {
+            state.entries.insert(entry.acl_key(), entry);
+        }
+        for rule in snapshot.rules {
+            state.rules.insert(rule.rule_key(), rule);
+        }
+        for mutation in idempotency_mutations {
+            state.insert_op_index(mutation)?;
+        }
         for mutation in mutations {
             state.apply_loaded_mutation(mutation)?;
         }
@@ -711,6 +754,11 @@ impl SourceOfTruth {
             .collect()
     }
 
+    pub fn mutation_history_compacted(&self, shard_id: u16, from_seq: u64) -> Option<u64> {
+        let compacted_seq = self.compacted_watermarks.get(shard_id as usize).copied()?;
+        (from_seq < compacted_seq).then_some(compacted_seq)
+    }
+
     pub fn restore_snapshot(
         &mut self,
         snapshot: Snapshot,
@@ -820,6 +868,48 @@ impl SourceOfTruth {
         &self.watermarks
     }
 
+    pub fn compacted_watermarks(&self) -> &[u64] {
+        &self.compacted_watermarks
+    }
+
+    pub fn compact_mutation_history(&mut self, watermarks: &[u64]) -> Result<()> {
+        if watermarks.len() != self.shard_count as usize {
+            return Err(GlobAclError::InvalidData(format!(
+                "compaction has {} watermarks for {} shards",
+                watermarks.len(),
+                self.shard_count
+            )));
+        }
+        for (shard_id, compacted_seq) in watermarks.iter().copied().enumerate() {
+            if compacted_seq > self.watermarks[shard_id] {
+                return Err(GlobAclError::InvalidData(format!(
+                    "compaction watermark {compacted_seq} exceeds shard {shard_id} watermark {}",
+                    self.watermarks[shard_id]
+                )));
+            }
+        }
+        self.mutations.retain(|mutation| {
+            mutation.commit_id.seq > watermarks[mutation.commit_id.shard_id as usize]
+        });
+        for (shard_id, compacted_seq) in watermarks.iter().copied().enumerate() {
+            self.compacted_watermarks[shard_id] =
+                self.compacted_watermarks[shard_id].max(compacted_seq);
+        }
+        Ok(())
+    }
+
+    pub fn idempotency_mutations(&self) -> Vec<Mutation> {
+        let mut mutations = self.op_index.values().cloned().collect::<Vec<_>>();
+        mutations.sort_by_key(|mutation| {
+            (
+                mutation.commit_id.shard_id,
+                mutation.commit_id.seq,
+                mutation.op_id.clone(),
+            )
+        });
+        mutations
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -838,9 +928,22 @@ impl SourceOfTruth {
 
     fn apply_loaded_mutation(&mut self, mutation: Mutation) -> Result<()> {
         self.apply_committed_mutation(&mutation)?;
-        self.op_index
-            .insert(mutation.op_id.clone(), mutation.clone());
+        self.insert_op_index(mutation.clone())?;
         self.mutations.push(mutation);
+        Ok(())
+    }
+
+    fn insert_op_index(&mut self, mutation: Mutation) -> Result<()> {
+        if let Some(existing) = self.op_index.get(&mutation.op_id) {
+            if existing == &mutation {
+                return Ok(());
+            }
+            return Err(GlobAclError::InvalidData(format!(
+                "op_id {} already exists with a different mutation",
+                mutation.op_id
+            )));
+        }
+        self.op_index.insert(mutation.op_id.clone(), mutation);
         Ok(())
     }
 
@@ -2837,8 +2940,79 @@ pub fn load_all_logs(log_dir: impl AsRef<Path>, shard_count: u16) -> Result<Vec<
     Ok(mutations)
 }
 
+pub fn load_logs_after_watermarks(
+    log_dir: impl AsRef<Path>,
+    shard_count: u16,
+    watermarks: &[u64],
+) -> Result<Vec<Mutation>> {
+    if watermarks.len() != shard_count as usize {
+        return Err(GlobAclError::InvalidData(format!(
+            "log replay has {} watermarks for {} shards",
+            watermarks.len(),
+            shard_count
+        )));
+    }
+
+    let mut mutations = Vec::new();
+    for shard_id in 0..shard_count {
+        let compacted_seq = watermarks[shard_id as usize];
+        mutations.extend(
+            read_shard_log(&log_dir, shard_id)?
+                .into_iter()
+                .filter(|mutation| mutation.commit_id.seq > compacted_seq),
+        );
+    }
+    Ok(mutations)
+}
+
+pub fn compact_logs_to_watermarks(
+    log_dir: impl AsRef<Path>,
+    shard_count: u16,
+    watermarks: &[u64],
+) -> Result<()> {
+    if watermarks.len() != shard_count as usize {
+        return Err(GlobAclError::InvalidData(format!(
+            "log compaction has {} watermarks for {} shards",
+            watermarks.len(),
+            shard_count
+        )));
+    }
+
+    fs::create_dir_all(&log_dir)?;
+    for shard_id in 0..shard_count {
+        let compacted_seq = watermarks[shard_id as usize];
+        let tail = read_shard_log(&log_dir, shard_id)?
+            .into_iter()
+            .filter(|mutation| mutation.commit_id.seq > compacted_seq)
+            .collect::<Vec<_>>();
+        write_shard_log(&log_dir, shard_id, &tail)?;
+    }
+    Ok(())
+}
+
 pub fn shard_log_path(log_dir: impl AsRef<Path>, shard_id: u16) -> PathBuf {
     log_dir.as_ref().join(format!("shard_{shard_id:04}.glog"))
+}
+
+fn write_shard_log(log_dir: impl AsRef<Path>, shard_id: u16, mutations: &[Mutation]) -> Result<()> {
+    fs::create_dir_all(&log_dir)?;
+    let path = shard_log_path(log_dir, shard_id);
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        for mutation in mutations {
+            let encoded = encode_mutation(mutation);
+            file.write_all(&(encoded.len() as u32).to_le_bytes())?;
+            file.write_all(&encoded)?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 pub fn write_delta_bundle_file(
@@ -4545,6 +4719,64 @@ mod tests {
         assert!(replayed
             .lookup("tenant-a", "user", "u2", now_unix())
             .is_denied());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_checkpoint_replays_tail_and_preserves_idempotency() {
+        let mut source = SourceOfTruth::new(1, "local");
+        let one = source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let checkpoint = source.snapshot();
+        let two = source.commit(request("op-2", "u2", Action::Deny)).unwrap();
+
+        let replayed = SourceOfTruth::from_snapshot_and_mutations(
+            1,
+            "local",
+            checkpoint,
+            vec![one.mutation.clone()],
+            vec![two.mutation.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(replayed.mutations_len(), 1);
+        assert_eq!(replayed.compacted_watermarks(), &[1]);
+        assert_eq!(replayed.mutation_history_compacted(0, 0), Some(1));
+        assert!(replayed
+            .lookup("tenant-a", "user", "u1", now_unix())
+            .is_denied());
+        assert!(replayed
+            .lookup("tenant-a", "user", "u2", now_unix())
+            .is_denied());
+
+        let duplicate = replayed
+            .prepare_commit(request("op-1", "u1", Action::Deny))
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.mutation, one.mutation);
+    }
+
+    #[test]
+    fn compact_logs_to_watermarks_keeps_only_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "globacl-core-compact-test-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let log_dir = root.join("logs");
+
+        let mut source = SourceOfTruth::new(1, "local");
+        let one = source.commit(request("op-1", "u1", Action::Deny)).unwrap();
+        let two = source.commit(request("op-2", "u2", Action::Deny)).unwrap();
+        append_mutation_to_log(&log_dir, &one.mutation).unwrap();
+        append_mutation_to_log(&log_dir, &two.mutation).unwrap();
+
+        let tail = load_logs_after_watermarks(&log_dir, 1, &[1]).unwrap();
+        assert_eq!(tail, vec![two.mutation.clone()]);
+
+        compact_logs_to_watermarks(&log_dir, 1, &[1]).unwrap();
+        let compacted = read_shard_log(&log_dir, 0).unwrap();
+        assert_eq!(compacted, vec![two.mutation]);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -38,11 +38,13 @@ The core tests cover:
 - delivery-priority roundtrip
 - gap detection for out-of-order mutation apply
 - per-shard append-log replay
+- checkpointed log compaction and snapshot-plus-tail replay
 - delta-bundle file roundtrip
 - PoP acknowledgement parsing/formatting
 - central propagation acknowledgement log replay and follower rehydration
 - source watermark formatting/parsing
 - commitd vote/heartbeat, restart, catch-up, pending-entry, quorum-loss, and stale-leader consensus invariants
+- commitd log compaction with persisted idempotency replay
 - multi-process commitd leader-isolation partition behavior
 - immutable base plus exact delta overlay behavior
 - RCU-style active-state handle swaps

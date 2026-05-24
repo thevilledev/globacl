@@ -1,14 +1,15 @@
 use globacl_core::{
-    append_mutation_to_log, decode_mutation, decode_mutation_stream, decode_snapshot,
-    deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
-    encode_snapshot_manifest, format_commit_outcome, format_decision, format_watermarks, http_get,
-    http_post, immutable_snapshot_object_name, is_safe_snapshot_object_name, load_all_logs,
-    nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix, parse_form_lines,
-    parse_query_path, parse_watermarks, read_http_request, rule_requires_blast_radius_override,
-    snapshot_artifact_sha256_hex, write_delta_bundle_file, write_http_response, Action,
-    ApplyStatus, DeliveryPriority, DenyRequest, GlobAclError, Mutation, PropagationAck, Result,
-    RuleRequest, SignatureSigner, Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT,
-    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
+    append_mutation_to_log, compact_logs_to_watermarks, decode_mutation, decode_mutation_stream,
+    decode_snapshot, deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream,
+    encode_snapshot, encode_snapshot_manifest, format_commit_outcome, format_decision,
+    format_watermarks, http_get, http_post, immutable_snapshot_object_name,
+    is_safe_snapshot_object_name, load_all_logs, nats_jetstream_ensure_stream,
+    nats_jetstream_publish, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
+    read_http_request, rule_requires_blast_radius_override, snapshot_artifact_sha256_hex,
+    write_delta_bundle_file, write_http_response, Action, ApplyStatus, DeliveryPriority,
+    DenyRequest, GlobAclError, Mutation, PropagationAck, Result, RuleRequest, SignatureSigner,
+    Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
+    DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -24,6 +25,7 @@ struct App {
     state: Mutex<SourceOfTruth>,
     log_dir: PathBuf,
     consensus_path: PathBuf,
+    idempotency_path: PathBuf,
     pending_dir: PathBuf,
     bundle_dir: PathBuf,
     snapshot_dir: PathBuf,
@@ -37,6 +39,7 @@ struct App {
     signature_signer: SignatureSigner,
     latest_canary: Mutex<Option<CanaryStatus>>,
     replication: ReplicationConfig,
+    compaction: CompactionConfig,
     consensus: Mutex<ConsensusState>,
     sync_status: Mutex<SyncStatus>,
     publisher: Option<PublisherConfig>,
@@ -70,6 +73,12 @@ struct ReplicationConfig {
     heartbeat_interval_ms: u64,
     election_timeout_ms: u64,
     sync_interval_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CompactionConfig {
+    min_log_entries: usize,
+    compact_on_startup: bool,
 }
 
 impl ReplicationConfig {
@@ -157,6 +166,7 @@ fn main() -> Result<()> {
 
     let log_dir = data_dir.join("logs");
     let consensus_path = data_dir.join("consensus.state");
+    let idempotency_path = data_dir.join("idempotency.glog");
     let pending_dir = data_dir.join("pending");
     let bundle_dir = data_dir.join("bundles");
     let snapshot_dir = data_dir.join("snapshots");
@@ -169,6 +179,7 @@ fn main() -> Result<()> {
     let propagation_acks_path = data_dir.join("propagation_acks.log");
     let signature_signer = signature_signer_from_env()?;
     let replication = replication_config(bind_addr)?;
+    let compaction = compaction_config()?;
     let publisher = publisher_config()?;
     if let Some(publisher) = &publisher {
         if publisher.autocreate_stream {
@@ -180,8 +191,14 @@ fn main() -> Result<()> {
         }
     }
     let consensus = load_consensus_state(&consensus_path, &replication)?;
-    let mutations = load_all_logs(&log_dir, shard_count)?;
-    let state = SourceOfTruth::from_mutations(shard_count, &replication.cluster_id, mutations)?;
+    let state = load_source_of_truth(
+        &log_dir,
+        &snapshot_path,
+        &idempotency_path,
+        shard_count,
+        &replication.cluster_id,
+        publisher.is_some(),
+    )?;
     let startup_snapshot = state.snapshot();
     write_signed_snapshot_file(&snapshot_path, &startup_snapshot, &signature_signer)?;
     write_snapshot_manifest_publication(
@@ -198,6 +215,7 @@ fn main() -> Result<()> {
         state: Mutex::new(state),
         log_dir,
         consensus_path,
+        idempotency_path,
         pending_dir,
         bundle_dir,
         snapshot_dir,
@@ -211,6 +229,7 @@ fn main() -> Result<()> {
         signature_signer,
         latest_canary: Mutex::new(None),
         replication,
+        compaction,
         consensus: Mutex::new(consensus),
         sync_status: Mutex::new(SyncStatus {
             last_peer_sync_unix: 0,
@@ -224,6 +243,12 @@ fn main() -> Result<()> {
         }),
         propagation_acks: Mutex::new(propagation_acks),
     });
+
+    if app.compaction.compact_on_startup {
+        if let Err(err) = compact_mutation_logs(&app, true) {
+            eprintln!("startup log compaction skipped: {err}");
+        }
+    }
 
     if canary_interval_secs > 0 {
         let app = Arc::clone(&app);
@@ -380,6 +405,14 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let body = format_propagation_ack_log_snapshot(&app)?;
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
+        ("GET", "/internal/replication/idempotency") => {
+            let mutations = {
+                let state = lock_state(&app)?;
+                state.idempotency_mutations()
+            };
+            let body = encode_mutation_stream(&mutations);
+            write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
+        }
         ("POST", "/v1/deny") | ("POST", "/v1/mutation") => {
             let form = parse_form_lines(&request.body)?;
             let deny_request = DenyRequest::from_form(&form)?;
@@ -483,11 +516,25 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("GET", "/v1/mutations") => {
+            if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
+                let body = format!(
+                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
+                );
+                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                return Ok(());
+            }
             let mutations = mutations_for_query(&app, &query)?;
             let body = encode_mutation_stream(&mutations);
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         ("GET", "/v1/mutations.sig") => {
+            if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
+                let body = format!(
+                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
+                );
+                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                return Ok(());
+            }
             let mutations = mutations_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
             let body = sign_payload(&app, &payload)?;
@@ -500,12 +547,33 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             };
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
+        ("GET", "/v1/compaction_watermarks") => {
+            let body = {
+                let state = lock_state(&app)?;
+                format_watermarks(state.compacted_watermarks())
+            };
+            write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
+        }
         ("GET", "/v1/delta_bundle") => {
+            if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
+                let body = format!(
+                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
+                );
+                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                return Ok(());
+            }
             let mutations = delta_bundle_for_query(&app, &query)?;
             let body = encode_mutation_stream(&mutations);
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         ("GET", "/v1/delta_bundle.sig") => {
+            if let Some(compacted_seq) = compacted_seq_for_query(&app, &query)? {
+                let body = format!(
+                    "status=compacted\nreason=history_compacted\ncompacted_seq={compacted_seq}\n"
+                );
+                write_http_response(&mut stream, 409, "text/plain", body.as_bytes())?;
+                return Ok(());
+            }
             let mutations = delta_bundle_for_query(&app, &query)?;
             let payload = encode_mutation_stream(&mutations);
             let body = sign_payload(&app, &payload)?;
@@ -681,6 +749,21 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     Ok(())
 }
 
+fn compacted_seq_for_query(
+    app: &App,
+    query: &std::collections::HashMap<String, String>,
+) -> Result<Option<u64>> {
+    let shard_id = required_query_u16(query, "shard")?;
+    let from_seq = query
+        .get("from_seq")
+        .or_else(|| query.get("from"))
+        .map(|value| parse_query_u64(value, "from_seq"))
+        .transpose()?
+        .unwrap_or(0);
+    let state = lock_state(app)?;
+    Ok(state.mutation_history_compacted(shard_id, from_seq))
+}
+
 fn mutations_for_query(
     app: &App,
     query: &std::collections::HashMap<String, String>,
@@ -749,6 +832,77 @@ fn ensure_latest_snapshot_manifest(app: &App) -> Result<()> {
     persist_latest_snapshot(app, &snapshot)
 }
 
+fn load_source_of_truth(
+    log_dir: &Path,
+    snapshot_path: &Path,
+    idempotency_path: &Path,
+    shard_count: u16,
+    cluster_id: &str,
+    prefer_full_log_replay: bool,
+) -> Result<SourceOfTruth> {
+    if snapshot_path.exists() {
+        let snapshot = decode_snapshot(&fs::read(snapshot_path)?)?;
+        snapshot.validate()?;
+        if snapshot.shard_count != shard_count {
+            return Err(GlobAclError::InvalidData(format!(
+                "snapshot shard_count {} does not match configured {shard_count}",
+                snapshot.shard_count
+            )));
+        }
+
+        let all_log_mutations = load_all_logs(log_dir, shard_count)?;
+        if prefer_full_log_replay && !all_log_mutations.is_empty() {
+            if let Ok(replayed) =
+                SourceOfTruth::from_mutations(shard_count, cluster_id, all_log_mutations.clone())
+            {
+                if replayed.watermarks() == snapshot.watermarks.as_slice() {
+                    return Ok(replayed);
+                }
+            }
+        }
+        let mut idempotency_mutations = if idempotency_path.exists() {
+            decode_mutation_stream(&fs::read(idempotency_path)?)?
+        } else {
+            all_log_mutations.clone()
+        };
+        if idempotency_path.exists() {
+            idempotency_mutations.extend(all_log_mutations.iter().cloned());
+        }
+        let tail_mutations = all_log_mutations
+            .into_iter()
+            .filter(|mutation| {
+                mutation.commit_id.seq > snapshot.watermarks[mutation.commit_id.shard_id as usize]
+            })
+            .collect::<Vec<_>>();
+        return SourceOfTruth::from_snapshot_and_mutations(
+            shard_count,
+            cluster_id,
+            snapshot,
+            idempotency_mutations,
+            tail_mutations,
+        );
+    }
+
+    let mutations = load_all_logs(log_dir, shard_count)?;
+    SourceOfTruth::from_mutations(shard_count, cluster_id, mutations)
+}
+
+fn compaction_config() -> Result<CompactionConfig> {
+    let min_log_entries = commitd_env("COMPACTION_MIN_LOG_ENTRIES")
+        .ok()
+        .map(|value| parse_env_usize(&value, "GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES"))
+        .transpose()?
+        .unwrap_or(10_000);
+    let compact_on_startup = commitd_env("COMPACT_ON_STARTUP")
+        .ok()
+        .map(|value| env_bool_value(&value))
+        .unwrap_or(true);
+    Ok(CompactionConfig {
+        min_log_entries,
+        compact_on_startup,
+    })
+}
+
 fn commit_request(app: &App, deny_request: DenyRequest) -> Result<globacl_core::CommitOutcome> {
     let term = ensure_write_authority(app)?;
     let mut state = lock_state(app)?;
@@ -813,6 +967,7 @@ fn apply_prepared_mutation(
             &state.snapshot(),
             &archive_name_for_mutation(&mutation),
         )?;
+        maybe_compact_mutation_logs(app, state)?;
     }
     remove_pending_mutation(&app.pending_dir, &mutation)?;
     Ok(status)
@@ -978,6 +1133,56 @@ fn persist_mutation(app: &App, mutation: &Mutation) -> Result<()> {
         mutation.commit_id.seq,
         std::slice::from_ref(mutation),
     )?;
+    Ok(())
+}
+
+fn maybe_compact_mutation_logs(app: &App, state: &mut SourceOfTruth) -> Result<()> {
+    if app.compaction.min_log_entries == 0 || state.mutations_len() < app.compaction.min_log_entries
+    {
+        return Ok(());
+    }
+    compact_mutation_logs_locked(app, state)
+}
+
+fn compact_mutation_logs(app: &App, force: bool) -> Result<()> {
+    let mut state = lock_state(app)?;
+    if !force
+        && (app.compaction.min_log_entries == 0
+            || state.mutations_len() < app.compaction.min_log_entries)
+    {
+        return Ok(());
+    }
+    compact_mutation_logs_locked(app, &mut state)
+}
+
+fn compact_mutation_logs_locked(app: &App, state: &mut SourceOfTruth) -> Result<()> {
+    if app.publisher.is_some() {
+        return Ok(());
+    }
+
+    let snapshot = state.snapshot();
+    persist_latest_snapshot(app, &snapshot)?;
+    persist_idempotency_snapshot(&app.idempotency_path, &state.idempotency_mutations())?;
+    compact_logs_to_watermarks(&app.log_dir, state.shard_count(), &snapshot.watermarks)?;
+    state.compact_mutation_history(&snapshot.watermarks)?;
+    Ok(())
+}
+
+fn persist_idempotency_snapshot(path: &Path, mutations: &[Mutation]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&encode_mutation_stream(mutations))?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -1501,10 +1706,32 @@ fn sync_from_leader(app: &App) -> Result<()> {
         )));
     }
     let remote_watermarks = parse_watermarks(&watermarks_response.body)?;
+    let remote_compacted_watermarks = fetch_compaction_watermarks(&leader_addr)
+        .unwrap_or_else(|| vec![0; remote_watermarks.len()]);
     let shard_count = {
         let state = lock_state(app)?;
         state.shard_count()
     };
+
+    let needs_snapshot = {
+        let state = lock_state(app)?;
+        (0..shard_count).any(|shard_id| {
+            let shard_index = shard_id as usize;
+            let local_seq = state.watermarks()[shard_index];
+            let remote_seq = remote_watermarks
+                .get(shard_index)
+                .copied()
+                .unwrap_or(local_seq);
+            let compacted_seq = remote_compacted_watermarks
+                .get(shard_index)
+                .copied()
+                .unwrap_or(0);
+            remote_seq > local_seq && local_seq < compacted_seq
+        })
+    };
+    if needs_snapshot {
+        install_snapshot_from_leader(app, &leader_addr)?;
+    }
 
     for shard_id in 0..shard_count {
         let local_seq = {
@@ -1521,6 +1748,10 @@ fn sync_from_leader(app: &App) -> Result<()> {
 
         let path = format!("/v1/mutations?shard={shard_id}&from_seq={local_seq}");
         let response = http_get(&leader_addr, &path)?;
+        if response.status_code == 409 || response.status_code == 410 {
+            install_snapshot_from_leader(app, &leader_addr)?;
+            continue;
+        }
         if response.status_code != 200 {
             return Err(GlobAclError::InvalidData(format!(
                 "leader returned status {} for {path}",
@@ -1536,6 +1767,55 @@ fn sync_from_leader(app: &App) -> Result<()> {
 
     let mut status = lock_sync_status(app)?;
     status.last_peer_sync_unix = now_unix();
+    Ok(())
+}
+
+fn fetch_compaction_watermarks(leader_addr: &str) -> Option<Vec<u64>> {
+    let response = http_get(leader_addr, "/v1/compaction_watermarks").ok()?;
+    (response.status_code == 200).then_some(())?;
+    parse_watermarks(&response.body).ok()
+}
+
+fn install_snapshot_from_leader(app: &App, leader_addr: &str) -> Result<()> {
+    let shard_count = {
+        let state = lock_state(app)?;
+        state.shard_count()
+    };
+
+    let snapshot_response = http_get(leader_addr, "/v1/snapshot")?;
+    if snapshot_response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "leader returned status {} for snapshot",
+            snapshot_response.status_code
+        )));
+    }
+    let snapshot = decode_snapshot(&snapshot_response.body)?;
+    snapshot.validate()?;
+
+    let idempotency_response = http_get(leader_addr, "/internal/replication/idempotency")?;
+    if idempotency_response.status_code != 200 {
+        return Err(GlobAclError::InvalidData(format!(
+            "leader returned status {} for idempotency snapshot",
+            idempotency_response.status_code
+        )));
+    }
+    let idempotency_mutations = decode_mutation_stream(&idempotency_response.body)?;
+
+    let mut rebuilt = SourceOfTruth::from_snapshot_and_mutations(
+        shard_count,
+        &app.replication.cluster_id,
+        snapshot,
+        idempotency_mutations,
+        Vec::new(),
+    )?;
+    let snapshot = rebuilt.snapshot();
+    persist_latest_snapshot(app, &snapshot)?;
+    persist_idempotency_snapshot(&app.idempotency_path, &rebuilt.idempotency_mutations())?;
+    compact_logs_to_watermarks(&app.log_dir, rebuilt.shard_count(), &snapshot.watermarks)?;
+    rebuilt.compact_mutation_history(&snapshot.watermarks)?;
+
+    let mut state = lock_state(app)?;
+    *state = rebuilt;
     Ok(())
 }
 
@@ -2325,13 +2605,15 @@ fn parse_env_u64(value: &str, field: &str) -> Result<u64> {
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)
         .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|value| env_bool_value(&value))
         .unwrap_or(default)
+}
+
+fn env_bool_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn load_consensus_state(path: &Path, replication: &ReplicationConfig) -> Result<ConsensusState> {
@@ -2458,6 +2740,7 @@ mod tests {
             state: Mutex::new(SourceOfTruth::new(shard_count, "cluster-a")),
             log_dir: root.join("logs"),
             consensus_path: root.join("consensus.state"),
+            idempotency_path: root.join("idempotency.glog"),
             pending_dir: root.join("pending"),
             bundle_dir: root.join("bundles"),
             snapshot_dir: root.join("snapshots"),
@@ -2500,6 +2783,10 @@ mod tests {
                 heartbeat_interval_ms: 250,
                 election_timeout_ms: 1200,
                 sync_interval_ms: 1000,
+            },
+            compaction: CompactionConfig {
+                min_log_entries: 10_000,
+                compact_on_startup: true,
             },
             consensus: Mutex::new(ConsensusState {
                 current_term: term,
@@ -2855,6 +3142,64 @@ mod tests {
             mutation.commit_id.seq
         );
         drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn log_compaction_rewrites_logs_and_preserves_idempotency_snapshot() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-log-compaction-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 1);
+
+        let (one, two) = {
+            let mut state = lock_state(&app).expect("state");
+            let one = state
+                .commit(deny_request("op-1", "user-1"))
+                .expect("first commit")
+                .mutation;
+            let two = state
+                .commit(deny_request("op-2", "user-2"))
+                .expect("second commit")
+                .mutation;
+            persist_mutation(&app, &one).expect("persist first");
+            persist_mutation(&app, &two).expect("persist second");
+            (one, two)
+        };
+
+        {
+            let mut state = lock_state(&app).expect("state");
+            compact_mutation_logs_locked(&app, &mut state).expect("compact logs");
+            assert_eq!(state.mutations_len(), 0);
+            assert_eq!(state.compacted_watermarks(), state.watermarks());
+        }
+
+        assert!(load_all_logs(&app.log_dir, 4)
+            .expect("load compacted logs")
+            .is_empty());
+        let idempotency =
+            decode_mutation_stream(&std::fs::read(&app.idempotency_path).expect("idempotency"))
+                .expect("decode idempotency");
+        assert!(idempotency.contains(&one));
+        assert!(idempotency.contains(&two));
+
+        let loaded = load_source_of_truth(
+            &app.log_dir,
+            &app.snapshot_path,
+            &app.idempotency_path,
+            4,
+            &app.replication.cluster_id,
+            false,
+        )
+        .expect("load compacted source");
+        let duplicate = loaded
+            .prepare_commit(deny_request("op-1", "user-1"))
+            .expect("prepare duplicate");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.mutation, one);
+
         remove_test_dir(root);
     }
 

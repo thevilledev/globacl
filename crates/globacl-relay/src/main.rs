@@ -352,16 +352,27 @@ impl JetStreamSource {
         let path = format!("/v1/delta_bundle?shard={shard_id}&from_seq={from_seq}&to_seq={to_seq}");
         let response = http_get(&self.bootstrap_addr, &path)?;
         if response.status_code != 200 {
-            return Err(GlobAclError::InvalidData(format!(
-                "bootstrap returned status {} for {path}",
-                response.status_code
-            )));
+            return self.rebuild_cache_from_snapshot();
         }
         let mutations = decode_mutation_stream(&response.body)?;
         let mut cache = lock_cache(self)?;
         for mutation in mutations {
             cache.apply(mutation)?;
         }
+        Ok(())
+    }
+
+    fn rebuild_cache_from_snapshot(&self) -> Result<()> {
+        let response = http_get(&self.bootstrap_addr, "/v1/snapshot")?;
+        if response.status_code != 200 {
+            return Err(GlobAclError::InvalidData(format!(
+                "bootstrap returned status {} for snapshot repair",
+                response.status_code
+            )));
+        }
+        let snapshot = decode_snapshot(&response.body)?;
+        let mut cache = lock_cache(self)?;
+        *cache = RelayCache::new(snapshot.watermarks);
         Ok(())
     }
 
