@@ -50,14 +50,22 @@ wait_for_http() {
   return 1
 }
 
+json_number() {
+  local key="$1"
+  local body="$2"
+  sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" <<<"${body}" | head -n1
+}
+
 wait_for_propagation_ack() {
   local expected_agents="$1"
   local status
-  local ack_count
+  local agent_count
+  local max_seq_lag
   for _ in $(seq 1 120); do
     status="$(curl -sS "http://127.0.0.1:${CONTROL_PORT}/v1/propagation/status")"
-    ack_count="$(awk -F= '$1 == "agent_count" {print $2}' <<<"${status}")"
-    if [[ "${ack_count:-0}" -ge "${expected_agents}" ]] && grep -q "max_seq_lag=0" <<<"${status}"; then
+    agent_count="$(json_number "agent_count" "${status}")"
+    max_seq_lag="$(json_number "max_seq_lag" "${status}")"
+    if [[ "${agent_count:-0}" -ge "${expected_agents}" && "${max_seq_lag:-1}" -eq 0 ]]; then
       return 0
     fi
     sleep 1
