@@ -209,7 +209,11 @@ func newClient(baseURL string) (*globacl.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return globacl.NewClient(normalized)
+	options := []globacl.ClientOption{}
+	if token := strings.TrimSpace(os.Getenv("GLOBACL_BEARER_TOKEN")); token != "" {
+		options = append(options, globacl.WithBearerToken(token))
+	}
+	return globacl.NewClient(normalized, options...)
 }
 
 func normalizeBaseURL(baseURL string) (string, error) {

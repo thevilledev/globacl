@@ -819,6 +819,24 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description Bearer authentication is required or invalid. */
+        UnauthorizedJson: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Authenticated caller lacks the required scope. */
+        ForbiddenJson: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description Upstream commit service is unavailable. */
         UnavailableJson: {
             headers: {
@@ -907,6 +925,8 @@ export interface operations {
         responses: {
             200: components["responses"]["CommitOutcome"];
             400: components["responses"]["RejectedJson"];
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
             503: components["responses"]["UnavailableJson"];
         };
     };
@@ -921,6 +941,8 @@ export interface operations {
         responses: {
             200: components["responses"]["CommitOutcome"];
             400: components["responses"]["RejectedJson"];
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
             503: components["responses"]["UnavailableJson"];
         };
     };
@@ -935,6 +957,8 @@ export interface operations {
         responses: {
             200: components["responses"]["CommitOutcome"];
             400: components["responses"]["RejectedJson"];
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
             503: components["responses"]["UnavailableJson"];
         };
     };
@@ -956,6 +980,8 @@ export interface operations {
                     "application/json": components["schemas"]["CanaryStatusResponse"];
                 };
             };
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
             503: components["responses"]["UnavailableJson"];
         };
     };
@@ -1216,6 +1242,8 @@ export interface operations {
                     "application/json": components["schemas"]["StatusResponse"];
                 };
             };
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
         };
     };
     getSnapshotSignature: {
@@ -1333,6 +1361,8 @@ export interface operations {
                 };
             };
             400: components["responses"]["RejectedJson"];
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
         };
     };
     getAuditLog: {
@@ -1353,6 +1383,8 @@ export interface operations {
                     "application/json": components["schemas"]["AuditLogResponse"];
                 };
             };
+            401: components["responses"]["UnauthorizedJson"];
+            403: components["responses"]["ForbiddenJson"];
         };
     };
 }

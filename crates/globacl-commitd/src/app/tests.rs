@@ -75,6 +75,7 @@ mod tests {
                 publish_errors: 0,
             }),
             propagation_acks: Mutex::new(HashMap::new()),
+            auth: AuthConfig::disabled(),
         }
     }
 

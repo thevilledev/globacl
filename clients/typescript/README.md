@@ -8,7 +8,9 @@ Use:
 ```ts
 import { createControlClient } from "@globacl/client";
 
-const client = createControlClient("http://127.0.0.1:7000");
+const client = createControlClient("http://127.0.0.1:7000", {
+  bearerToken: "admin-token",
+});
 const outcome = await client.deny({
   op_id: "demo-1",
   tenant_id: "tenant-a",

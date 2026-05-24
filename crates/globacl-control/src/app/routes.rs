@@ -26,7 +26,13 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             };
             write_http_response(&mut stream, status_code, "text/plain", body.as_bytes())?;
         }
+        (_, path) if path.starts_with("/internal/") => {
+            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+        }
         ("POST", "/v1/deny") | ("POST", "/v1/mutation") => {
+            if require_scope(&mut stream, &app, &request, "acl:write")?.is_none() {
+                return Ok(());
+            }
             let form = parse_form_lines(&request.body)?;
             let deny_request = DenyRequest::from_form(&form)?;
             if deny_requires_blast_radius_override(&deny_request)
@@ -40,9 +46,12 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            proxy_post(&mut stream, &app, &request.path, &request.body)?;
+            proxy_post(&mut stream, &app, &request)?;
         }
         ("POST", "/v1/rule") => {
+            if require_scope(&mut stream, &app, &request, "acl:write")?.is_none() {
+                return Ok(());
+            }
             let form = parse_form_lines(&request.body)?;
             let rule_request = RuleRequest::from_form(&form)?;
             if rule_requires_blast_radius_override(&rule_request)
@@ -56,10 +65,39 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            proxy_post(&mut stream, &app, &request.path, &request.body)?;
+            proxy_post(&mut stream, &app, &request)?;
         }
-        ("GET", _) => proxy_get(&mut stream, &app, &request.path)?,
-        ("POST", _) => proxy_post(&mut stream, &app, &request.path, &request.body)?,
+        ("POST", "/v1/canary") => {
+            if require_scope(&mut stream, &app, &request, "acl:write")?.is_none() {
+                return Ok(());
+            }
+            proxy_post(&mut stream, &app, &request)?;
+        }
+        ("POST", "/v1/snapshot") => {
+            if require_scope(&mut stream, &app, &request, "snapshot:write")?.is_none() {
+                return Ok(());
+            }
+            proxy_post(&mut stream, &app, &request)?;
+        }
+        ("POST", "/v1/rollback") => {
+            if require_scope(&mut stream, &app, &request, "admin:rollback")?.is_none() {
+                return Ok(());
+            }
+            proxy_post(&mut stream, &app, &request)?;
+        }
+        ("GET", "/v1/audit") => {
+            if require_scope(&mut stream, &app, &request, "audit:read")?.is_none() {
+                return Ok(());
+            }
+            proxy_get(&mut stream, &app, &request)?;
+        }
+        ("POST", "/v1/ack") => {
+            proxy_post(&mut stream, &app, &request)?;
+        }
+        ("GET", _) => proxy_get(&mut stream, &app, &request)?,
+        ("POST", _) => {
+            write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
+        }
         (method, _) => {
             return Err(GlobAclError::Parse(format!(
                 "unsupported control method {method}"

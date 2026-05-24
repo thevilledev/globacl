@@ -465,6 +465,93 @@ fn backend_conforms_to_documented_openapi_contract() {
     }));
 }
 
+#[test]
+fn backend_enforces_optional_bearer_auth_when_configured() {
+    let cluster = TestCluster::start_with_env(&[(
+        "GLOBACL_AUTH_TOKENS",
+        "writer-token=writer:acl:write;reader-token=reader:audit:read",
+    )]);
+
+    let unauthenticated = raw_post(
+        &cluster.control_addr,
+        "/v1/deny",
+        "application/json",
+        br#"{
+          "op_id": "auth-deny-missing",
+          "tenant_id": "tenant-a",
+          "namespace": "user",
+          "key": "user-auth",
+          "action": "deny",
+          "created_by": "untrusted"
+        }"#,
+    );
+    assert_status(&unauthenticated, 401);
+    assert_eq!(
+        form(&unauthenticated).get("reason").map(String::as_str),
+        Some("missing_bearer_token")
+    );
+
+    let forbidden = raw_post_with_headers(
+        &cluster.control_addr,
+        "/v1/deny",
+        "application/json",
+        br#"{
+          "op_id": "auth-deny-forbidden",
+          "tenant_id": "tenant-a",
+          "namespace": "user",
+          "key": "user-auth",
+          "action": "deny",
+          "created_by": "untrusted"
+        }"#,
+        &[("Authorization", "Bearer reader-token")],
+    );
+    assert_status(&forbidden, 403);
+    assert_eq!(
+        form(&forbidden).get("reason").map(String::as_str),
+        Some("insufficient_scope")
+    );
+
+    let authorized = raw_post_with_headers(
+        &cluster.control_addr,
+        "/v1/deny",
+        "application/json",
+        br#"{
+          "op_id": "auth-deny-ok",
+          "tenant_id": "tenant-a",
+          "namespace": "user",
+          "key": "user-auth",
+          "action": "deny",
+          "created_by": "untrusted"
+        }"#,
+        &[("Authorization", "Bearer writer-token")],
+    );
+    assert_status(&authorized, 200);
+
+    let audit_forbidden = raw_get_with_headers(
+        &cluster.control_addr,
+        "/v1/audit",
+        &[("Authorization", "Bearer writer-token")],
+    );
+    assert_status(&audit_forbidden, 403);
+
+    let audit = raw_get_with_headers(
+        &cluster.control_addr,
+        "/v1/audit",
+        &[("Authorization", "Bearer reader-token")],
+    );
+    assert_status(&audit, 200);
+    let audit_body = parse_json_body(&audit.body).unwrap();
+    let audit_items = audit_body
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("audit response should contain items");
+    assert!(audit_items.iter().any(|item| {
+        item.get("event").and_then(JsonValue::as_str) == Some("deny")
+            && item.get("op_id").and_then(JsonValue::as_str) == Some("auth-deny-ok")
+            && item.get("actor").and_then(JsonValue::as_str) == Some("writer")
+    }));
+}
+
 struct TestCluster {
     _root: TempRoot,
     _commitd: ChildGuard,
@@ -478,6 +565,10 @@ struct TestCluster {
 
 impl TestCluster {
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    fn start_with_env(extra_envs: &[(&str, &str)]) -> Self {
         let root = TempRoot::new("globacl-contract");
         let commit_addr = free_addr();
         let control_addr = free_addr();
@@ -495,7 +586,10 @@ impl TestCluster {
                 "16",
                 "0",
             ],
-            &[("GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES", "0")],
+            &append_envs(
+                &[("GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES", "0")],
+                extra_envs,
+            ),
         );
         wait_for_health("commitd", &commit_addr);
 
@@ -503,7 +597,7 @@ impl TestCluster {
             "control",
             env!("CARGO_BIN_EXE_globacl-contract-control"),
             &[&commit_addr, &control_addr],
-            &[],
+            extra_envs,
         );
         wait_for_health("control", &control_addr);
 
@@ -603,6 +697,15 @@ fn spawn(name: &str, binary: &str, args: &[&str], envs: &[(&str, &str)]) -> Chil
     ChildGuard { child }
 }
 
+fn append_envs<'a>(
+    base: &[(&'a str, &'a str)],
+    extra: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut envs = base.to_vec();
+    envs.extend_from_slice(extra);
+    envs
+}
+
 fn free_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().unwrap().to_string()
@@ -652,11 +755,27 @@ fn raw_get(addr: &str, path: &str) -> RawResponse {
 }
 
 fn try_raw_get(addr: &str, path: &str) -> Result<RawResponse, GlobAclError> {
-    raw_request(addr, "GET", path, None, &[])
+    raw_request(addr, "GET", path, None, &[], &[])
+}
+
+fn raw_get_with_headers(addr: &str, path: &str, headers: &[(&str, &str)]) -> RawResponse {
+    raw_request(addr, "GET", path, None, &[], headers)
+        .unwrap_or_else(|err| panic!("GET {addr}{path}: {err}"))
 }
 
 fn raw_post(addr: &str, path: &str, content_type: &str, body: &[u8]) -> RawResponse {
-    raw_request(addr, "POST", path, Some(content_type), body)
+    raw_request(addr, "POST", path, Some(content_type), body, &[])
+        .unwrap_or_else(|err| panic!("POST {addr}{path}: {err}"))
+}
+
+fn raw_post_with_headers(
+    addr: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> RawResponse {
+    raw_request(addr, "POST", path, Some(content_type), body, headers)
         .unwrap_or_else(|err| panic!("POST {addr}{path}: {err}"))
 }
 
@@ -666,6 +785,7 @@ fn raw_request(
     path: &str,
     content_type: Option<&str>,
     body: &[u8],
+    headers: &[(&str, &str)],
 ) -> Result<RawResponse, GlobAclError> {
     let mut stream = TcpStream::connect(addr)?;
     let mut request = format!(
@@ -674,6 +794,12 @@ fn raw_request(
     );
     if let Some(content_type) = content_type {
         request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    for (key, value) in headers {
+        request.push_str(key);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;

@@ -24,6 +24,7 @@ export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promis
 
 export interface ClientOptions {
   fetch?: FetchLike;
+  bearerToken?: string;
 }
 
 export interface LookupParams {
@@ -65,6 +66,7 @@ export class GlobaclApiError extends Error {
 export class GlobaclClient {
   readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
+  private readonly bearerToken: string | undefined;
 
   constructor(baseUrl: string, options: ClientOptions = {}) {
     this.baseUrl = normalizeBaseUrl(baseUrl);
@@ -73,6 +75,7 @@ export class GlobaclClient {
       throw new Error("globacl client requires a fetch implementation");
     }
     this.fetchImpl = fetchImpl;
+    this.bearerToken = options.bearerToken;
   }
 
   health(): Promise<HealthResponse> {
@@ -193,6 +196,7 @@ export class GlobaclClient {
 
   private async requestJson<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers = new Headers({ Accept: "application/json" });
+    this.authorize(headers);
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
       headers.set("Content-Type", "application/json");
@@ -210,7 +214,7 @@ export class GlobaclClient {
   private async getBytes(path: string): Promise<ArrayBuffer> {
     const response = await this.fetchImpl(this.url(path), {
       method: "GET",
-      headers: { Accept: "application/octet-stream" },
+      headers: this.headers({ Accept: "application/octet-stream" }),
     });
     if (!response.ok) {
       throw new GlobaclApiError(response.status, await response.text());
@@ -225,10 +229,10 @@ export class GlobaclClient {
         : body;
     const response = await this.fetchImpl(this.url(path), {
       method: "POST",
-      headers: {
+      headers: this.headers({
         Accept: "application/json",
         "Content-Type": "application/octet-stream",
-      },
+      }),
       body: payload,
     });
     const text = await response.text();
@@ -240,6 +244,18 @@ export class GlobaclClient {
 
   private url(path: string): URL {
     return new URL(path, this.baseUrl);
+  }
+
+  private headers(values: HeadersInit): Headers {
+    const headers = new Headers(values);
+    this.authorize(headers);
+    return headers;
+  }
+
+  private authorize(headers: Headers): void {
+    if (this.bearerToken) {
+      headers.set("Authorization", `Bearer ${this.bearerToken}`);
+    }
   }
 }
 

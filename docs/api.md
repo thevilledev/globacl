@@ -57,6 +57,35 @@ GET  /v1/acks
 
 Request bodies are capped at 1 MiB by the dependency-free HTTP parser.
 
+## Authentication
+
+Authentication is opt-in for local development. Set `GLOBACL_AUTH_TOKENS` on
+`globacl-control` and `globacl-commitd` to require bearer tokens on write and
+admin endpoints:
+
+```sh
+export GLOBACL_AUTH_TOKENS='admin-token=admin:acl:write,snapshot:write,admin:rollback,audit:read'
+```
+
+Clients then send:
+
+```text
+Authorization: Bearer admin-token
+```
+
+Current scopes:
+
+```text
+acl:write       POST /v1/deny, /v1/mutation, /v1/rule, /v1/canary
+snapshot:write  POST /v1/snapshot
+admin:rollback  POST /v1/rollback
+audit:read      GET  /v1/audit
+```
+
+The committed audit log records the authenticated actor when auth is enabled.
+When auth is disabled, audit entries fall back to the request's `created_by`
+field for local demos.
+
 Control `/health` reports gateway health and whether commitd is reachable:
 
 ```json

@@ -169,6 +169,16 @@ GLOBACL_COMMITD_COMPACT_ON_STARTUP
 
 Commitd compaction uses the latest signed snapshot as the checkpoint, rewrites per-shard logs to retain only post-checkpoint mutations, and writes `idempotency.glog` so duplicate `op_id` handling survives restarts. If a follower or edge component asks for a compacted range, it repairs from the snapshot channel. When `GLOBACL_COMMITD_PUBLISHER=jetstream` is enabled, compaction is capped by durable per-shard publisher offsets so unpublished JetStream events remain replayable after restart.
 
+Control and commitd can require scoped bearer tokens for write/admin APIs:
+
+```text
+GLOBACL_AUTH_TOKENS           token=identity:scope,scope;token2=identity2:scope
+```
+
+For example, `admin-token=admin:acl:write,snapshot:write,admin:rollback,audit:read`
+allows authoring, snapshot upload, rollback, and audit reads. The k3s smoke
+runner reads `GLOBACL_BEARER_TOKEN` when a token-protected environment is used.
+
 Relay source selection is runtime-configurable:
 
 ```text

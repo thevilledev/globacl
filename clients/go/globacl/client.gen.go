@@ -11,6 +11,10 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+const (
+	BearerAuthScopes = "BearerAuth.Scopes"
+)
+
 // Defines values for Action.
 const (
 	ActionAllowOverride Action = "allow_override"
@@ -557,11 +561,17 @@ type CommitOutcome = CommitOutcomeResponse
 // DecisionJson defines model for DecisionJson.
 type DecisionJson = DecisionResponse
 
+// ForbiddenJson defines model for ForbiddenJson.
+type ForbiddenJson = ErrorResponse
+
 // HistoryCompacted defines model for HistoryCompacted.
 type HistoryCompacted = HistoryCompactedResponse
 
 // RejectedJson defines model for RejectedJson.
 type RejectedJson = ErrorResponse
+
+// UnauthorizedJson defines model for UnauthorizedJson.
+type UnauthorizedJson = ErrorResponse
 
 // UnavailableJson defines model for UnavailableJson.
 type UnavailableJson = ErrorResponse

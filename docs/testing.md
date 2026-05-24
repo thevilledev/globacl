@@ -77,6 +77,9 @@ Run k3d-backed k3s smoke tests:
 The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The JetStream smoke uses the same local shape, adds NATS JetStream, enables commitd publishing, switches the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app observes a deny through the agent. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
 
 The smoke scripts use the Go client smoke runner in `clients/go/cmd/globacl-smoke` for API operations and assertions, so they exercise the generated client model surface instead of shell JSON parsing.
+If a smoke environment enables `GLOBACL_AUTH_TOKENS`, export
+`GLOBACL_BEARER_TOKEN` with a token that has `acl:write` before running the
+script.
 
 The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
 

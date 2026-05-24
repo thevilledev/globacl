@@ -12,8 +12,9 @@ import (
 )
 
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL     string
+	httpClient  *http.Client
+	bearerToken string
 }
 
 func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
@@ -43,6 +44,12 @@ type ClientOption func(*Client)
 func WithHTTPClient(httpClient *http.Client) ClientOption {
 	return func(client *Client) {
 		client.httpClient = httpClient
+	}
+}
+
+func WithBearerToken(token string) ClientOption {
+	return func(client *Client) {
+		client.bearerToken = token
 	}
 }
 
@@ -141,6 +148,7 @@ func (client *Client) doJSON(ctx context.Context, method, path string, requestBo
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
+	client.authorize(request)
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -170,6 +178,7 @@ func (client *Client) doBytes(ctx context.Context, method, path string) ([]byte,
 		return nil, fmt.Errorf("globacl: build request: %w", err)
 	}
 	request.Header.Set("Accept", "application/octet-stream")
+	client.authorize(request)
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -185,6 +194,12 @@ func (client *Client) doBytes(ctx context.Context, method, path string) ([]byte,
 		return nil, APIError{StatusCode: response.StatusCode, Body: payload}
 	}
 	return payload, nil
+}
+
+func (client *Client) authorize(request *http.Request) {
+	if client.bearerToken != "" {
+		request.Header.Set("Authorization", "Bearer "+client.bearerToken)
+	}
 }
 
 type APIError struct {

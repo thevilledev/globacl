@@ -6,7 +6,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         && app.replication.is_clustered()
         && !is_write_leader(&app)?
     {
-        proxy_write_to_leader(&mut stream, &app, &request.path, &request.body)?;
+        proxy_write_to_leader(&mut stream, &app, &request)?;
         return Ok(());
     }
 
@@ -49,7 +49,7 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/propagation/status") => {
             if app.replication.is_clustered() && !is_write_leader(&app)? {
-                proxy_get_to_leader(&mut stream, &app, &request.path)?;
+                proxy_get_to_leader(&mut stream, &app, &request)?;
                 return Ok(());
             }
             let body = format_propagation_status(&app)?;
@@ -114,6 +114,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         ("POST", "/v1/deny") | ("POST", "/v1/mutation") => {
+            let principal = match require_scope(&mut stream, &app, &request, "acl:write")? {
+                Some(principal) => principal,
+                None => return Ok(()),
+            };
             let form = parse_form_lines(&request.body)?;
             let deny_request = DenyRequest::from_form(&form)?;
             if deny_requires_blast_radius_override(&deny_request)
@@ -124,8 +128,11 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                     "deny",
                     "rejected",
                     &format!(
-                        "op_id={} reason=blast_radius_override_required namespace={} key={}",
-                        deny_request.op_id, deny_request.namespace, deny_request.key
+                        "op_id={} reason=blast_radius_override_required namespace={} key={} actor={}",
+                        deny_request.op_id,
+                        deny_request.namespace,
+                        deny_request.key,
+                        audit_actor(&principal, &deny_request.created_by)
                     ),
                 )?;
                 write_http_response(
@@ -142,17 +149,22 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 "deny",
                 "committed",
                 &format!(
-                    "op_id={} shard_id={} seq={} duplicate={}",
+                    "op_id={} shard_id={} seq={} duplicate={} actor={}",
                     outcome.mutation.op_id,
                     outcome.mutation.commit_id.shard_id,
                     outcome.mutation.commit_id.seq,
-                    outcome.duplicate
+                    outcome.duplicate,
+                    audit_actor(&principal, &outcome.mutation.entry.created_by)
                 ),
             )?;
             let body = format_commit_outcome(&outcome);
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("POST", "/v1/rule") => {
+            let principal = match require_scope(&mut stream, &app, &request, "acl:write")? {
+                Some(principal) => principal,
+                None => return Ok(()),
+            };
             let form = parse_form_lines(&request.body)?;
             let rule_request = RuleRequest::from_form(&form)?;
             if rule_requires_blast_radius_override(&rule_request)
@@ -163,10 +175,11 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                     "rule",
                     "rejected",
                     &format!(
-                        "op_id={} reason=blast_radius_override_required kind={} pattern={}",
+                        "op_id={} reason=blast_radius_override_required kind={} pattern={} actor={}",
                         rule_request.op_id,
                         rule_request.kind.as_str(),
-                        rule_request.pattern
+                        rule_request.pattern,
+                        audit_actor(&principal, &rule_request.created_by)
                     ),
                 )?;
                 write_http_response(
@@ -183,25 +196,41 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 "rule",
                 "committed",
                 &format!(
-                    "op_id={} shard_id={} seq={} duplicate={}",
+                    "op_id={} shard_id={} seq={} duplicate={} actor={}",
                     outcome.mutation.op_id,
                     outcome.mutation.commit_id.shard_id,
                     outcome.mutation.commit_id.seq,
-                    outcome.duplicate
+                    outcome.duplicate,
+                    audit_actor(
+                        &principal,
+                        outcome
+                            .mutation
+                            .rule
+                            .as_ref()
+                            .map(|rule| rule.created_by.as_str())
+                            .unwrap_or(&outcome.mutation.entry.created_by)
+                    )
                 ),
             )?;
             let body = format_commit_outcome(&outcome);
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("POST", "/v1/canary") => {
+            let principal = match require_scope(&mut stream, &app, &request, "acl:write")? {
+                Some(principal) => principal,
+                None => return Ok(()),
+            };
             let canary = commit_canary(&app)?;
             append_audit(
                 &app,
                 "canary",
                 "committed",
                 &format!(
-                    "op_id={} shard_id={} seq={}",
-                    canary.op_id, canary.shard_id, canary.seq
+                    "op_id={} shard_id={} seq={} actor={}",
+                    canary.op_id,
+                    canary.shard_id,
+                    canary.seq,
+                    audit_actor(&principal, "globacl-commitd")
                 ),
             )?;
             let body = format_canary_status(&canary);
@@ -342,6 +371,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("POST", "/v1/snapshot") => {
+            let principal = match require_scope(&mut stream, &app, &request, "snapshot:write")? {
+                Some(principal) => principal,
+                None => return Ok(()),
+            };
             let snapshot = decode_snapshot(&request.body)?;
             snapshot.validate()?;
             let archive_name = format!("uploaded_{}", now_unix());
@@ -350,11 +383,18 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "snapshot",
                 "uploaded",
-                &format!("snapshot={archive_name}.gacl"),
+                &format!(
+                    "snapshot={archive_name}.gacl actor={}",
+                    audit_actor(&principal, "unknown")
+                ),
             )?;
             write_http_response(&mut stream, 200, "text/plain", b"status=ok\n")?;
         }
         ("POST", "/v1/rollback") => {
+            let principal = match require_scope(&mut stream, &app, &request, "admin:rollback")? {
+                Some(principal) => principal,
+                None => return Ok(()),
+            };
             let form = parse_form_lines(&request.body)?;
             let snapshot_name = form
                 .get("snapshot")
@@ -401,7 +441,12 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 &app,
                 "rollback",
                 "committed",
-                &format!("snapshot={} mutations={}", snapshot_name, mutations.len()),
+                &format!(
+                    "snapshot={} mutations={} actor={}",
+                    snapshot_name,
+                    mutations.len(),
+                    audit_actor(&principal, "unknown")
+                ),
             )?;
             let body = format!(
                 "status=ok\nsnapshot={}\nmutations={}\n",
@@ -411,6 +456,9 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("GET", "/v1/audit") => {
+            if require_scope(&mut stream, &app, &request, "audit:read")?.is_none() {
+                return Ok(());
+            }
             let body = fs::read(&app.audit_path).unwrap_or_default();
             write_http_response(&mut stream, 200, "text/plain", &body)?;
         }
@@ -448,4 +496,3 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     Ok(())
 }
-

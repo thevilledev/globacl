@@ -1,15 +1,16 @@
 use globacl_core::{
-    append_mutation_to_log, compact_logs_to_watermarks, decode_mutation, decode_mutation_stream,
-    decode_snapshot, deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream,
-    encode_snapshot, encode_snapshot_manifest, format_commit_outcome, format_decision,
-    format_watermarks, http_get, http_post, immutable_snapshot_object_name,
-    is_safe_snapshot_object_name, load_all_logs, nats_jetstream_ensure_stream,
-    nats_jetstream_publish, now_unix, parse_form_lines, parse_query_path, parse_watermarks,
-    read_http_request, rule_requires_blast_radius_override, snapshot_artifact_sha256_hex,
-    write_delta_bundle_file, write_http_response, Action, ApplyStatus, DeliveryPriority,
-    DenyRequest, GlobAclError, Mutation, PropagationAck, Result, RuleRequest, SignatureSigner,
-    Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT, DEFAULT_SIGNATURE_KEY_ID,
-    DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
+    append_mutation_to_log, auth_config_from_env_var, compact_logs_to_watermarks, decode_mutation,
+    decode_mutation_stream, decode_snapshot, deny_requires_blast_radius_override, encode_mutation,
+    encode_mutation_stream, encode_snapshot, encode_snapshot_manifest, format_commit_outcome,
+    format_decision, format_watermarks, http_get, http_post, http_post_with_headers,
+    immutable_snapshot_object_name, is_safe_snapshot_object_name, load_all_logs,
+    nats_jetstream_ensure_stream, nats_jetstream_publish, now_unix, parse_form_lines,
+    parse_query_path, parse_watermarks, read_http_request, rule_requires_blast_radius_override,
+    sanitize_audit_value, snapshot_artifact_sha256_hex, write_auth_failure_response,
+    write_delta_bundle_file, write_http_response, Action, ApplyStatus, AuthConfig, AuthPrincipal,
+    DeliveryPriority, DenyRequest, GlobAclError, HttpRequest, Mutation, PropagationAck, Result,
+    RuleRequest, SignatureSigner, Snapshot, SnapshotManifest, SourceOfTruth, DEFAULT_SHARD_COUNT,
+    DEFAULT_SIGNATURE_KEY_ID, DEFAULT_SIGNATURE_KEY_VERSION, DEFAULT_SIGNATURE_PRIVATE_KEY,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -45,6 +46,7 @@ struct App {
     publisher: Option<PublisherConfig>,
     publisher_status: Mutex<PublisherStatus>,
     propagation_acks: Mutex<HashMap<String, PropagationAck>>,
+    auth: AuthConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +180,7 @@ pub(crate) fn run() -> Result<()> {
     let publisher_offsets_path = data_dir.join("publisher_offsets.state");
     let propagation_acks_path = data_dir.join("propagation_acks.log");
     let signature_signer = signature_signer_from_env()?;
+    let auth = auth_config_from_env_var("GLOBACL_AUTH_TOKENS")?;
     let replication = replication_config(bind_addr)?;
     let compaction = compaction_config()?;
     let publisher = publisher_config()?;
@@ -242,6 +245,7 @@ pub(crate) fn run() -> Result<()> {
             publish_errors: 0,
         }),
         propagation_acks: Mutex::new(propagation_acks),
+        auth,
     });
 
     if app.compaction.compact_on_startup {

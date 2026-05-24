@@ -100,7 +100,7 @@ fn requires_leader(method: &str, route: &str) -> bool {
         )
 }
 
-fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, path: &str) -> Result<()> {
+fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
         write_http_response(
             stream,
@@ -110,7 +110,11 @@ fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, path: &str) -> Result<
         )?;
         return Ok(());
     };
-    match http_get(&leader_addr, path) {
+    let headers = request
+        .authorization_forward_header()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match globacl_core::http_get_with_headers(&leader_addr, &request.path, &headers) {
         Ok(response) => {
             write_http_response(stream, response.status_code, "text/plain", &response.body)
         }
@@ -121,7 +125,7 @@ fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, path: &str) -> Result<
     }
 }
 
-fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, path: &str, body: &[u8]) -> Result<()> {
+fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
         write_http_response(
             stream,
@@ -131,7 +135,11 @@ fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, path: &str, body: &[
         )?;
         return Ok(());
     };
-    match http_post(&leader_addr, path, body) {
+    let headers = request
+        .authorization_forward_header()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match http_post_with_headers(&leader_addr, &request.path, &request.body, &headers) {
         Ok(response) => {
             write_http_response(stream, response.status_code, "text/plain", &response.body)?;
         }
@@ -141,6 +149,29 @@ fn proxy_write_to_leader(stream: &mut TcpStream, app: &App, path: &str, body: &[
         }
     }
     Ok(())
+}
+
+fn require_scope(
+    stream: &mut TcpStream,
+    app: &App,
+    request: &HttpRequest,
+    scope: &str,
+) -> Result<Option<AuthPrincipal>> {
+    match app.auth.require_scope(request, scope) {
+        Ok(principal) => Ok(Some(principal)),
+        Err(failure) => {
+            write_auth_failure_response(stream, failure, scope)?;
+            Ok(None)
+        }
+    }
+}
+
+fn audit_actor(principal: &AuthPrincipal, fallback: &str) -> String {
+    if principal.authenticated {
+        sanitize_audit_value(&principal.identity)
+    } else {
+        sanitize_audit_value(fallback)
+    }
 }
 
 fn is_write_leader(app: &App) -> Result<bool> {
@@ -501,4 +532,3 @@ fn form_bool(form: &std::collections::HashMap<String, String>, key: &str) -> boo
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
 }
-

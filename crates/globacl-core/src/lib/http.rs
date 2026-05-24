@@ -163,14 +163,35 @@ pub fn parse_query_path(path: &str) -> (String, HashMap<String, String>) {
 }
 
 pub fn http_get(addr: &str, path: &str) -> Result<HttpResponse> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    http_get_with_headers(addr, path, &[])
+}
+
+pub fn http_get_with_headers(
+    addr: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<HttpResponse> {
+    let extra_headers = format_extra_headers(headers)?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{extra_headers}Connection: close\r\n\r\n");
     send_http(addr, request.as_bytes())
 }
 
 pub fn http_post(addr: &str, path: &str, body: &[u8]) -> Result<HttpResponse> {
+    http_post_with_headers(addr, path, body, &[])
+}
+
+pub fn http_post_with_headers(
+    addr: &str,
+    path: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<HttpResponse> {
+    let extra_headers = format_extra_headers(headers)?;
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        body.len(),
+        extra_headers
     )
     .into_bytes();
     request.extend_from_slice(body);
@@ -187,20 +208,76 @@ pub fn http_post_with_content_type(
     content_type: &str,
     body: &[u8],
 ) -> Result<HttpResponse> {
+    http_post_with_content_type_and_headers(addr, path, content_type, body, &[])
+}
+
+pub fn http_post_with_content_type_and_headers(
+    addr: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<HttpResponse> {
+    let extra_headers = format_extra_headers(headers)?;
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        body.len(),
+        extra_headers
     )
     .into_bytes();
     request.extend_from_slice(body);
     send_http(addr, &request)
 }
 
+fn format_extra_headers(headers: &[(&str, &str)]) -> Result<String> {
+    let mut out = String::new();
+    for (name, value) in headers {
+        if name.contains('\r')
+            || name.contains('\n')
+            || name.contains(':')
+            || value.contains('\r')
+            || value.contains('\n')
+        {
+            return Err(GlobAclError::Parse(
+                "invalid HTTP header name or value".to_owned(),
+            ));
+        }
+        out.push_str(name.trim());
+        out.push_str(": ");
+        out.push_str(value.trim());
+        out.push_str("\r\n");
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
+    pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    pub fn bearer_token(&self) -> Option<&str> {
+        let value = self.header("authorization")?.trim();
+        value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn authorization_forward_header(&self) -> Option<(&'static str, &str)> {
+        self.header("authorization")
+            .map(|value| ("Authorization", value))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -390,8 +467,10 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         .to_owned();
 
     let mut content_length = 0usize;
+    let mut headers = HashMap::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value
                     .trim()
@@ -420,6 +499,7 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path,
+        headers,
         body: buffer[header_end..target_len].to_vec(),
     })
 }
@@ -438,6 +518,7 @@ pub fn write_http_response(
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
@@ -469,4 +550,3 @@ pub fn write_json_response_from_text(
     let value = key_value_body_to_json(body)?;
     write_json_response(stream, status_code, &value)
 }
-

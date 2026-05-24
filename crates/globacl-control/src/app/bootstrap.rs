@@ -1,7 +1,9 @@
 use globacl_core::{
-    deny_requires_blast_radius_override, http_get, http_post, parse_form_lines, parse_query_path,
-    read_http_request, rule_requires_blast_radius_override, write_http_response, DenyRequest,
-    GlobAclError, Result, RuleRequest,
+    auth_config_from_env_var, deny_requires_blast_radius_override, http_get,
+    http_get_with_headers, http_post_with_headers, parse_form_lines, parse_query_path,
+    read_http_request, rule_requires_blast_radius_override, write_auth_failure_response,
+    write_http_response, AuthConfig, AuthPrincipal, DenyRequest, GlobAclError, HttpRequest, Result,
+    RuleRequest,
 };
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +12,7 @@ use std::thread;
 
 struct App {
     commit_addr: String,
+    auth: AuthConfig,
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -20,7 +23,8 @@ pub(crate) fn run() -> Result<()> {
         .or_else(|| env::var("GLOBACL_COMMITD_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:7003".to_owned());
     let bind_addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:7000");
-    let app = Arc::new(App { commit_addr });
+    let auth = auth_config_from_env_var("GLOBACL_AUTH_TOKENS")?;
+    let app = Arc::new(App { commit_addr, auth });
 
     let listener = TcpListener::bind(bind_addr)?;
     eprintln!(
@@ -44,4 +48,3 @@ pub(crate) fn run() -> Result<()> {
 
     Ok(())
 }
-

@@ -1,18 +1,26 @@
 
-fn proxy_get(stream: &mut TcpStream, app: &App, path: &str) -> Result<()> {
-    match http_get(&app.commit_addr, path) {
+fn proxy_get(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
+    let headers = request
+        .authorization_forward_header()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match http_get_with_headers(&app.commit_addr, &request.path, &headers) {
         Ok(response) => write_http_response(
             stream,
             response.status_code,
-            content_type_for(path),
+            content_type_for(&request.path),
             &response.body,
         ),
         Err(err) => write_proxy_error(stream, err),
     }
 }
 
-fn proxy_post(stream: &mut TcpStream, app: &App, path: &str, body: &[u8]) -> Result<()> {
-    match http_post(&app.commit_addr, path, body) {
+fn proxy_post(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
+    let headers = request
+        .authorization_forward_header()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match http_post_with_headers(&app.commit_addr, &request.path, &request.body, &headers) {
         Ok(response) => {
             write_http_response(stream, response.status_code, "text/plain", &response.body)
         }
@@ -50,4 +58,19 @@ fn blast_radius_override_enabled(form: &std::collections::HashMap<String, String
             )
         })
         .unwrap_or(false)
+}
+
+fn require_scope(
+    stream: &mut TcpStream,
+    app: &App,
+    request: &HttpRequest,
+    scope: &str,
+) -> Result<Option<AuthPrincipal>> {
+    match app.auth.require_scope(request, scope) {
+        Ok(principal) => Ok(Some(principal)),
+        Err(failure) => {
+            write_auth_failure_response(stream, failure, scope)?;
+            Ok(None)
+        }
+    }
 }

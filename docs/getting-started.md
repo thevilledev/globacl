@@ -8,6 +8,17 @@ cargo run -p globacl-commitd -- data/commitd 127.0.0.1:7003 4096 0
 
 The final argument is the synthetic canary interval in seconds. Use `0` to disable automatic canaries, or a positive value such as `60` to inject a P0 canary every minute.
 
+Optional bearer-token auth can be enabled on `globacl-control` and
+`globacl-commitd`:
+
+```sh
+export GLOBACL_AUTH_TOKENS='admin-token=admin:acl:write,snapshot:write,admin:rollback,audit:read'
+```
+
+When this is set, protected write/admin requests need
+`Authorization: Bearer admin-token`. Leave it unset for the simplest local
+walkthrough.
+
 Optional Ed25519 signing keys can be set on commitd, relays, and agents:
 
 ```sh
@@ -74,6 +85,9 @@ curl -sS http://127.0.0.1:7000/v1/deny \
   --header 'Content-Type: application/json' \
   --data-binary '{"op_id":"demo-1","tenant_id":"tenant-a","namespace":"user","key":"user-123","action":"deny","delivery_priority":"p0","priority":100,"reason_code":"abuse","created_by":"demo"}'
 ```
+
+If auth is enabled, add `--header 'Authorization: Bearer admin-token'` to
+write/admin requests.
 
 Query the agent:
 

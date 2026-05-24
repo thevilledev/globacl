@@ -6,7 +6,10 @@ Generated models live in `globacl/client.gen.go`. The ergonomic wrapper is in
 Use:
 
 ```go
-client, err := globacl.NewClient("http://127.0.0.1:7000")
+client, err := globacl.NewClient(
+    "http://127.0.0.1:7000",
+    globacl.WithBearerToken("admin-token"),
+)
 if err != nil {
     panic(err)
 }
@@ -33,3 +36,6 @@ go run ./cmd/globacl-smoke wait-health --base-url http://127.0.0.1:7000
 go run ./cmd/globacl-smoke deny --base-url http://127.0.0.1:7000 \
   --op-id demo-1 --tenant-id tenant-a --namespace user --key user-123
 ```
+
+For auth-enabled environments, set `GLOBACL_BEARER_TOKEN` before running the
+smoke runner.

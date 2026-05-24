@@ -67,11 +67,17 @@ paths:
         - Authoring
       summary: Commit a point deny, allow override, or delete mutation.
       operationId: createDenyMutation
+      security:
+        - BearerAuth: []
       requestBody:
         $ref: "#/components/requestBodies/DenyMutation"
       responses:
         "200":
           $ref: "#/components/responses/CommitOutcome"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
         "400":
           $ref: "#/components/responses/RejectedJson"
         "503":
@@ -83,11 +89,17 @@ paths:
         - Authoring
       summary: Alias for `/v1/deny`.
       operationId: createPointMutation
+      security:
+        - BearerAuth: []
       requestBody:
         $ref: "#/components/requestBodies/DenyMutation"
       responses:
         "200":
           $ref: "#/components/responses/CommitOutcome"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
         "400":
           $ref: "#/components/responses/RejectedJson"
         "503":
@@ -100,11 +112,17 @@ paths:
       summary: Commit a compiled rule mutation.
       description: Supports IPv4 CIDR and domain suffix rules.
       operationId: createRuleMutation
+      security:
+        - BearerAuth: []
       requestBody:
         $ref: "#/components/requestBodies/RuleMutation"
       responses:
         "200":
           $ref: "#/components/responses/CommitOutcome"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
         "400":
           $ref: "#/components/responses/RejectedJson"
         "503":
@@ -116,6 +134,8 @@ paths:
         - Propagation
       summary: Commit a synthetic P0 canary deny.
       operationId: createCanary
+      security:
+        - BearerAuth: []
       responses:
         "200":
           description: Canary status.
@@ -134,6 +154,10 @@ paths:
                     shard_id: 7
                     seq: 42
                     delivery_priority: p0
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
         "503":
           $ref: "#/components/responses/UnavailableJson"
 
@@ -327,6 +351,8 @@ paths:
         - Snapshots
       summary: Upload and archive a binary snapshot.
       operationId: uploadSnapshot
+      security:
+        - BearerAuth: []
       requestBody:
         required: true
         content:
@@ -341,6 +367,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
 
   /v1/snapshot.sig:
     get:
@@ -424,6 +454,8 @@ paths:
         - Snapshots
       summary: Restore an archived snapshot through forward compensating mutations.
       operationId: rollbackToSnapshot
+      security:
+        - BearerAuth: []
       requestBody:
         $ref: "#/components/requestBodies/Rollback"
       responses:
@@ -433,6 +465,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RollbackResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
         "400":
           $ref: "#/components/responses/RejectedJson"
 
@@ -442,6 +478,8 @@ paths:
         - Operations
       summary: Return the append-only audit log.
       operationId: getAuditLog
+      security:
+        - BearerAuth: []
       responses:
         "200":
           description: Audit log JSON.
@@ -449,8 +487,19 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuditLogResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedJson"
+        "403":
+          $ref: "#/components/responses/ForbiddenJson"
 
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Optional static bearer-token authentication. When `GLOBACL_AUTH_TOKENS`
+        is unset, protected endpoints allow local development traffic.
   schemas:
     BinaryPayload:
       type: string
@@ -1403,6 +1452,30 @@ components:
               value:
                 status: rejected
                 reason: blast_radius_override_required
+    UnauthorizedJson:
+      description: Bearer authentication is required or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing_bearer:
+              value:
+                status: rejected
+                reason: missing_bearer_token
+                required_scope: acl:write
+    ForbiddenJson:
+      description: Authenticated caller lacks the required scope.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            insufficient_scope:
+              value:
+                status: rejected
+                reason: insufficient_scope
+                required_scope: acl:write
     UnavailableJson:
       description: Upstream commit service is unavailable.
       content:
