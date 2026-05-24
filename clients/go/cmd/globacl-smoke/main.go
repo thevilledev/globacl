@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: globacl-smoke <wait-health|require-health-fields|deny|wait-demo-deny|wait-propagation|wait-prometheus-query>")
+		fatalf("usage: globacl-smoke <wait-health|require-health-fields|deny|wait-demo-deny|wait-propagation|wait-prometheus-query|wait-grafana-dashboard>")
 	}
 
 	var err error
@@ -35,6 +35,8 @@ func main() {
 		err = waitPropagation(os.Args[2:])
 	case "wait-prometheus-query":
 		err = waitPrometheusQuery(os.Args[2:])
+	case "wait-grafana-dashboard":
+		err = waitGrafanaDashboard(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -332,6 +334,73 @@ func prometheusSampleValue(raw json.RawMessage) (float64, error) {
 		return 0, err
 	}
 	return value, nil
+}
+
+func waitGrafanaDashboard(args []string) error {
+	flags := flag.NewFlagSet("wait-grafana-dashboard", flag.ExitOnError)
+	baseURL := flags.String("base-url", "", "Grafana base URL")
+	uid := flags.String("uid", "globacl-overview", "dashboard uid")
+	timeout := flags.Duration("timeout", 120*time.Second, "wait timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	normalized, err := normalizeBaseURL(*baseURL)
+	if err != nil {
+		return err
+	}
+	dashboardUID := requireValue("uid", *uid)
+	return waitUntil(*timeout, func(ctx context.Context) (bool, error) {
+		if ok, err := grafanaHealthy(ctx, normalized); err != nil || !ok {
+			return false, err
+		}
+		return grafanaDashboardExists(ctx, normalized, dashboardUID)
+	})
+}
+
+func grafanaHealthy(ctx context.Context, baseURL string) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/health", nil)
+	if err != nil {
+		return false, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return false, nil
+	}
+	defer response.Body.Close()
+	return response.StatusCode >= 200 && response.StatusCode < 300, nil
+}
+
+func grafanaDashboardExists(ctx context.Context, baseURL string, uid string) (bool, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		baseURL+"/api/dashboards/uid/"+url.PathEscape(uid),
+		nil,
+	)
+	if err != nil {
+		return false, err
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return false, nil
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(response.Body)
+		return false, fmt.Errorf("Grafana dashboard lookup returned HTTP %d: %s", response.StatusCode, body)
+	}
+	var payload struct {
+		Dashboard struct {
+			UID string `json:"uid"`
+		} `json:"dashboard"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return false, nil
+	}
+	return payload.Dashboard.UID == uid, nil
 }
 
 func newClient(baseURL string) (*globacl.Client, error) {

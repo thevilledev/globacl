@@ -94,8 +94,9 @@ observes a deny through the agent. The global smoke deploys a three-replica
 central commitd StatefulSet with persistent volumes, stateless central control
 gateways, plus three regional k3s clusters with HA relays and demo apps. The
 observability smoke deploys a three-replica local control plane, three relays,
-three agents, three demo apps, and Prometheus, then asserts scrape discovery
-and live propagation metrics after a deny.
+three agents, three demo apps, Prometheus, and Grafana. It asserts scrape
+discovery, verifies that the provisioned `globacl-overview` Grafana dashboard is
+available, and checks live propagation metrics after a deny.
 
 The smoke scripts use the Go client smoke runner in `clients/go/cmd/globacl-smoke` for API operations and assertions, so they exercise the generated client model surface instead of shell JSON parsing.
 If a smoke environment enables `GLOBACL_AUTH_TOKENS`, export

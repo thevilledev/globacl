@@ -332,6 +332,30 @@ Use the metrics for scrape-based SLO dashboards and alerts around commit
 quorum, stale agents, relay source health, central ack aggregation, publisher
 errors, repair activity, and edge-state size.
 
+The local observability setup also deploys Grafana with a provisioned
+Prometheus datasource and the checked-in dashboard at
+`deploy/grafana/globacl-overview.json`. The dashboard visualizes commitd
+leadership, relay source health, propagation progress, central acknowledgements,
+agent lag, repair activity, edge-state size, and recent control-plane errors.
+
+When running the dev cluster helper, Grafana is port-forwarded locally:
+
+```sh
+./deploy/k3s/dev-cluster.sh up --messaging jetstream
+open http://127.0.0.1:13000/d/globacl-overview/globacl-system-overview
+```
+
+For direct Kubernetes use, create the dashboard ConfigMap and apply the Grafana
+manifests after `local-observability.yaml`:
+
+```sh
+kubectl -n globacl create configmap globacl-grafana-dashboard \
+  --from-file=globacl-overview.json=deploy/grafana/globacl-overview.json \
+  --dry-run=client \
+  -o yaml | kubectl apply -f -
+kubectl apply -f deploy/k8s/grafana.yaml
+```
+
 ## Production Notes
 
 These manifests prove the distribution mechanics, but they are intentionally not a complete production platform.

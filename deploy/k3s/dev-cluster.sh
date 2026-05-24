@@ -10,6 +10,7 @@ NAMESPACE="${NAMESPACE:-globacl}"
 CONTROL_PORT="${CONTROL_PORT:-17200}"
 DEMO_PORT="${DEMO_PORT:-18280}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-19090}"
+GRAFANA_PORT="${GRAFANA_PORT:-13000}"
 AGENTS="${AGENTS:-2}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_RESTART="${SKIP_RESTART:-0}"
@@ -103,6 +104,7 @@ Environment:
   CONTROL_PORT=${CONTROL_PORT}
   DEMO_PORT=${DEMO_PORT}
   PROMETHEUS_PORT=${PROMETHEUS_PORT}
+  GRAFANA_PORT=${GRAFANA_PORT}
   SKIP_BUILD=1       reuse the current local image tag
   SKIP_RESTART=1     apply manifests without restarting workloads
 EOF
@@ -157,6 +159,7 @@ rollout_restart() {
   k -n "${NAMESPACE}" rollout restart deploy/globacl-agent
   k -n "${NAMESPACE}" rollout restart deploy/globacl-demo
   k -n "${NAMESPACE}" rollout restart deploy/globacl-prometheus
+  k -n "${NAMESPACE}" rollout restart deploy/globacl-grafana
 }
 
 wait_for_rollouts() {
@@ -169,6 +172,7 @@ wait_for_rollouts() {
   k -n "${NAMESPACE}" rollout status deploy/globacl-agent --timeout=180s
   k -n "${NAMESPACE}" rollout status deploy/globacl-demo --timeout=180s
   k -n "${NAMESPACE}" rollout status deploy/globacl-prometheus --timeout=180s
+  k -n "${NAMESPACE}" rollout status deploy/globacl-grafana --timeout=180s
 }
 
 configure_pull_proxy() {
@@ -209,12 +213,21 @@ configure_messaging() {
   esac
 }
 
+apply_grafana() {
+  k -n "${NAMESPACE}" create configmap globacl-grafana-dashboard \
+    --from-file=globacl-overview.json="${ROOT_DIR}/deploy/grafana/globacl-overview.json" \
+    --dry-run=client \
+    -o yaml | k apply -f -
+  k apply -f "${ROOT_DIR}/deploy/k8s/grafana.yaml"
+}
+
 deploy_current_code() {
   ensure_cluster
   build_and_import_image
 
   echo "applying local observability topology"
   k apply -f "${ROOT_DIR}/deploy/k8s/local-observability.yaml"
+  apply_grafana
   configure_messaging
   rollout_restart
   wait_for_rollouts
@@ -252,11 +265,13 @@ open_ports() {
   port_forward svc/globacl-control "${CONTROL_PORT}" 7000 /tmp/globacl-dev-control-pf.log
   port_forward svc/globacl-demo "${DEMO_PORT}" 8080 /tmp/globacl-dev-demo-pf.log
   port_forward svc/globacl-prometheus "${PROMETHEUS_PORT}" 9090 /tmp/globacl-dev-prometheus-pf.log
+  port_forward svc/globacl-grafana "${GRAFANA_PORT}" 3000 /tmp/globacl-dev-grafana-pf.log
 
   cat <<EOF
 control:    http://127.0.0.1:${CONTROL_PORT}
 demo:       http://127.0.0.1:${DEMO_PORT}
 prometheus: http://127.0.0.1:${PROMETHEUS_PORT}
+grafana:    http://127.0.0.1:${GRAFANA_PORT}/d/globacl-overview/globacl-system-overview
 messaging:  ${MESSAGING}
 
 Redeploy code from another terminal:

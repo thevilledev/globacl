@@ -8,6 +8,7 @@ NAMESPACE="${NAMESPACE:-globacl}"
 CONTROL_PORT="${CONTROL_PORT:-17200}"
 DEMO_PORT="${DEMO_PORT:-18280}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-19090}"
+GRAFANA_PORT="${GRAFANA_PORT:-13000}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
 
 PIDS=()
@@ -66,8 +67,23 @@ wait_for_prometheus_query() {
     --timeout 180s
 }
 
+wait_for_grafana_dashboard() {
+  smoke_client wait-grafana-dashboard \
+    --base-url "http://127.0.0.1:${GRAFANA_PORT}" \
+    --uid globacl-overview \
+    --timeout 180s
+}
+
 smoke_client() {
   (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
+}
+
+apply_grafana() {
+  k -n "${NAMESPACE}" create configmap globacl-grafana-dashboard \
+    --from-file=globacl-overview.json="${ROOT_DIR}/deploy/grafana/globacl-overview.json" \
+    --dry-run=client \
+    -o yaml | k apply -f -
+  k apply -f "${ROOT_DIR}/deploy/k8s/grafana.yaml"
 }
 
 require_cmd docker
@@ -83,12 +99,14 @@ k3d cluster create "${CLUSTER}" --agents 2 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
 k apply -f "${ROOT_DIR}/deploy/k8s/local-observability.yaml"
+apply_grafana
 k -n "${NAMESPACE}" rollout status statefulset/globacl-commitd --timeout=240s
 k -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-relay --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-agent --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-demo --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-prometheus --timeout=180s
+k -n "${NAMESPACE}" rollout status deploy/globacl-grafana --timeout=180s
 
 port_forward svc/globacl-control "${CONTROL_PORT}" 7000 /tmp/globacl-observability-control-pf.log
 wait_for_http "http://127.0.0.1:${CONTROL_PORT}/health"
@@ -98,6 +116,9 @@ wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
 
 port_forward svc/globacl-prometheus "${PROMETHEUS_PORT}" 9090 /tmp/globacl-observability-prometheus-pf.log
 wait_for_prometheus_query "vector(1)" 1
+
+port_forward svc/globacl-grafana "${GRAFANA_PORT}" 3000 /tmp/globacl-observability-grafana-pf.log
+wait_for_grafana_dashboard
 
 smoke_client deny \
   --base-url "http://127.0.0.1:${CONTROL_PORT}" \
