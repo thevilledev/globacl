@@ -1027,7 +1027,7 @@ fn assert_prometheus_metric(response: &RawResponse, metric_name: &str) {
         "missing TYPE line for {metric_name}: {body}"
     );
     assert!(
-        body.contains(&format!("{metric_name}")),
+        body.contains(metric_name),
         "missing sample for {metric_name}: {body}"
     );
 }
