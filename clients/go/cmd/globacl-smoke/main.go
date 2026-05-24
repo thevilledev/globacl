@@ -56,15 +56,32 @@ func waitHealth(args []string) error {
 	if err != nil {
 		return err
 	}
-	return waitUntil(*timeout, func(ctx context.Context) (bool, error) {
+	var lastErr error
+	var lastStatus globacl.HealthResponseStatus
+	var sawStatus bool
+	err = waitUntil(*timeout, func(ctx context.Context) (bool, error) {
 		health, err := client.Health(ctx)
 		if err != nil {
+			lastErr = err
 			return false, nil
 		}
+		lastErr = nil
+		lastStatus = health.Status
+		sawStatus = true
 		return health.Status == globacl.HealthResponseStatusOk ||
 			health.Status == globacl.HealthResponseStatusDegraded ||
 			health.Status == globacl.HealthResponseStatusStale, nil
 	})
+	if err == nil {
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%w: last health error: %v", err, lastErr)
+	}
+	if sawStatus {
+		return fmt.Errorf("%w: last health status: %q", err, lastStatus)
+	}
+	return err
 }
 
 func requireHealthFields(args []string) error {
@@ -83,18 +100,34 @@ func requireHealthFields(args []string) error {
 	if err != nil {
 		return err
 	}
-	return waitUntil(*timeout, func(ctx context.Context) (bool, error) {
+	var lastErr error
+	var lastMissing []string
+	err = waitUntil(*timeout, func(ctx context.Context) (bool, error) {
 		health, err := client.Health(ctx)
 		if err != nil {
+			lastErr = err
 			return false, nil
 		}
+		lastErr = nil
+		lastMissing = lastMissing[:0]
 		for _, field := range requiredFields {
-			if _, ok := health.Get(strings.TrimSpace(field)); !ok {
-				return false, nil
+			name := strings.TrimSpace(field)
+			if _, ok := health.Get(name); !ok {
+				lastMissing = append(lastMissing, name)
 			}
 		}
-		return true, nil
+		return len(lastMissing) == 0, nil
 	})
+	if err == nil {
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%w: last health error: %v", err, lastErr)
+	}
+	if len(lastMissing) > 0 {
+		return fmt.Errorf("%w: last missing health fields: %s", err, strings.Join(lastMissing, ","))
+	}
+	return err
 }
 
 func deny(args []string) error {

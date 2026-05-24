@@ -10,23 +10,34 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
             let status = if health.ok { "ok" } else { "degraded" };
             let upstream = if health.ok { "ok" } else { "bad" };
             let source_details = parse_json_body(health.details.as_bytes())
-                .unwrap_or_else(|_| json!({"parse_error": true}));
+                .unwrap_or_else(|_| json!({"source_parse_error": true}));
+            let mut body = json!({
+                "status": status,
+                "role": "relay",
+                "relay_id": app.relay_id.as_str(),
+                "location": app.location.as_str(),
+                "source": app.source.kind(),
+                "upstream": upstream,
+                "upstream_addr": app.source.upstream_addr(),
+                "ack_count": ack_count,
+                "last_ack_forward_unix": ack_forward_status.last_ack_forward_unix,
+                "ack_forward_errors": ack_forward_status.ack_forward_errors
+            });
+            if let (Some(body), Some(source_details)) =
+                (body.as_object_mut(), source_details.as_object())
+            {
+                for (key, value) in source_details {
+                    if !body.contains_key(key)
+                        && (value.is_string() || value.is_number() || value.is_boolean())
+                    {
+                        body.insert(key.clone(), value.clone());
+                    }
+                }
+            }
             write_json_response(
                 &mut stream,
                 200,
-                &json!({
-                    "status": status,
-                    "role": "relay",
-                    "relay_id": app.relay_id.as_str(),
-                    "location": app.location.as_str(),
-                    "source": app.source.kind(),
-                    "upstream": upstream,
-                    "upstream_addr": app.source.upstream_addr(),
-                    "ack_count": ack_count,
-                    "last_ack_forward_unix": ack_forward_status.last_ack_forward_unix,
-                    "ack_forward_errors": ack_forward_status.ack_forward_errors,
-                    "source_details": source_details
-                }),
+                &body,
             )?;
         }
         "GET" if route == "/metrics" => {

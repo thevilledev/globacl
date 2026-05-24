@@ -9,10 +9,17 @@ CONTROL_PORT="${CONTROL_PORT:-17100}"
 RELAY_PORT="${RELAY_PORT:-17101}"
 DEMO_PORT="${DEMO_PORT:-18180}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
+PORT_FORWARD_TIMEOUT_SECONDS="${PORT_FORWARD_TIMEOUT_SECONDS:-30}"
 
 CONTROL_PF_PID=""
 RELAY_PF_PID=""
 DEMO_PF_PID=""
+SMOKE_BIN=""
+START_PORT_FORWARD_PID=""
+
+CONTROL_PF_LOG="${TMPDIR:-/tmp}/globacl-jetstream-control-pf.log"
+RELAY_PF_LOG="${TMPDIR:-/tmp}/globacl-jetstream-relay-pf.log"
+DEMO_PF_LOG="${TMPDIR:-/tmp}/globacl-jetstream-demo-pf.log"
 
 cleanup() {
   if [[ -n "${CONTROL_PF_PID}" ]]; then
@@ -26,6 +33,9 @@ cleanup() {
   if [[ -n "${DEMO_PF_PID}" ]]; then
     kill "${DEMO_PF_PID}" 2>/dev/null || true
     wait "${DEMO_PF_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${SMOKE_BIN}" ]]; then
+    rm -f "${SMOKE_BIN}" 2>/dev/null || true
   fi
   if [[ "${KEEP_CLUSTER}" != "1" ]]; then
     k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
@@ -46,7 +56,13 @@ k() {
 
 wait_for_http() {
   local url="$1"
-  smoke_client wait-health --base-url "${url}" --timeout 120s
+  local log_file="${2:-}"
+  if ! smoke_client wait-health --base-url "${url}" --timeout 120s; then
+    if [[ -n "${log_file}" ]]; then
+      print_port_forward_log "${log_file}"
+    fi
+    return 1
+  fi
 }
 
 wait_for_propagation_ack() {
@@ -58,13 +74,64 @@ wait_for_propagation_ack() {
 }
 
 smoke_client() {
-  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
+  "${SMOKE_BIN}" "$@"
+}
+
+build_smoke_client() {
+  SMOKE_BIN="$(mktemp "${TMPDIR:-/tmp}/globacl-smoke.XXXXXX")"
+  (cd "${ROOT_DIR}/clients/go" && go build -o "${SMOKE_BIN}" ./cmd/globacl-smoke)
+}
+
+print_port_forward_log() {
+  local log_file="$1"
+  if [[ -s "${log_file}" ]]; then
+    echo "port-forward log (${log_file}):" >&2
+    cat "${log_file}" >&2 || true
+  else
+    echo "port-forward log (${log_file}) is empty" >&2
+  fi
+}
+
+stop_port_forward_pid() {
+  local pid="$1"
+  kill "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+start_port_forward() {
+  local service="$1"
+  local local_port="$2"
+  local remote_port="$3"
+  local log_file="$4"
+
+  : >"${log_file}"
+  k -n "${NAMESPACE}" port-forward "svc/${service}" "${local_port}:${remote_port}" >"${log_file}" 2>&1 &
+  START_PORT_FORWARD_PID="$!"
+
+  local deadline=$((SECONDS + PORT_FORWARD_TIMEOUT_SECONDS))
+  while ! grep -q "Forwarding from" "${log_file}" 2>/dev/null; do
+    if ! kill -0 "${START_PORT_FORWARD_PID}" 2>/dev/null; then
+      echo "port-forward for svc/${service} exited before becoming ready" >&2
+      print_port_forward_log "${log_file}"
+      return 1
+    fi
+    if ((SECONDS >= deadline)); then
+      echo "timed out waiting ${PORT_FORWARD_TIMEOUT_SECONDS}s for port-forward svc/${service} ${local_port}:${remote_port}" >&2
+      print_port_forward_log "${log_file}"
+      stop_port_forward_pid "${START_PORT_FORWARD_PID}"
+      START_PORT_FORWARD_PID=""
+      return 1
+    fi
+    sleep 0.2
+  done
 }
 
 require_cmd docker
 require_cmd k3d
 require_cmd kubectl
 require_cmd go
+
+build_smoke_client
 
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
@@ -92,17 +159,17 @@ k -n "${NAMESPACE}" rollout status deploy/globacl-relay --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-agent --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-demo --timeout=180s
 
-k -n "${NAMESPACE}" port-forward svc/globacl-control "${CONTROL_PORT}:7000" >/tmp/globacl-jetstream-control-pf.log 2>&1 &
-CONTROL_PF_PID="$!"
-wait_for_http "http://127.0.0.1:${CONTROL_PORT}/health"
+start_port_forward globacl-control "${CONTROL_PORT}" 7000 "${CONTROL_PF_LOG}"
+CONTROL_PF_PID="${START_PORT_FORWARD_PID}"
+wait_for_http "http://127.0.0.1:${CONTROL_PORT}/health" "${CONTROL_PF_LOG}"
 
-k -n "${NAMESPACE}" port-forward svc/globacl-relay "${RELAY_PORT}:7001" >/tmp/globacl-jetstream-relay-pf.log 2>&1 &
-RELAY_PF_PID="$!"
-wait_for_http "http://127.0.0.1:${RELAY_PORT}/health"
+start_port_forward globacl-relay "${RELAY_PORT}" 7001 "${RELAY_PF_LOG}"
+RELAY_PF_PID="${START_PORT_FORWARD_PID}"
+wait_for_http "http://127.0.0.1:${RELAY_PORT}/health" "${RELAY_PF_LOG}"
 
-k -n "${NAMESPACE}" port-forward svc/globacl-demo "${DEMO_PORT}:8080" >/tmp/globacl-jetstream-demo-pf.log 2>&1 &
-DEMO_PF_PID="$!"
-wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
+start_port_forward globacl-demo "${DEMO_PORT}" 8080 "${DEMO_PF_LOG}"
+DEMO_PF_PID="${START_PORT_FORWARD_PID}"
+wait_for_http "http://127.0.0.1:${DEMO_PORT}/health" "${DEMO_PF_LOG}"
 
 smoke_client require-health-fields \
   --base-url "http://127.0.0.1:${RELAY_PORT}" \
