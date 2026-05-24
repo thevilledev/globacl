@@ -1,4 +1,4 @@
-use globacl_core::{http_get, http_post, parse_json_fields, parse_watermarks};
+use globacl_core::{http_get, http_post, parse_json_body, parse_json_fields, parse_watermarks};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -6,7 +6,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,8 +14,11 @@ const NODE_A: &str = "node-a";
 const NODE_B: &str = "node-b";
 const NODE_C: &str = "node-c";
 
+static MULTI_PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 #[test]
 fn isolated_leader_cannot_commit_while_majority_side_elects_and_commits() {
+    let _guard = multi_process_test_guard();
     let mut cluster = CommitdCluster::start();
 
     wait_for_healthy_nodes(&cluster);
@@ -56,10 +59,45 @@ fn isolated_leader_cannot_commit_while_majority_side_elects_and_commits() {
     wait_for_watermark_at_least(cluster.addr(NODE_C), shard_id, seq);
 }
 
+#[test]
+fn restarted_follower_recovers_missed_ack_from_leader_snapshot() {
+    let _guard = multi_process_test_guard();
+    let mut cluster = CommitdCluster::start();
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+    assert_empty_ack_snapshot(cluster.addr(NODE_A));
+
+    cluster.stop_node(NODE_B);
+
+    let ack = http_post(
+        cluster.addr(NODE_A),
+        "/v1/ack",
+        ack_body("relay-regression", "agent-regression", 2, 9).as_bytes(),
+    )
+    .expect("leader ack request should receive a response");
+    assert_eq!(ack.status_code, 200, "{}", body_text(&ack.body));
+
+    wait_for_ack_count_at_least(cluster.addr(NODE_A), 1);
+    wait_for_ack_count_at_least(cluster.addr(NODE_C), 1);
+
+    cluster.restart_node(NODE_B);
+    wait_for_healthy_node(cluster.addr(NODE_B));
+    wait_for_ack_count_at_least(cluster.addr(NODE_B), 1);
+}
+
+fn multi_process_test_guard() -> MutexGuard<'static, ()> {
+    MULTI_PROCESS_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("multi-process test lock should not be poisoned")
+}
+
 struct CommitdCluster {
     temp_dir: PathBuf,
     nodes: HashMap<&'static str, Node>,
     links: DirectedLinks,
+    cluster_id: String,
 }
 
 impl CommitdCluster {
@@ -119,6 +157,7 @@ impl CommitdCluster {
             temp_dir,
             nodes,
             links,
+            cluster_id,
         }
     }
 
@@ -153,6 +192,51 @@ impl CommitdCluster {
             other => panic!("unknown node {other}"),
         }
     }
+
+    fn stop_node(&mut self, node_id: &'static str) {
+        self.nodes
+            .get_mut(node_id)
+            .unwrap_or_else(|| panic!("unknown node {node_id}"))
+            .stop();
+    }
+
+    fn restart_node(&mut self, node_id: &'static str) {
+        let peers = self.peers_for(node_id);
+        self.nodes
+            .get_mut(node_id)
+            .unwrap_or_else(|| panic!("unknown node {node_id}"))
+            .restart(&self.temp_dir, &self.cluster_id, &peers);
+    }
+
+    fn peers_for(&self, node_id: &str) -> String {
+        match node_id {
+            NODE_A => format!(
+                "{NODE_A}={},{}={},{}={}",
+                self.addr(NODE_A),
+                NODE_B,
+                self.links.ab.addr,
+                NODE_C,
+                self.links.ac.addr
+            ),
+            NODE_B => format!(
+                "{NODE_A}={},{}={},{}={}",
+                self.links.ba.addr,
+                NODE_B,
+                self.addr(NODE_B),
+                NODE_C,
+                self.links.bc.addr
+            ),
+            NODE_C => format!(
+                "{NODE_A}={},{}={},{}={}",
+                self.links.ca.addr,
+                NODE_B,
+                self.links.cb.addr,
+                NODE_C,
+                self.addr(NODE_C)
+            ),
+            other => panic!("unknown node {other}"),
+        }
+    }
 }
 
 impl Drop for CommitdCluster {
@@ -165,6 +249,7 @@ impl Drop for CommitdCluster {
 }
 
 struct Node {
+    node_id: &'static str,
     addr: String,
     child: Child,
 }
@@ -177,10 +262,26 @@ impl Node {
         cluster_id: &str,
         peers: &str,
     ) -> Self {
+        let child = Self::spawn(node_id, addr, temp_dir, cluster_id, peers);
+
+        Self {
+            node_id,
+            addr: addr.to_owned(),
+            child,
+        }
+    }
+
+    fn spawn(
+        node_id: &'static str,
+        addr: &str,
+        temp_dir: &Path,
+        cluster_id: &str,
+        peers: &str,
+    ) -> Child {
         let data_dir = temp_dir.join(node_id);
         fs::create_dir_all(&data_dir).expect("node data dir should be created");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_globacl-commitd"))
+        Command::new(env!("CARGO_BIN_EXE_globacl-commitd"))
             .arg(&data_dir)
             .arg(addr)
             .arg("4")
@@ -197,12 +298,12 @@ impl Node {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("commitd process should start");
+            .expect("commitd process should start")
+    }
 
-        Self {
-            addr: addr.to_owned(),
-            child,
-        }
+    fn restart(&mut self, temp_dir: &Path, cluster_id: &str, peers: &str) {
+        self.stop();
+        self.child = Self::spawn(self.node_id, &self.addr, temp_dir, cluster_id, peers);
     }
 
     fn stop(&mut self) {
@@ -326,11 +427,15 @@ fn proxy_connection(mut client: TcpStream, target_addr: String, enabled: Arc<Ato
 fn wait_for_healthy_nodes(cluster: &CommitdCluster) {
     for node_id in [NODE_A, NODE_B, NODE_C] {
         let addr = cluster.addr(node_id).to_owned();
-        wait_until(Duration::from_secs(10), || {
-            health(&addr)
-                .map(|form| (form.get("status").map(String::as_str) == Some("ok")).then_some(()))?
-        });
+        wait_for_healthy_node(&addr);
     }
+}
+
+fn wait_for_healthy_node(addr: &str) {
+    wait_until(Duration::from_secs(10), || {
+        health(addr)
+            .map(|form| (form.get("status").map(String::as_str) == Some("ok")).then_some(()))?
+    });
 }
 
 fn wait_for_role(addr: &str, role: &str) {
@@ -356,6 +461,28 @@ fn wait_for_watermark_at_least(addr: &str, shard_id: usize, seq: u64) {
         let watermarks = watermarks(addr)?;
         (watermarks.get(shard_id).copied().unwrap_or(0) >= seq).then_some(())
     });
+}
+
+fn wait_for_ack_count_at_least(addr: &str, expected: u64) {
+    wait_until(Duration::from_secs(10), || {
+        let form = health(addr)?;
+        let count = parse_json_u64(&form, "central_ack_count");
+        (count >= expected).then_some(())
+    });
+}
+
+fn assert_empty_ack_snapshot(addr: &str) {
+    let response =
+        http_get(addr, "/internal/replication/acks").expect("internal ack snapshot should respond");
+    assert_eq!(response.status_code, 200, "{}", body_text(&response.body));
+    let body = parse_json_body(&response.body).expect("ack snapshot should be JSON");
+    assert_eq!(
+        body.get("acks")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(0),
+        "empty ack snapshot should be a JSON acks array: {body:?}"
+    );
 }
 
 fn assert_all_watermarks_zero(addr: &str) {
@@ -402,6 +529,12 @@ fn deny_body(op_id: &str, key: &str) -> String {
         ("created_by", "partition-test"),
         ("reason_code", "partition"),
     ])
+}
+
+fn ack_body(relay_id: &str, agent_id: &str, shard_id: u16, seq: u64) -> String {
+    format!(
+        r#"{{"relay_id":"{relay_id}","location":"local","agent_id":"{agent_id}","shard_id":{shard_id},"seq":{seq},"entries":1,"applied_at_unix":1760000000,"relay_received_at_unix":1760000001}}"#
+    )
 }
 
 fn json_body(fields: &[(&str, &str)]) -> String {
