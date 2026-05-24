@@ -212,11 +212,15 @@ fn is_write_leader(app: &App) -> Result<bool> {
 }
 
 fn current_leader_addr(app: &App) -> Result<Option<String>> {
+    Ok(current_leader_peer(app)?.map(|(_, addr)| addr))
+}
+
+fn current_leader_peer(app: &App) -> Result<Option<(String, String)>> {
     let leader_id = lock_consensus(app)?.leader_id.clone();
     Ok(leader_id.and_then(|node_id| {
         app.replication
             .peer_addr(&node_id)
-            .map(|addr| addr.to_owned())
+            .map(|addr| (node_id, addr.to_owned()))
     }))
 }
 
@@ -510,10 +514,14 @@ fn persist_consensus_state(path: &Path, consensus: &ConsensusState) -> Result<()
     Ok(())
 }
 
-fn local_log_status(app: &App) -> Result<(u64, u64)> {
+fn local_log_status(app: &App) -> Result<(u64, u64, Vec<u64>)> {
     let state = lock_state(app)?;
     let last_seq = state.watermarks().iter().copied().max().unwrap_or(0);
-    Ok((last_seq, state.mutations_len() as u64))
+    Ok((
+        last_seq,
+        state.mutations_len() as u64,
+        state.watermarks().to_vec(),
+    ))
 }
 
 fn next_election_deadline_ms(node_id: &str, election_timeout_ms: u64) -> u64 {

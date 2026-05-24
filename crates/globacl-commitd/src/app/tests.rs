@@ -220,6 +220,45 @@ mod tests {
     }
 
     #[test]
+    fn vote_request_rejects_candidate_missing_local_shard_watermark() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-vote-stale-watermark-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        let mutation = {
+            let mut state = lock_state(&app).expect("state");
+            state
+                .commit(deny_request("op-1", "user-1"))
+                .expect("commit local mutation")
+                .mutation
+        };
+        let mut candidate_watermarks = vec![999_u64; 4];
+        candidate_watermarks[mutation.commit_id.shard_id as usize] = 0;
+        let candidate_watermarks = json!(candidate_watermarks).to_string();
+
+        let response = handle_request_vote(
+            &app,
+            &test_form(&[
+                ("term", "2"),
+                ("candidate_id", "node-b"),
+                ("last_seq", "999"),
+                ("log_len", "999"),
+                ("watermarks", candidate_watermarks.as_str()),
+            ]),
+        )
+        .expect("vote response");
+
+        assert!(!response_bool(&response, "vote_granted"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 2);
+        assert_eq!(consensus.voted_for, None);
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn vote_request_grants_only_one_vote_per_term() {
         let root = env::temp_dir().join(format!(
             "globacl-commitd-vote-once-{}-{}",
@@ -665,6 +704,89 @@ mod tests {
         assert_eq!(state.mutations_len(), 0);
         assert_eq!(state.watermarks()[mutation.commit_id.shard_id as usize], 0);
         drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn replication_prepare_rejects_unknown_leader() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-unknown-leader-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        let mutation = prepared_mutation("op-unknown-leader", "user-1", 1);
+
+        let err = prepare_replicated_mutation_from_leader(&app, &mutation, "node-x")
+            .expect_err("unknown leader should be rejected");
+
+        assert!(err.to_string().contains("unknown replication leader"));
+        assert!(!pending_mutation_path(&app.pending_dir, &mutation).exists());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn replication_routes_require_declared_leader_header() {
+        let request = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/internal/replication/prepare".to_owned(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let err = required_replication_leader(&request)
+            .expect_err("missing leader header should be rejected");
+
+        assert!(err.to_string().contains("missing X-Globacl-Leader-Id"));
+    }
+
+    #[test]
+    fn replication_prepare_rejects_conflicting_same_term_leader() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-conflicting-leader-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        {
+            let mut consensus = lock_consensus(&app).expect("consensus");
+            consensus.leader_id = Some("node-b".to_owned());
+            consensus.voted_for = Some("node-b".to_owned());
+        }
+        let mutation = prepared_mutation("op-conflicting-leader", "user-1", 3);
+
+        let err = prepare_replicated_mutation_from_leader(&app, &mutation, "node-c")
+            .expect_err("conflicting leader should be rejected");
+
+        assert!(err.to_string().contains("conflicting replication leader"));
+        assert!(!pending_mutation_path(&app.pending_dir, &mutation).exists());
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn higher_term_replication_prepare_fences_local_leader() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-higher-term-leader-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 3);
+        let mutation = prepared_mutation("op-higher-term", "user-1", 4);
+
+        prepare_replicated_mutation_from_leader(&app, &mutation, "node-b")
+            .expect("higher term leader should fence local leader");
+
+        assert!(pending_mutation_path(&app.pending_dir, &mutation).exists());
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 4);
+        assert_eq!(consensus.role, ConsensusRole::Follower);
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
         remove_test_dir(root);
     }
 

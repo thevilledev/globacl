@@ -76,12 +76,14 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("POST", "/internal/replication/prepare") => {
             let mutation = decode_mutation(&request.body)?;
-            prepare_replicated_mutation(&app, &mutation)?;
+            let leader_id = required_replication_leader(&request)?;
+            prepare_replicated_mutation_from_leader(&app, &mutation, leader_id)?;
             write_json_response(&mut stream, 200, &json!({"status": "prepared"}))?;
         }
         ("POST", "/internal/replication/commit") => {
             let mutation = decode_mutation(&request.body)?;
-            let status = commit_replicated_mutation(&app, mutation, true)?;
+            let leader_id = required_replication_leader(&request)?;
+            let status = commit_replicated_mutation_from_leader(&app, mutation, true, leader_id)?;
             let status = match status {
                 ApplyStatus::Applied => "applied",
                 ApplyStatus::DuplicateOrOld => "duplicate",
@@ -90,7 +92,8 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("POST", "/internal/replication/abort") => {
             let mutation = decode_mutation(&request.body)?;
-            remove_pending_mutation(&app.pending_dir, &mutation)?;
+            let leader_id = required_replication_leader(&request)?;
+            abort_replicated_mutation_from_leader(&app, &mutation, leader_id)?;
             write_json_response(&mut stream, 200, &json!({"status": "aborted"}))?;
         }
         ("POST", "/internal/replication/ack") => {
@@ -679,4 +682,10 @@ fn format_commitd_metrics(app: &App) -> Result<String> {
         central_ack_count,
     );
     Ok(out)
+}
+
+fn required_replication_leader(request: &HttpRequest) -> Result<&str> {
+    request
+        .header("x-globacl-leader-id")
+        .ok_or_else(|| GlobAclError::InvalidData("missing X-Globacl-Leader-Id header".to_owned()))
 }

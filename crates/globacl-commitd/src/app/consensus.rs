@@ -39,8 +39,8 @@ fn consensus_loop(app: Arc<App>) {
 }
 
 fn start_election(app: &App) -> Result<()> {
-    let (last_seq, log_len) = local_log_status(app)?;
-    let (term, last_seq, log_len) = {
+    let (last_seq, log_len, watermarks) = local_log_status(app)?;
+    let (term, last_seq, log_len, watermarks) = {
         let mut consensus = lock_consensus(app)?;
         consensus.current_term += 1;
         consensus.voted_for = Some(app.replication.node_id.clone());
@@ -52,7 +52,7 @@ fn start_election(app: &App) -> Result<()> {
             app.replication.election_timeout_ms,
         );
         persist_consensus_state(&app.consensus_path, &consensus)?;
-        (consensus.current_term, last_seq, log_len)
+        (consensus.current_term, last_seq, log_len, watermarks)
     };
 
     let mut votes = 1usize;
@@ -61,7 +61,8 @@ fn start_election(app: &App) -> Result<()> {
             "term": term,
             "candidate_id": app.replication.node_id,
             "last_seq": last_seq,
-            "log_len": log_len
+            "log_len": log_len,
+            "watermarks": watermarks
         })
         .to_string();
         match http_post(&peer.addr, "/internal/raft/request_vote", body.as_bytes()) {
@@ -142,7 +143,7 @@ fn handle_request_vote(
     let candidate_id = required_json_field(fields, "candidate_id")?;
     let candidate_last_seq = parse_json_u64(fields, "last_seq", 0)?;
     let candidate_log_len = parse_json_u64(fields, "log_len", 0)?;
-    let (local_last_seq, local_log_len) = local_log_status(app)?;
+    let (local_last_seq, local_log_len, local_watermarks) = local_log_status(app)?;
 
     let mut consensus = lock_consensus(app)?;
     if candidate_term > consensus.current_term {
@@ -152,8 +153,16 @@ fn handle_request_vote(
         consensus.leader_id = None;
     }
 
-    let up_to_date = candidate_last_seq > local_last_seq
-        || (candidate_last_seq == local_last_seq && candidate_log_len >= local_log_len);
+    let up_to_date = if let Some(candidate_watermarks) = vote_watermarks(fields)? {
+        candidate_watermarks.len() == local_watermarks.len()
+            && candidate_watermarks
+                .iter()
+                .zip(local_watermarks.iter())
+                .all(|(candidate, local)| candidate >= local)
+    } else {
+        candidate_last_seq > local_last_seq
+            || (candidate_last_seq == local_last_seq && candidate_log_len >= local_log_len)
+    };
     let no_conflicting_leader = consensus
         .leader_id
         .as_ref()
@@ -187,6 +196,25 @@ fn handle_request_vote(
         "vote_granted": can_vote
     })
     .to_string())
+}
+
+fn vote_watermarks(
+    fields: &std::collections::HashMap<String, String>,
+) -> Result<Option<Vec<u64>>> {
+    let Some(raw) = fields.get("watermarks").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let value = parse_json_body(raw.as_bytes())?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| GlobAclError::Parse("vote watermarks must be a JSON array".to_owned()))?;
+    let mut watermarks = Vec::with_capacity(array.len());
+    for value in array {
+        watermarks.push(value.as_u64().ok_or_else(|| {
+            GlobAclError::Parse("vote watermarks must contain unsigned integers".to_owned())
+        })?);
+    }
+    Ok(Some(watermarks))
 }
 
 fn handle_heartbeat(
@@ -269,7 +297,7 @@ fn sync_from_leader(app: &App) -> Result<()> {
     if is_write_leader(app)? {
         return Ok(());
     }
-    let Some(leader_addr) = current_leader_addr(app)? else {
+    let Some((leader_id, leader_addr)) = current_leader_peer(app)? else {
         return Ok(());
     };
     let watermarks_response = http_get(&leader_addr, "/v1/watermarks")?;
@@ -333,7 +361,7 @@ fn sync_from_leader(app: &App) -> Result<()> {
             )));
         }
         for mutation in decode_mutation_stream(&response.body)? {
-            commit_replicated_mutation(app, mutation, false)?;
+            commit_replicated_mutation_from_leader(app, mutation, false, &leader_id)?;
         }
     }
 
