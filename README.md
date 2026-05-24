@@ -101,7 +101,6 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 - [Client generation](docs/client-generation.md)
 - [Deployment](docs/deployment.md)
 - [Testing](docs/testing.md)
-- [Production readiness](docs/production-readiness.md)
 
 ## Clients
 
