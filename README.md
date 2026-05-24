@@ -98,6 +98,7 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 - [Getting started](docs/getting-started.md)
 - [API](docs/api.md)
 - [OpenAPI contract](docs/openapi.yaml)
+- [Client generation plan](docs/client-generation.md)
 - [Deployment](docs/deployment.md)
 - [Testing](docs/testing.md)
 - [Production readiness](docs/production-readiness.md)

@@ -52,7 +52,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/HealthResponse"
               examples:
                 control:
                   value:
@@ -122,7 +122,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/CanaryStatusResponse"
               examples:
                 committed:
                   value:
@@ -149,7 +149,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/LatestCanaryResponse"
 
   /v1/lookup:
     get:
@@ -277,7 +277,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/StatusResponse"
               examples:
                 ok:
                   value:
@@ -297,7 +297,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/RelayAcksResponse"
 
   /v1/propagation/status:
     get:
@@ -311,7 +311,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/PropagationStatusResponse"
 
   /v1/snapshot:
     get:
@@ -340,7 +340,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/StatusResponse"
 
   /v1/snapshot.sig:
     get:
@@ -364,7 +364,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/SnapshotManifestResponse"
 
   /v1/snapshot_manifest.sig:
     get:
@@ -416,7 +416,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/SnapshotListResponse"
 
   /v1/rollback:
     post:
@@ -432,7 +432,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/RollbackResponse"
         "400":
           $ref: "#/components/responses/RejectedJson"
 
@@ -448,17 +448,710 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/JsonObject"
+                $ref: "#/components/schemas/AuditLogResponse"
 
 components:
   schemas:
-    JsonObject:
-      type: object
-      description: JSON object response. Numeric and boolean fields use JSON scalar types where available.
-      additionalProperties: true
     BinaryPayload:
       type: string
       format: binary
+    Sequence:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Monotonic per-shard sequence number.
+    ShardId:
+      type: integer
+      format: int32
+      minimum: 0
+      maximum: 65535
+    UnixTimestamp:
+      type: integer
+      format: int64
+      minimum: 0
+      description: Unix timestamp in seconds.
+    Action:
+      type: string
+      enum:
+        - deny
+        - allow_override
+        - delete
+    DeliveryPriorityValue:
+      type: string
+      enum:
+        - p0
+        - p1
+        - p2
+    RuleKind:
+      type: string
+      enum:
+        - ipv4_cidr
+        - domain_suffix
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+            - stale
+        role:
+          type: string
+          enum:
+            - control
+            - relay
+            - agent
+            - follower
+            - candidate
+            - leader
+      additionalProperties:
+        oneOf:
+          - type: string
+          - type: integer
+          - type: boolean
+    DenyMutationRequest:
+      type: object
+      required:
+        - op_id
+        - tenant_id
+        - namespace
+        - key
+        - action
+      properties:
+        op_id:
+          type: string
+          minLength: 1
+        tenant_id:
+          type: string
+          minLength: 1
+        namespace:
+          type: string
+          minLength: 1
+        key:
+          type: string
+          minLength: 1
+        action:
+          $ref: "#/components/schemas/Action"
+        priority:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 0
+        reason_code:
+          type: string
+          default: unspecified
+        expires_at:
+          $ref: "#/components/schemas/UnixTimestamp"
+        created_by:
+          type: string
+          default: unknown
+        delivery_priority:
+          $ref: "#/components/schemas/DeliveryPriorityValue"
+        override_blast_radius:
+          type: boolean
+          default: false
+        blast_radius_override:
+          type: boolean
+          default: false
+        two_person_approved:
+          type: boolean
+          default: false
+      additionalProperties: false
+    RuleMutationRequest:
+      type: object
+      required:
+        - op_id
+        - tenant_id
+        - kind
+        - pattern
+        - action
+      properties:
+        op_id:
+          type: string
+          minLength: 1
+        tenant_id:
+          type: string
+          minLength: 1
+        kind:
+          $ref: "#/components/schemas/RuleKind"
+        pattern:
+          type: string
+          minLength: 1
+        action:
+          $ref: "#/components/schemas/Action"
+        priority:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 0
+        reason_code:
+          type: string
+          default: unspecified
+        expires_at:
+          $ref: "#/components/schemas/UnixTimestamp"
+        created_by:
+          type: string
+          default: unknown
+        delivery_priority:
+          $ref: "#/components/schemas/DeliveryPriorityValue"
+        override_blast_radius:
+          type: boolean
+          default: false
+        blast_radius_override:
+          type: boolean
+          default: false
+        two_person_approved:
+          type: boolean
+          default: false
+      additionalProperties: false
+    CommitOutcomeResponse:
+      type: object
+      required:
+        - duplicate
+        - shard_id
+        - seq
+        - epoch
+        - action
+        - key_hash
+        - delivery_priority
+        - committed_at_unix
+        - entries_changed
+      properties:
+        duplicate:
+          type: boolean
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        epoch:
+          $ref: "#/components/schemas/Sequence"
+        action:
+          $ref: "#/components/schemas/Action"
+        key_hash:
+          type: integer
+          format: int64
+          minimum: 0
+        delivery_priority:
+          $ref: "#/components/schemas/DeliveryPriorityValue"
+        committed_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        entries_changed:
+          type: integer
+          format: int32
+          minimum: 0
+        rule_kind:
+          $ref: "#/components/schemas/RuleKind"
+        pattern:
+          type: string
+        rule_hash:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+    AllowDecision:
+      type: object
+      required:
+        - decision
+      properties:
+        decision:
+          type: string
+          enum:
+            - allow
+      additionalProperties: false
+    DenyDecision:
+      type: object
+      required:
+        - decision
+        - reason_code
+        - priority
+        - shard_id
+        - seq
+        - epoch
+      properties:
+        decision:
+          type: string
+          enum:
+            - deny
+        reason_code:
+          type: string
+        priority:
+          type: integer
+          format: int32
+          minimum: 0
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        epoch:
+          $ref: "#/components/schemas/Sequence"
+      additionalProperties: false
+    DecisionResponse:
+      oneOf:
+        - $ref: "#/components/schemas/AllowDecision"
+        - $ref: "#/components/schemas/DenyDecision"
+    WatermarksResponse:
+      type: object
+      required:
+        - shard_count
+      properties:
+        shard_count:
+          type: integer
+          format: int32
+          minimum: 1
+      patternProperties:
+        "^shard_[0-9]{4}$":
+          $ref: "#/components/schemas/Sequence"
+      additionalProperties: false
+    CanaryStatusResponse:
+      type: object
+      required:
+        - status
+        - op_id
+        - tenant_id
+        - namespace
+        - key
+        - shard_id
+        - seq
+        - created_at_unix
+        - expires_at
+        - delivery_priority
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+        op_id:
+          type: string
+        tenant_id:
+          type: string
+        namespace:
+          type: string
+        key:
+          type: string
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        created_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        expires_at:
+          $ref: "#/components/schemas/UnixTimestamp"
+        delivery_priority:
+          $ref: "#/components/schemas/DeliveryPriorityValue"
+      additionalProperties: false
+    NoCanaryStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - none
+      additionalProperties: false
+    LatestCanaryResponse:
+      oneOf:
+        - $ref: "#/components/schemas/CanaryStatusResponse"
+        - $ref: "#/components/schemas/NoCanaryStatus"
+    StatusResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+      additionalProperties: false
+    SignatureEnvelope:
+      type: object
+      required:
+        - algorithm
+        - key_id
+        - key_version
+        - signature
+      properties:
+        algorithm:
+          type: string
+          enum:
+            - ed25519
+        key_id:
+          type: string
+        key_version:
+          $ref: "#/components/schemas/Sequence"
+        signature:
+          type: string
+          pattern: "^[0-9a-fA-F]+$"
+      additionalProperties: false
+    HistoryCompactedResponse:
+      type: object
+      required:
+        - status
+        - reason
+        - compacted_seq
+      properties:
+        status:
+          type: string
+          enum:
+            - compacted
+        reason:
+          type: string
+          enum:
+            - history_compacted
+        compacted_seq:
+          $ref: "#/components/schemas/Sequence"
+      additionalProperties: false
+    ErrorResponse:
+      type: object
+      required:
+        - status
+        - reason
+      properties:
+        status:
+          type: string
+        reason:
+          type: string
+      additionalProperties: false
+    PopAckRequest:
+      type: object
+      required:
+        - agent_id
+        - shard_id
+        - seq
+      properties:
+        agent_id:
+          type: string
+          minLength: 1
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        entries:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        applied_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+      additionalProperties: false
+    PropagationAckRequest:
+      type: object
+      required:
+        - relay_id
+        - location
+        - agent_id
+        - shard_id
+        - seq
+      properties:
+        relay_id:
+          type: string
+          minLength: 1
+        location:
+          type: string
+          minLength: 1
+        agent_id:
+          type: string
+          minLength: 1
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        entries:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        applied_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        relay_received_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+      additionalProperties: false
+    AckRequest:
+      oneOf:
+        - $ref: "#/components/schemas/PopAckRequest"
+        - $ref: "#/components/schemas/PropagationAckRequest"
+    PropagationAckStatus:
+      type: object
+      required:
+        - relay_id
+        - location
+        - agent_id
+        - shard_id
+        - seq
+        - entries
+        - applied_at_unix
+        - relay_received_at_unix
+      properties:
+        relay_id:
+          type: string
+        location:
+          type: string
+        agent_id:
+          type: string
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        source_seq:
+          $ref: "#/components/schemas/Sequence"
+        seq_lag:
+          $ref: "#/components/schemas/Sequence"
+        entries:
+          type: integer
+          format: int64
+          minimum: 0
+        applied_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        relay_received_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        lag_secs:
+          type: integer
+          format: int64
+          minimum: 0
+        ack_age_secs:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+    RelayAcksResponse:
+      type: object
+      required:
+        - relay_id
+        - location
+        - ack_count
+      properties:
+        relay_id:
+          type: string
+        location:
+          type: string
+        ack_count:
+          type: integer
+          format: int64
+          minimum: 0
+        acks:
+          type: array
+          items:
+            $ref: "#/components/schemas/PropagationAckStatus"
+      additionalProperties: false
+    PropagationStatusResponse:
+      type: object
+      required:
+        - status
+        - shard_count
+        - source_max_seq
+        - ack_count
+        - relay_count
+        - agent_count
+        - acked_shards
+        - min_ack_seq
+        - max_ack_seq
+        - max_seq_lag
+        - lagging_ack_count
+        - max_ack_age_secs
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+        shard_count:
+          type: integer
+          format: int32
+          minimum: 1
+        source_max_seq:
+          $ref: "#/components/schemas/Sequence"
+        ack_count:
+          type: integer
+          format: int64
+          minimum: 0
+        relay_count:
+          type: integer
+          format: int64
+          minimum: 0
+        agent_count:
+          type: integer
+          format: int64
+          minimum: 0
+        acked_shards:
+          type: integer
+          format: int64
+          minimum: 0
+        min_ack_seq:
+          $ref: "#/components/schemas/Sequence"
+        max_ack_seq:
+          $ref: "#/components/schemas/Sequence"
+        max_seq_lag:
+          $ref: "#/components/schemas/Sequence"
+        lagging_ack_count:
+          type: integer
+          format: int64
+          minimum: 0
+        max_ack_age_secs:
+          type: integer
+          format: int64
+          minimum: 0
+        acks:
+          type: array
+          items:
+            $ref: "#/components/schemas/PropagationAckStatus"
+      additionalProperties: false
+    SnapshotManifestResponse:
+      type: object
+      required:
+        - manifest_version
+        - format_version
+        - created_at_unix
+        - artifact_object
+        - artifact_signature_object
+        - artifact_bytes
+        - artifact_sha256
+        - shard_count
+        - entry_count
+        - rule_count
+        - max_seq
+      properties:
+        manifest_version:
+          type: integer
+          format: int32
+          minimum: 1
+        format_version:
+          type: integer
+          format: int32
+          minimum: 1
+        created_at_unix:
+          $ref: "#/components/schemas/UnixTimestamp"
+        artifact_object:
+          type: string
+        artifact_signature_object:
+          type: string
+        artifact_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        artifact_sha256:
+          type: string
+          pattern: "^[0-9a-fA-F]{64}$"
+        shard_count:
+          type: integer
+          format: int32
+          minimum: 1
+        entry_count:
+          type: integer
+          format: int64
+          minimum: 0
+        rule_count:
+          type: integer
+          format: int64
+          minimum: 0
+        max_seq:
+          $ref: "#/components/schemas/Sequence"
+      patternProperties:
+        "^shard_[0-9]{4}$":
+          $ref: "#/components/schemas/Sequence"
+      additionalProperties: false
+    SnapshotNameOrList:
+      oneOf:
+        - type: string
+        - type: array
+          items:
+            type: string
+    SnapshotListResponse:
+      type: object
+      required:
+        - snapshot_count
+        - manifest_count
+      properties:
+        snapshot_count:
+          type: integer
+          format: int64
+          minimum: 0
+        snapshot:
+          $ref: "#/components/schemas/SnapshotNameOrList"
+        manifest_count:
+          type: integer
+          format: int64
+          minimum: 0
+        manifest:
+          $ref: "#/components/schemas/SnapshotNameOrList"
+      additionalProperties: false
+    RollbackRequest:
+      type: object
+      required:
+        - snapshot
+      properties:
+        snapshot:
+          type: string
+          minLength: 1
+      additionalProperties: false
+    RollbackResponse:
+      type: object
+      required:
+        - status
+        - snapshot
+        - mutations
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+        snapshot:
+          type: string
+        mutations:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties: false
+    AuditLogEntry:
+      type: object
+      required:
+        - ts
+        - event
+        - result
+      properties:
+        ts:
+          $ref: "#/components/schemas/UnixTimestamp"
+        event:
+          type: string
+        result:
+          type: string
+        op_id:
+          type: string
+        reason:
+          type: string
+        namespace:
+          type: string
+        key:
+          type: string
+        kind:
+          type: string
+        pattern:
+          type: string
+        shard_id:
+          $ref: "#/components/schemas/ShardId"
+        seq:
+          $ref: "#/components/schemas/Sequence"
+        duplicate:
+          type: boolean
+        snapshot:
+          type: string
+        mutations:
+          type: integer
+          format: int64
+          minimum: 0
+      additionalProperties:
+        oneOf:
+          - type: string
+          - type: integer
+          - type: boolean
+    AuditLogResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditLogEntry"
+      additionalProperties: false
 
   parameters:
     TenantId:
@@ -542,7 +1235,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/DenyMutationRequest"
           examples:
             deny:
               value:
@@ -568,7 +1261,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/RuleMutationRequest"
           examples:
             ipv4:
               value:
@@ -591,7 +1284,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/AckRequest"
           examples:
             agent:
               value:
@@ -605,7 +1298,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/RollbackRequest"
           examples:
             snapshot:
               value:
@@ -617,7 +1310,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/CommitOutcomeResponse"
           examples:
             committed:
               value:
@@ -635,7 +1328,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/DecisionResponse"
           examples:
             allow:
               value:
@@ -653,7 +1346,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/WatermarksResponse"
           examples:
             watermarks:
               value:
@@ -679,7 +1372,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/SignatureEnvelope"
           examples:
             signature:
               value:
@@ -692,7 +1385,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/HistoryCompactedResponse"
           examples:
             compacted:
               value:
@@ -704,7 +1397,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/ErrorResponse"
           examples:
             rejected:
               value:
@@ -715,7 +1408,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/JsonObject"
+            $ref: "#/components/schemas/ErrorResponse"
           examples:
             unavailable:
               value:

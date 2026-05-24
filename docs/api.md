@@ -4,6 +4,7 @@ The API uses JSON request and response bodies for the documented HTTP contract. 
 
 The machine-readable contract is [OpenAPI](openapi.yaml). It documents the current HTTP surface as it exists today:
 `application/json` for control, lookup, status, signature, acknowledgement, and audit endpoints, plus `application/octet-stream` for binary snapshots and mutation streams.
+The generated-client plan is in [client-generation.md](client-generation.md).
 
 Required fields for `POST /v1/deny`:
 
@@ -12,12 +13,12 @@ op_id
 tenant_id
 namespace
 key
+action=deny|allow_override|delete
 ```
 
 Optional fields:
 
 ```text
-action=deny|allow_override|delete
 delivery_priority=p0|p1|p2
 priority=0
 reason_code=unspecified
@@ -114,12 +115,12 @@ op_id
 tenant_id
 kind=ipv4_cidr|domain_suffix
 pattern
+action=deny|allow_override|delete
 ```
 
 Optional fields are the same as point denies:
 
 ```text
-action=deny|allow_override|delete
 delivery_priority=p0|p1|p2
 priority=0
 reason_code=unspecified

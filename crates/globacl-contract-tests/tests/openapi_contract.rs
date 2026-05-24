@@ -90,6 +90,26 @@ fn documented_openapi_surface_is_present() {
             "OpenAPI spec is missing operationId {operation_id}"
         );
     }
+
+    assert!(
+        !spec.contains("JsonObject"),
+        "OpenAPI spec should use typed schemas instead of generic JsonObject"
+    );
+    for schema in [
+        "DenyMutationRequest",
+        "RuleMutationRequest",
+        "CommitOutcomeResponse",
+        "DecisionResponse",
+        "WatermarksResponse",
+        "PropagationStatusResponse",
+        "SnapshotManifestResponse",
+        "AuditLogResponse",
+    ] {
+        assert!(
+            spec.contains(&format!("    {schema}:")),
+            "OpenAPI spec is missing typed schema {schema}"
+        );
+    }
 }
 
 #[test]
