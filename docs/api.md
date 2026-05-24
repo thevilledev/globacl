@@ -133,6 +133,37 @@ GET /check?tenant_id=...&namespace=ip&value=...
 
 It calls the local agent and maps deny decisions to `HTTP 403` with `"access": "denied"`.
 
+## Edge Hot Path
+
+The sidecar HTTP API is still supported for polyglot services and smoke tests:
+
+```text
+GET /v1/lookup?tenant_id=...&namespace=...&key=...
+GET /v1/check?tenant_id=...&namespace=ip&value=...
+```
+
+Rust services that need the lowest request-time latency can embed
+`globacl-agent` and use its in-process lookup handle. The embedded agent owns
+the same snapshot bootstrap, signature verification, polling, gap repair,
+state swapping, canary checks, and ack reporting as the sidecar. The
+application hot path then calls `AgentHandle::lookup` or `AgentHandle::check`
+without a localhost HTTP hop:
+
+```rust
+use globacl_agent::{start_embedded, AgentConfig};
+use std::{path::PathBuf, time::Duration};
+
+let config = AgentConfig::new("127.0.0.1:7001", PathBuf::from("data/agent/latest.gacl"))?
+    .with_agent_id("api-1")
+    .with_poll_interval(Duration::from_millis(1000));
+
+let agent = start_embedded(config)?;
+let decision = agent.lookup("tenant-a", "user", "user-123", globacl_core::now_unix());
+```
+
+`AgentHandle::current_state` also returns the RCU-loaded `ActiveState` snapshot
+for code that wants to batch several lookups against one loaded state pointer.
+
 ## Rule Authoring
 
 `POST /v1/rule` compiles non-point policies into specialized edge indices.

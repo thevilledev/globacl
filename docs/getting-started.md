@@ -78,6 +78,19 @@ cargo run -p globacl-demo-app -- 127.0.0.1:7002 127.0.0.1:8080
 
 The demo app calls the local agent on every request. It does not call control.
 
+For the in-process edge hot path, run the demo app in embedded mode and point
+its first argument at the relay instead of the sidecar agent:
+
+```sh
+GLOBACL_DEMO_LOOKUP_MODE=embedded \
+GLOBACL_DEMO_AGENT_ID=demo-embedded \
+cargo run -p globacl-demo-app -- 127.0.0.1:7001 127.0.0.1:8080
+```
+
+In this mode the demo app embeds `globacl-agent`, keeps its own local
+`ActiveStateHandle`, and performs request-time lookups without a localhost HTTP
+hop.
+
 Commit a deny mutation:
 
 ```sh

@@ -6,4 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+globacl-agent = { path = "../globacl-agent" }
 globacl-core = { path = "../globacl-core" }

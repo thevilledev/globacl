@@ -207,6 +207,7 @@ logs: HTTP pull-proxy for simple deployments, NATS JetStream in this repo, or Ka
 snapshots: durable object storage
 relays: regional/PoP relay pools with autoscaling
 agents: one per node or service workload depending latency needs
+edge hot path: embed globacl-agent in Rust services when localhost HTTP latency is too expensive; keep the sidecar API for polyglot services
 signing: Ed25519 signatures are implemented; use HSM/KMS-backed key handling and rotation for production
 ```
 

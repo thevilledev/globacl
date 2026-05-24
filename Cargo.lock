@@ -189,6 +189,7 @@ dependencies = [
 name = "globacl-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "globacl-agent",
  "globacl-core",
 ]
 
@@ -213,6 +214,7 @@ dependencies = [
 name = "globacl-demo-app"
 version = "0.1.0"
 dependencies = [
+ "globacl-agent",
  "globacl-core",
 ]
 

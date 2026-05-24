@@ -81,6 +81,10 @@ If a smoke environment enables `GLOBACL_AUTH_TOKENS`, export
 `GLOBACL_BEARER_TOKEN` with a token that has `acl:write` before running the
 script.
 
+`cargo test -p globacl-agent --locked` includes a focused embedded-hot-path
+test. It loads a signed snapshot into `AgentHandle` and checks lookup decisions
+directly, without starting the localhost HTTP sidecar.
+
 The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
 
 Run the focused multi-process partition test:

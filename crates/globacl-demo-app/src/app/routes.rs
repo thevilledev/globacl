@@ -4,20 +4,17 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
-            let body = format!("status=ok\nagent_addr={}\n", app.agent_addr);
+            let body = format!("status=ok\n{}\n", app.lookup.description());
             write_http_response(&mut stream, 200, "text/plain", body.as_bytes())?;
         }
         ("GET", "/access") => {
             let tenant_id = required_query(&query, "tenant_id")?;
             let namespace = required_query(&query, "namespace")?;
             let key = required_query(&query, "key")?;
-            let agent_path = format!(
-                "/v1/lookup?tenant_id={}&namespace={}&key={}",
-                percent_encode(tenant_id),
-                percent_encode(namespace),
-                percent_encode(key)
-            );
-            proxy_acl_decision(&mut stream, &app.agent_addr, &agent_path)?;
+            write_acl_decision(
+                &mut stream,
+                resolve_acl_decision(&app.lookup, tenant_id, namespace, key, false)?,
+            )?;
         }
         ("GET", "/check") => {
             let tenant_id = required_query(&query, "tenant_id")?;
@@ -28,13 +25,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 .map(String::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| GlobAclError::Parse("missing query parameter value".to_owned()))?;
-            let agent_path = format!(
-                "/v1/check?tenant_id={}&namespace={}&value={}",
-                percent_encode(tenant_id),
-                percent_encode(namespace),
-                percent_encode(value)
-            );
-            proxy_acl_decision(&mut stream, &app.agent_addr, &agent_path)?;
+            write_acl_decision(
+                &mut stream,
+                resolve_acl_decision(&app.lookup, tenant_id, namespace, value, true)?,
+            )?;
         }
         _ => {
             write_http_response(&mut stream, 404, "text/plain", b"not found\n")?;
@@ -43,4 +37,3 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
 
     Ok(())
 }
-
