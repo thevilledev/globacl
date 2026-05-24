@@ -43,6 +43,7 @@ The core tests cover:
 - central propagation acknowledgement log replay and follower rehydration
 - source watermark formatting/parsing
 - commitd vote/heartbeat, restart, catch-up, pending-entry, quorum-loss, and stale-leader consensus invariants
+- multi-process commitd leader-isolation partition behavior
 - immutable base plus exact delta overlay behavior
 - RCU-style active-state handle swaps
 - IPv4 CIDR rule compilation and matching
@@ -66,6 +67,14 @@ Run k3d-backed k3s smoke tests:
 The local smoke deploys one commitd, one control gateway, one relay, one agent, and one demo app in a single k3s cluster. The JetStream smoke uses the same local shape, adds NATS JetStream, enables commitd publishing, switches the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app observes a deny through the agent. The global smoke deploys a three-replica central commitd StatefulSet with persistent volumes, stateless central control gateways, plus three regional k3s clusters with HA relays and demo apps.
 
 The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
+
+Run the focused multi-process partition test:
+
+```sh
+cargo test -p globacl-commitd --test multi_process_partition --locked
+```
+
+This starts three real `globacl-commitd` processes behind per-link loopback TCP proxies, isolates the current leader, verifies the isolated leader cannot commit or apply a mutation without quorum, and verifies the remaining two-node majority elects a leader and commits.
 
 Rollback smoke test:
 
