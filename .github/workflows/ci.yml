@@ -24,8 +24,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        # actions/checkout v6.0.2
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -33,8 +32,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Cargo cache
-        # actions/cache v5.0.5
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: |
             ~/.cargo/git
@@ -68,8 +66,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        # actions/checkout v6.0.2
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -86,8 +83,7 @@ jobs:
         run: jq empty deploy/grafana/*.json
 
       - name: Install uv
-        # astral-sh/setup-uv v8.1.0
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
         with:
           version: "0.11.7"
           cache-dependency-glob: uv.lock
@@ -108,13 +104,20 @@ jobs:
           OAPI_CODEGEN_VERSION: "v2.5.0"
         run: scripts/check-generated-clients.sh
 
+      - name: Check TypeScript client
+        working-directory: clients/typescript
+        run: pnpm run check
+
+      - name: Build TypeScript client
+        working-directory: clients/typescript
+        run: pnpm run build
+
       - name: Test Go clients
         working-directory: clients/go
         run: go test ./...
 
       - name: Audit GitHub Actions
-        # zizmorcore/zizmor-action v0.5.6
-        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d  # v0.5.6
         with:
           advanced-security: false
           annotations: true
@@ -128,8 +131,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        # actions/checkout v6.0.2
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
