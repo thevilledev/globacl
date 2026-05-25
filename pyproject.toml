@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "openapi-spec-validator==0.7.2",
     "yamllint==1.38.0",
+    "zizmor==1.25.2",
 ]
 
 [tool.uv]

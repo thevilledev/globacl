@@ -8,6 +8,7 @@ uv = "0.11.7"
 OAPI_CODEGEN_VERSION = "v2.5.0"
 OPENAPI_SPEC_VALIDATOR_VERSION = "0.7.2"
 YAMLLINT_VERSION = "1.38.0"
+ZIZMOR_VERSION = "1.25.2"
 
 [tasks.yamllint]
 description = "Lint tracked YAML files"
@@ -16,6 +17,10 @@ run = "git ls-files -z -- '*.yaml' '*.yml' '*.yaml.tpl' | xargs -0 uvx --from ya
 [tasks.openapi]
 description = "Validate the OpenAPI contract"
 run = "uvx --from openapi-spec-validator==$OPENAPI_SPEC_VALIDATOR_VERSION openapi-spec-validator docs/openapi.yaml"
+
+[tasks.zizmor]
+description = "Audit GitHub Actions workflows"
+run = "uvx --from zizmor==$ZIZMOR_VERSION zizmor .github/workflows"
 
 [tasks.generate-clients]
 description = "Regenerate checked-in Go and TypeScript clients from OpenAPI"
