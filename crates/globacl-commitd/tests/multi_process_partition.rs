@@ -8,7 +8,7 @@ use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -90,6 +90,190 @@ fn restarted_follower_recovers_missed_ack_from_leader_snapshot() {
     wait_for_ack_count_at_least(cluster.addr(NODE_B), 1);
 }
 
+#[test]
+fn killed_leader_fails_over_and_restarted_node_catches_up() {
+    let _guard = multi_process_test_guard();
+    let mut cluster = CommitdCluster::start();
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+
+    let (first_shard, first_seq) = commit_deny(
+        cluster.addr(NODE_A),
+        "chaos-before-kill",
+        "user-before-kill",
+    );
+    wait_for_watermark_at_least(cluster.addr(NODE_B), first_shard, first_seq);
+    wait_for_watermark_at_least(cluster.addr(NODE_C), first_shard, first_seq);
+
+    cluster.stop_node(NODE_A);
+
+    let majority_addrs = [cluster.addr(NODE_B), cluster.addr(NODE_C)];
+    let majority_leader = wait_for_leader_among(&majority_addrs);
+    let (second_shard, second_seq) =
+        commit_deny(majority_leader, "chaos-after-kill", "user-after-kill");
+    wait_for_watermark_at_least(cluster.addr(NODE_B), second_shard, second_seq);
+    wait_for_watermark_at_least(cluster.addr(NODE_C), second_shard, second_seq);
+
+    cluster.restart_node(NODE_A);
+    wait_for_healthy_node(cluster.addr(NODE_A));
+    wait_for_watermark_at_least(cluster.addr(NODE_A), second_shard, second_seq);
+}
+
+#[test]
+fn healed_partitioned_old_leader_steps_down_and_catches_up() {
+    let _guard = multi_process_test_guard();
+    let mut cluster = CommitdCluster::start();
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+
+    cluster.isolate(NODE_A);
+
+    let majority_addrs = [cluster.addr(NODE_B), cluster.addr(NODE_C)];
+    let majority_leader = wait_for_leader_among(&majority_addrs);
+    let (shard_id, seq) = commit_deny(
+        majority_leader,
+        "chaos-majority-partition",
+        "user-majority-partition",
+    );
+    wait_for_watermark_at_least(cluster.addr(NODE_B), shard_id, seq);
+    wait_for_watermark_at_least(cluster.addr(NODE_C), shard_id, seq);
+
+    cluster.heal(NODE_A);
+
+    wait_for_role(cluster.addr(NODE_A), "follower");
+    wait_for_watermark_at_least(cluster.addr(NODE_A), shard_id, seq);
+}
+
+#[test]
+fn lagging_follower_repairs_from_compacted_leader_snapshot() {
+    let _guard = multi_process_test_guard();
+    let mut cluster = CommitdCluster::start_with(ClusterOptions {
+        compaction_min_log_entries: Some(1),
+    });
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+
+    cluster.stop_node(NODE_B);
+
+    let (shard_id, seq) = commit_deny(
+        cluster.addr(NODE_A),
+        "chaos-compacted-follower",
+        "user-compacted-follower",
+    );
+    wait_for_watermark_at_least(cluster.addr(NODE_C), shard_id, seq);
+    wait_for_compaction_watermark_at_least(cluster.addr(NODE_A), shard_id, seq);
+
+    cluster.restart_node(NODE_B);
+    wait_for_healthy_node(cluster.addr(NODE_B));
+    wait_for_watermark_at_least(cluster.addr(NODE_B), shard_id, seq);
+}
+
+#[test]
+#[ignore = "soak test; run explicitly with GLOBACL_SOAK_SECONDS/GLOBACL_SOAK_WRITERS"]
+fn compacting_cluster_survives_sustained_write_load() {
+    let _guard = multi_process_test_guard();
+    let mut cluster = CommitdCluster::start_with(ClusterOptions {
+        compaction_min_log_entries: Some(16),
+    });
+    let duration = Duration::from_secs(env_usize("GLOBACL_SOAK_SECONDS", 30) as u64);
+    let writers = env_usize("GLOBACL_SOAK_WRITERS", 4).max(1);
+    let min_commits = env_usize("GLOBACL_SOAK_MIN_COMMITS", 100);
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+
+    let leader_addr = cluster.addr(NODE_A).to_owned();
+    let started = Instant::now();
+    let stop_at = started + duration;
+    let committed = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for writer_id in 0..writers {
+        let leader_addr = leader_addr.clone();
+        let committed = Arc::clone(&committed);
+        let errors = Arc::clone(&errors);
+        handles.push(thread::spawn(move || {
+            let mut index = 0usize;
+            while Instant::now() < stop_at {
+                let op_id = format!("soak-{writer_id}-{index}");
+                let key = format!("user-soak-{writer_id}-{index}");
+                match http_post(&leader_addr, "/v1/deny", deny_body(&op_id, &key).as_bytes()) {
+                    Ok(response) if response.status_code == 200 => {
+                        committed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(response) => {
+                        eprintln!(
+                            "soak writer {writer_id} got HTTP status {}: {}",
+                            response.status_code,
+                            body_text(&response.body)
+                        );
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(err) => {
+                        eprintln!("soak writer {writer_id} request failed: {err}");
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                index += 1;
+            }
+        }));
+    }
+
+    thread::sleep(duration / 3);
+    cluster.stop_node(NODE_B);
+    thread::sleep(Duration::from_millis(750));
+    cluster.restart_node(NODE_B);
+    wait_for_healthy_node(cluster.addr(NODE_B));
+
+    for handle in handles {
+        handle.join().expect("soak writer should not panic");
+    }
+
+    assert_eq!(errors.load(Ordering::SeqCst), 0, "soak write errors");
+    let committed = committed.load(Ordering::SeqCst);
+    assert!(
+        committed >= min_commits,
+        "soak committed {committed} writes, expected at least {min_commits}"
+    );
+
+    wait_for_healthy_nodes(&cluster);
+    let all_addrs = [
+        cluster.addr(NODE_A),
+        cluster.addr(NODE_B),
+        cluster.addr(NODE_C),
+    ];
+    let current_leader = wait_for_leader_among(&all_addrs);
+    let leader_watermarks = watermarks(current_leader).expect("leader watermarks");
+    eprintln!(
+        "soak write phase complete: committed={committed} writers={writers} duration_secs={}",
+        duration.as_secs()
+    );
+    for node_id in [NODE_A, NODE_B, NODE_C] {
+        wait_for_watermarks_at_least(
+            cluster.addr(node_id),
+            &leader_watermarks,
+            Duration::from_secs(60),
+            node_id,
+        );
+    }
+    let compaction_total = compaction_watermarks(current_leader)
+        .expect("leader compaction watermarks")
+        .iter()
+        .sum::<u64>();
+    assert!(
+        compaction_total > 0,
+        "compaction should advance during sustained write load"
+    );
+
+    eprintln!(
+        "soak complete: committed={committed} writers={writers} duration_secs={}",
+        duration.as_secs()
+    );
+}
+
 fn multi_process_test_guard() -> MutexGuard<'static, ()> {
     MULTI_PROCESS_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -97,15 +281,25 @@ fn multi_process_test_guard() -> MutexGuard<'static, ()> {
         .expect("multi-process test lock should not be poisoned")
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterOptions {
+    compaction_min_log_entries: Option<usize>,
+}
+
 struct CommitdCluster {
     temp_dir: PathBuf,
     nodes: HashMap<&'static str, Node>,
     links: DirectedLinks,
     cluster_id: String,
+    options: ClusterOptions,
 }
 
 impl CommitdCluster {
     fn start() -> Self {
+        Self::start_with(ClusterOptions::default())
+    }
+
+    fn start_with(options: ClusterOptions) -> Self {
         let temp_dir = temp_root();
         fs::create_dir_all(&temp_dir).expect("temp root should be created");
 
@@ -124,6 +318,7 @@ impl CommitdCluster {
                 &addr_a,
                 &temp_dir,
                 &cluster_id,
+                &options,
                 &format!(
                     "{NODE_A}={addr_a},{NODE_B}={},{}={}",
                     links.ab.addr, NODE_C, links.ac.addr
@@ -137,6 +332,7 @@ impl CommitdCluster {
                 &addr_b,
                 &temp_dir,
                 &cluster_id,
+                &options,
                 &format!(
                     "{NODE_A}={},{}={addr_b},{}={}",
                     links.ba.addr, NODE_B, NODE_C, links.bc.addr
@@ -150,6 +346,7 @@ impl CommitdCluster {
                 &addr_c,
                 &temp_dir,
                 &cluster_id,
+                &options,
                 &format!(
                     "{NODE_A}={},{}={},{}={addr_c}",
                     links.ca.addr, NODE_B, links.cb.addr, NODE_C
@@ -162,6 +359,7 @@ impl CommitdCluster {
             nodes,
             links,
             cluster_id,
+            options,
         }
     }
 
@@ -197,6 +395,30 @@ impl CommitdCluster {
         }
     }
 
+    fn heal(&mut self, node_id: &str) {
+        match node_id {
+            NODE_A => {
+                self.links.ab.enable();
+                self.links.ac.enable();
+                self.links.ba.enable();
+                self.links.ca.enable();
+            }
+            NODE_B => {
+                self.links.ba.enable();
+                self.links.bc.enable();
+                self.links.ab.enable();
+                self.links.cb.enable();
+            }
+            NODE_C => {
+                self.links.ca.enable();
+                self.links.cb.enable();
+                self.links.ac.enable();
+                self.links.bc.enable();
+            }
+            other => panic!("unknown node {other}"),
+        }
+    }
+
     fn stop_node(&mut self, node_id: &'static str) {
         self.nodes
             .get_mut(node_id)
@@ -209,7 +431,7 @@ impl CommitdCluster {
         self.nodes
             .get_mut(node_id)
             .unwrap_or_else(|| panic!("unknown node {node_id}"))
-            .restart(&self.temp_dir, &self.cluster_id, &peers);
+            .restart(&self.temp_dir, &self.cluster_id, &self.options, &peers);
     }
 
     fn peers_for(&self, node_id: &str) -> String {
@@ -264,9 +486,10 @@ impl Node {
         addr: &str,
         temp_dir: &Path,
         cluster_id: &str,
+        options: &ClusterOptions,
         peers: &str,
     ) -> Self {
-        let child = Self::spawn(node_id, addr, temp_dir, cluster_id, peers);
+        let child = Self::spawn(node_id, addr, temp_dir, cluster_id, options, peers);
 
         Self {
             node_id,
@@ -280,12 +503,14 @@ impl Node {
         addr: &str,
         temp_dir: &Path,
         cluster_id: &str,
+        options: &ClusterOptions,
         peers: &str,
     ) -> Child {
         let data_dir = temp_dir.join(node_id);
         fs::create_dir_all(&data_dir).expect("node data dir should be created");
 
-        Command::new(env!("CARGO_BIN_EXE_globacl-commitd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_globacl-commitd"));
+        command
             .arg(&data_dir)
             .arg(addr)
             .arg("4")
@@ -301,14 +526,32 @@ impl Node {
             .env("GLOBACL_COMMITD_SYNC_MS", "50")
             .env("GLOBACL_COMMITD_METRICS_ADDR", "off")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("commitd process should start")
+            .stderr(Stdio::null());
+        if let Some(min_log_entries) = options.compaction_min_log_entries {
+            command.env(
+                "GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES",
+                min_log_entries.to_string(),
+            );
+        }
+        command.spawn().expect("commitd process should start")
     }
 
-    fn restart(&mut self, temp_dir: &Path, cluster_id: &str, peers: &str) {
+    fn restart(
+        &mut self,
+        temp_dir: &Path,
+        cluster_id: &str,
+        options: &ClusterOptions,
+        peers: &str,
+    ) {
         self.stop();
-        self.child = Self::spawn(self.node_id, &self.addr, temp_dir, cluster_id, peers);
+        self.child = Self::spawn(
+            self.node_id,
+            &self.addr,
+            temp_dir,
+            cluster_id,
+            options,
+            peers,
+        );
     }
 
     fn stop(&mut self) {
@@ -394,6 +637,10 @@ impl TcpProxy {
     fn disable(&self) {
         self.enabled.store(false, Ordering::SeqCst);
     }
+
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for TcpProxy {
@@ -468,6 +715,34 @@ fn wait_for_watermark_at_least(addr: &str, shard_id: usize, seq: u64) {
     });
 }
 
+fn wait_for_watermarks_at_least(addr: &str, expected: &[u64], timeout: Duration, label: &str) {
+    let started = Instant::now();
+    let mut last_observed = Vec::new();
+    loop {
+        if let Some(watermarks) = watermarks(addr) {
+            let caught_up = expected.iter().enumerate().all(|(shard_id, expected_seq)| {
+                watermarks.get(shard_id).copied().unwrap_or(0) >= *expected_seq
+            });
+            if caught_up {
+                return;
+            }
+            last_observed = watermarks;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "{label} did not catch up within {timeout:?}; expected={expected:?}; observed={last_observed:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_compaction_watermark_at_least(addr: &str, shard_id: usize, seq: u64) {
+    wait_until(Duration::from_secs(10), || {
+        let watermarks = compaction_watermarks(addr)?;
+        (watermarks.get(shard_id).copied().unwrap_or(0) >= seq).then_some(())
+    });
+}
+
 fn wait_for_ack_count_at_least(addr: &str, expected: u64) {
     wait_until(Duration::from_secs(10), || {
         let form = health(addr)?;
@@ -514,6 +789,12 @@ fn watermarks(addr: &str) -> Option<Vec<u64>> {
     parse_watermarks(&response.body).ok()
 }
 
+fn compaction_watermarks(addr: &str) -> Option<Vec<u64>> {
+    let response = http_get(addr, "/v1/compaction_watermarks").ok()?;
+    (response.status_code == 200).then_some(())?;
+    parse_watermarks(&response.body).ok()
+}
+
 fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
     let started = Instant::now();
     loop {
@@ -538,6 +819,17 @@ fn deny_body(op_id: &str, key: &str) -> String {
         ("created_by", "partition-test"),
         ("reason_code", "partition"),
     ])
+}
+
+fn commit_deny(addr: &str, op_id: &str, key: &str) -> (usize, u64) {
+    let response = http_post(addr, "/v1/deny", deny_body(op_id, key).as_bytes())
+        .expect("commit request should receive a response");
+    assert_eq!(response.status_code, 200, "{}", body_text(&response.body));
+    let form = parse_json_fields(&response.body).expect("commit response should be JSON");
+    (
+        parse_json_usize(&form, "shard_id"),
+        parse_json_u64(&form, "seq"),
+    )
 }
 
 fn ack_body(relay_id: &str, agent_id: &str, shard_id: u16, seq: u64) -> String {
@@ -601,4 +893,11 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
