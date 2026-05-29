@@ -57,6 +57,7 @@ mod tests {
                 min_log_entries: 10_000,
                 compact_on_startup: true,
             },
+            peer_token: Some("test-peer-token".to_owned()),
             consensus: Mutex::new(ConsensusState {
                 current_term: term,
                 voted_for: None,
@@ -81,10 +82,13 @@ mod tests {
     }
 
     fn test_form(fields: &[(&str, &str)]) -> HashMap<String, String> {
-        fields
+        let mut form = fields
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect()
+            .collect::<HashMap<_, _>>();
+        form.entry("cluster_id".to_owned())
+            .or_insert_with(|| "cluster-a".to_owned());
+        form
     }
 
     fn response_bool(body: &str, key: &str) -> bool {
@@ -348,7 +352,7 @@ mod tests {
         assert_eq!(consensus.current_term, 6);
         assert_eq!(consensus.role, ConsensusRole::Follower);
         assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
-        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for, None);
         drop(consensus);
         remove_test_dir(root);
     }
@@ -443,6 +447,59 @@ mod tests {
         let err = write_pending_mutation(&pending_dir, &older).expect_err("reject older pending");
 
         assert!(err.to_string().contains("newer epoch"));
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn local_log_status_includes_durable_pending_mutations() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-pending-log-status-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        let mutation = prepared_mutation("op-pending-status", "user-1", 3);
+
+        write_pending_mutation(&app.pending_dir, &mutation).expect("write pending");
+        let (_last_seq, log_len, watermarks) = local_log_status(&app).expect("local status");
+
+        assert_eq!(log_len, 1);
+        assert_eq!(
+            watermarks[mutation.commit_id.shard_id as usize],
+            mutation.commit_id.seq
+        );
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn new_leader_recovers_pending_mutation_in_current_term() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-pending-leader-recovery-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 5);
+        app.replication.peers = vec![ControlPeer {
+            node_id: "node-a".to_owned(),
+            addr: "127.0.0.1:7101".to_owned(),
+        }];
+        app.replication.quorum = 1;
+        let old = prepared_mutation("op-recover-pending", "user-1", 4);
+
+        write_pending_mutation(&app.pending_dir, &old).expect("write pending");
+        let recovered =
+            recover_pending_mutations_as_leader(&app).expect("recover pending as leader");
+
+        assert_eq!(recovered, 1);
+        assert!(!pending_mutation_path(&app.pending_dir, &old).exists());
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 1);
+        assert_eq!(state.watermarks()[old.commit_id.shard_id as usize], old.commit_id.seq);
+        let log = load_all_logs(&app.log_dir, 4).expect("load log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].op_id, old.op_id);
+        assert_eq!(log[0].commit_id.epoch, 5);
+        drop(state);
         remove_test_dir(root);
     }
 
@@ -769,6 +826,62 @@ mod tests {
     }
 
     #[test]
+    fn same_term_heartbeat_is_accepted_after_vote_for_other_candidate() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-heartbeat-after-other-vote-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        {
+            let mut consensus = lock_consensus(&app).expect("consensus");
+            consensus.voted_for = Some("node-b".to_owned());
+            consensus.leader_id = None;
+        }
+
+        let response =
+            handle_heartbeat(&app, &test_form(&[("term", "3"), ("leader_id", "node-c")]))
+                .expect("heartbeat response");
+
+        assert!(response_bool(&response, "success"));
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 3);
+        assert_eq!(consensus.role, ConsensusRole::Follower);
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-c"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn same_term_replication_is_accepted_after_vote_for_other_candidate() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-replication-after-other-vote-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 3);
+        {
+            let mut consensus = lock_consensus(&app).expect("consensus");
+            consensus.voted_for = Some("node-b".to_owned());
+            consensus.leader_id = None;
+        }
+        let mutation = prepared_mutation("op-same-term-leader", "user-1", 3);
+
+        prepare_replicated_mutation_from_leader(&app, &mutation, "node-c")
+            .expect("same-term leader should be accepted");
+
+        assert!(pending_mutation_path(&app.pending_dir, &mutation).exists());
+        let consensus = lock_consensus(&app).expect("consensus");
+        assert_eq!(consensus.current_term, 3);
+        assert_eq!(consensus.role, ConsensusRole::Follower);
+        assert_eq!(consensus.leader_id.as_deref(), Some("node-c"));
+        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        drop(consensus);
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn higher_term_replication_prepare_fences_local_leader() {
         let root = env::temp_dir().join(format!(
             "globacl-commitd-higher-term-leader-{}-{}",
@@ -786,7 +899,7 @@ mod tests {
         assert_eq!(consensus.current_term, 4);
         assert_eq!(consensus.role, ConsensusRole::Follower);
         assert_eq!(consensus.leader_id.as_deref(), Some("node-b"));
-        assert_eq!(consensus.voted_for.as_deref(), Some("node-b"));
+        assert_eq!(consensus.voted_for, None);
         drop(consensus);
         remove_test_dir(root);
     }
@@ -809,6 +922,33 @@ mod tests {
         assert_eq!(state.entries_len(), 0);
         assert!(state.watermarks().iter().all(|seq| *seq == 0));
         drop(state);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn leader_ack_without_quorum_does_not_apply_locally() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-partitioned-ack-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Leader, 4);
+        let ack = PropagationAck {
+            relay_id: "relay-a".to_owned(),
+            location: "region-a".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            shard_id: 1,
+            seq: 10,
+            entries: 1,
+            applied_at_unix: 1000,
+            relay_received_at_unix: 1001,
+        };
+
+        let err = record_propagation_ack(&app, ack).expect_err("partitioned ack should fail");
+
+        assert!(err.to_string().contains("commitd ack quorum unavailable"));
+        assert_eq!(lock_propagation_acks(&app).expect("acks").len(), 0);
+        assert!(!app.propagation_acks_path.exists());
         remove_test_dir(root);
     }
 

@@ -334,6 +334,7 @@ GLOBACL_COMMITD_NODE_ID       pod name, from metadata.name
 GLOBACL_COMMITD_CLUSTER_ID    logical consensus cluster id
 GLOBACL_COMMITD_PEERS         node_id=host:port peer list
 GLOBACL_COMMITD_QUORUM        majority threshold
+GLOBACL_COMMITD_PEER_TOKEN    shared bearer for internal commitd peer RPCs; required when clustered
 GLOBACL_COMMITD_HEARTBEAT_MS  leader heartbeat interval
 GLOBACL_COMMITD_ELECTION_MS   follower election timeout base
 GLOBACL_COMMITD_SYNC_MS       follower mutation catch-up interval
@@ -342,6 +343,8 @@ GLOBACL_COMMITD_COMPACTION_MIN_LOG_ENTRIES
 GLOBACL_COMMITD_COMPACT_ON_STARTUP
                                   rewrite logs behind latest signed checkpoint on startup
 ```
+
+Clustered commitd nodes reject startup unless the configured quorum is a strict majority and `GLOBACL_COMMITD_PEER_TOKEN` is set. Internal Raft and replication endpoints require that peer token, while public authoring and read APIs keep using `GLOBACL_AUTH_TOKENS`.
 
 Commitd compaction uses the latest signed snapshot as the checkpoint, rewrites per-shard logs to retain only post-checkpoint mutations, and writes `idempotency.glog` so duplicate `op_id` handling survives restarts. If a follower or edge component asks for a compacted range, it repairs from the snapshot channel. When `GLOBACL_COMMITD_PUBLISHER=jetstream` is enabled, compaction is capped by durable per-shard publisher offsets so unpublished JetStream events remain replayable after restart.
 

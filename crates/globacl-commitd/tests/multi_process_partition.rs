@@ -1,4 +1,7 @@
-use globacl_core::{http_get, http_post, parse_json_body, parse_json_fields, parse_watermarks};
+use globacl_core::{
+    http_get, http_get_with_headers, http_post, parse_json_body, parse_json_fields,
+    parse_watermarks,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -13,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const NODE_A: &str = "node-a";
 const NODE_B: &str = "node-b";
 const NODE_C: &str = "node-c";
+const PEER_TOKEN: &str = "partition-test-peer-token";
 
 static MULTI_PROCESS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -291,6 +295,7 @@ impl Node {
             .env("GLOBACL_COMMITD_INITIAL_LEADER_ID", NODE_A)
             .env("GLOBACL_COMMITD_PEERS", peers)
             .env("GLOBACL_COMMITD_QUORUM", "2")
+            .env("GLOBACL_COMMITD_PEER_TOKEN", PEER_TOKEN)
             .env("GLOBACL_COMMITD_HEARTBEAT_MS", "50")
             .env("GLOBACL_COMMITD_ELECTION_MS", "250")
             .env("GLOBACL_COMMITD_SYNC_MS", "50")
@@ -472,8 +477,12 @@ fn wait_for_ack_count_at_least(addr: &str, expected: u64) {
 }
 
 fn assert_empty_ack_snapshot(addr: &str) {
-    let response =
-        http_get(addr, "/internal/replication/acks").expect("internal ack snapshot should respond");
+    let response = http_get_with_headers(
+        addr,
+        "/internal/replication/acks",
+        &[("X-Globacl-Peer-Token", PEER_TOKEN)],
+    )
+    .expect("internal ack snapshot should respond");
     assert_eq!(response.status_code, 200, "{}", body_text(&response.body));
     let body = parse_json_body(&response.body).expect("ack snapshot should be JSON");
     assert_eq!(

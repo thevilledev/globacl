@@ -198,6 +198,14 @@ fn commit_prepared_outcome(
         )));
     }
     prepare_on_quorum(app, &outcome.mutation)?;
+    let term = ensure_write_authority(app)?;
+    if outcome.mutation.commit_id.epoch != term {
+        abort_on_peers(app, &outcome.mutation);
+        return Err(GlobAclError::InvalidData(format!(
+            "mutation epoch {} no longer matches current leader term {term}",
+            outcome.mutation.commit_id.epoch
+        )));
+    }
     apply_prepared_mutation(app, state, outcome.mutation.clone())?;
     commit_on_peers(app, &outcome.mutation);
     Ok(outcome)
@@ -261,7 +269,7 @@ fn prepare_on_quorum(app: &App, mutation: &Mutation) -> Result<()> {
     }
 
     let payload = encode_mutation(mutation);
-    let headers = [("X-Globacl-Leader-Id", app.replication.node_id.as_str())];
+    let headers = replication_headers(app);
     let mut prepared = 1usize;
     let mut failures = Vec::new();
     for peer in app.replication.remote_peers() {
@@ -300,7 +308,7 @@ fn commit_on_peers(app: &App, mutation: &Mutation) {
     }
 
     let payload = encode_mutation(mutation);
-    let headers = [("X-Globacl-Leader-Id", app.replication.node_id.as_str())];
+    let headers = replication_headers(app);
     for peer in app.replication.remote_peers() {
         match http_post_with_headers(
             &peer.addr,
@@ -320,7 +328,7 @@ fn commit_on_peers(app: &App, mutation: &Mutation) {
 
 fn abort_on_peers(app: &App, mutation: &Mutation) {
     let payload = encode_mutation(mutation);
-    let headers = [("X-Globacl-Leader-Id", app.replication.node_id.as_str())];
+    let headers = replication_headers(app);
     for peer in app.replication.remote_peers() {
         if let Err(err) = http_post_with_headers(
             &peer.addr,
@@ -473,29 +481,17 @@ fn ensure_replication_leader(app: &App, mutation: &Mutation, leader_id: &str) ->
         )));
     }
 
-    if mutation_term == consensus.current_term {
-        if consensus
+    if mutation_term == consensus.current_term
+        && consensus
             .leader_id
             .as_ref()
             .map(|known_leader| known_leader != leader_id)
             .unwrap_or(false)
-        {
-            return Err(GlobAclError::InvalidData(format!(
-                "conflicting replication leader {leader_id}; known leader is {}",
-                consensus.leader_id.as_deref().unwrap_or("unknown")
-            )));
-        }
-        if consensus
-            .voted_for
-            .as_ref()
-            .map(|voted_for| voted_for != leader_id)
-            .unwrap_or(false)
-        {
-            return Err(GlobAclError::InvalidData(format!(
-                "conflicting replication leader {leader_id}; voted for {}",
-                consensus.voted_for.as_deref().unwrap_or("unknown")
-            )));
-        }
+    {
+        return Err(GlobAclError::InvalidData(format!(
+            "conflicting replication leader {leader_id}; known leader is {}",
+            consensus.leader_id.as_deref().unwrap_or("unknown")
+        )));
     }
 
     if mutation_term > consensus.current_term {
@@ -504,9 +500,6 @@ fn ensure_replication_leader(app: &App, mutation: &Mutation, leader_id: &str) ->
     }
     consensus.role = ConsensusRole::Follower;
     consensus.leader_id = Some(leader_id.to_owned());
-    if consensus.voted_for.is_none() {
-        consensus.voted_for = Some(leader_id.to_owned());
-    }
     consensus.last_leader_contact_ms = now_unix_millis();
     consensus.election_deadline_ms = next_election_deadline_ms(
         &app.replication.node_id,

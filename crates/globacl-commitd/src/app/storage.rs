@@ -228,6 +228,29 @@ fn write_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()>
     Ok(())
 }
 
+fn load_pending_mutations(pending_dir: &Path) -> Result<Vec<Mutation>> {
+    let mut mutations = Vec::new();
+    if !pending_dir.exists() {
+        return Ok(mutations);
+    }
+    for entry in fs::read_dir(pending_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("gmut") {
+            continue;
+        }
+        mutations.push(decode_mutation(&fs::read(path)?)?);
+    }
+    mutations.sort_by_key(|mutation| {
+        (
+            mutation.commit_id.shard_id,
+            mutation.commit_id.seq,
+            mutation.commit_id.epoch,
+        )
+    });
+    Ok(mutations)
+}
+
 fn ensure_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()> {
     let path = pending_mutation_path(pending_dir, mutation);
     if !path.exists() {

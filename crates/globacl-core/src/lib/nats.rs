@@ -235,7 +235,28 @@ pub fn parse_watermarks(body: &[u8]) -> Result<Vec<u64>> {
 }
 
 fn send_http(addr: &str, request: &[u8]) -> Result<HttpResponse> {
-    let mut stream = TcpStream::connect(addr)?;
+    let timeout = Duration::from_secs(5);
+    let mut last_err = None;
+    let mut stream = None;
+    for socket_addr in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(candidate) => {
+                stream = Some(candidate);
+                break;
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        GlobAclError::Io(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no socket addresses resolved for {addr}"),
+            )
+        }))
+    })?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     stream.write_all(request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Vec::new();

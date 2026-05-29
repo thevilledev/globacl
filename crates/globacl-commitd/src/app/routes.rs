@@ -2,6 +2,10 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     let request = read_http_request(&mut stream)?;
     let (route, query) = parse_query_path(&request.path);
 
+    if is_internal_route(&route) && !require_peer_token(&mut stream, &app, &request)? {
+        return Ok(());
+    }
+
     if requires_leader(&request.method, &route)
         && app.replication.is_clustered()
         && !is_write_leader(&app)?
@@ -702,7 +706,7 @@ fn format_commitd_metrics(app: &App) -> Result<String> {
 }
 
 fn required_replication_leader(request: &HttpRequest) -> Result<&str> {
-    request
-        .header("x-globacl-leader-id")
-        .ok_or_else(|| GlobAclError::InvalidData("missing X-Globacl-Leader-Id header".to_owned()))
+    request.header(LEADER_ID_HEADER).ok_or_else(|| {
+        GlobAclError::InvalidData(format!("missing {LEADER_ID_HEADER} header"))
+    })
 }

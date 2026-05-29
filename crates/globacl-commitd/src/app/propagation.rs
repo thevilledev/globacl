@@ -109,9 +109,10 @@ fn persist_publisher_offsets(path: &Path, offsets: &[u64]) -> Result<()> {
 fn record_propagation_ack(app: &App, ack: PropagationAck) -> Result<()> {
     if app.replication.is_clustered() {
         ensure_write_authority(app)?;
+        replicate_propagation_ack_on_quorum(app, &ack)?;
     }
-    apply_propagation_ack(app, ack.clone())?;
-    replicate_propagation_ack_on_quorum(app, &ack)
+    apply_propagation_ack(app, ack)?;
+    Ok(())
 }
 
 fn apply_propagation_ack(app: &App, ack: PropagationAck) -> Result<bool> {
@@ -144,7 +145,13 @@ fn replicate_propagation_ack_on_quorum(app: &App, ack: &PropagationAck) -> Resul
     let mut replicated = 1usize;
     let mut failures = Vec::new();
     for peer in app.replication.remote_peers() {
-        match http_post(&peer.addr, "/internal/replication/ack", payload.as_bytes()) {
+        let headers = peer_headers(app);
+        match http_post_with_headers(
+            &peer.addr,
+            "/internal/replication/ack",
+            payload.as_bytes(),
+            &headers,
+        ) {
             Ok(response) if response.status_code == 200 => replicated += 1,
             Ok(response) => {
                 failures.push(format!(
@@ -250,7 +257,8 @@ fn apply_propagation_ack_log_snapshot(app: &App, body: &[u8]) -> Result<usize> {
 }
 
 fn sync_acks_from_peer(app: &App, peer_addr: &str) -> Result<usize> {
-    let response = http_get(peer_addr, "/internal/replication/acks")?;
+    let headers = peer_headers(app);
+    let response = http_get_with_headers(peer_addr, "/internal/replication/acks", &headers)?;
     if response.status_code != 200 {
         return Err(GlobAclError::InvalidData(format!(
             "peer returned status {} for ack snapshot",

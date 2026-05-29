@@ -3,7 +3,8 @@ use globacl_core::{
     compact_logs_to_watermarks, decode_mutation, decode_mutation_stream, decode_snapshot,
     decode_snapshot_manifest, deny_requires_blast_radius_override, encode_mutation,
     encode_mutation_stream, encode_snapshot, encode_snapshot_manifest, format_commit_outcome,
-    format_decision, format_watermarks, http_get, http_post, http_post_with_headers,
+    format_decision, format_watermarks, http_get, http_get_with_headers,
+    http_post_with_headers,
     immutable_snapshot_object_name, is_safe_snapshot_object_name, json, load_all_logs,
     metrics_bind_addr_from_env, nats_jetstream_ensure_stream,
     nats_jetstream_publish, now_unix, parse_json_fields, parse_query_path, parse_watermarks,
@@ -45,6 +46,7 @@ struct App {
     latest_canary: Mutex<Option<CanaryStatus>>,
     replication: ReplicationConfig,
     compaction: CompactionConfig,
+    peer_token: Option<String>,
     consensus: Mutex<ConsensusState>,
     sync_status: Mutex<SyncStatus>,
     publisher: Option<PublisherConfig>,
@@ -155,6 +157,9 @@ struct PublisherStatus {
     publish_errors: u64,
 }
 
+const PEER_TOKEN_HEADER: &str = "X-Globacl-Peer-Token";
+const LEADER_ID_HEADER: &str = "X-Globacl-Leader-Id";
+
 pub(crate) fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let data_dir = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("data/commitd"));
@@ -187,6 +192,7 @@ pub(crate) fn run() -> Result<()> {
     let auth = auth_config_from_env_var("GLOBACL_AUTH_TOKENS")?;
     let object_store = object_store_config()?;
     let replication = replication_config(bind_addr)?;
+    let peer_token = peer_token_config(&replication)?;
     let compaction = compaction_config()?;
     let publisher = publisher_config()?;
     if let Some(publisher) = &publisher {
@@ -248,6 +254,7 @@ pub(crate) fn run() -> Result<()> {
         latest_canary: Mutex::new(None),
         replication,
         compaction,
+        peer_token,
         consensus: Mutex::new(consensus),
         sync_status: Mutex::new(SyncStatus {
             last_peer_sync_unix: 0,

@@ -104,6 +104,52 @@ fn requires_leader(method: &str, route: &str) -> bool {
         )
 }
 
+fn is_internal_route(route: &str) -> bool {
+    route.starts_with("/internal/raft/") || route.starts_with("/internal/replication/")
+}
+
+fn require_peer_token(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<bool> {
+    let Some(expected) = app.peer_token.as_deref() else {
+        return Ok(true);
+    };
+    let provided = request.header(PEER_TOKEN_HEADER).unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return Ok(true);
+    }
+    write_json_response(
+        stream,
+        401,
+        &json!({
+            "status": "rejected",
+            "reason": "invalid_peer_token"
+        }),
+    )?;
+    Ok(false)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+fn peer_headers(app: &App) -> Vec<(&'static str, &str)> {
+    app.peer_token
+        .as_deref()
+        .map(|token| vec![(PEER_TOKEN_HEADER, token)])
+        .unwrap_or_default()
+}
+
+fn replication_headers(app: &App) -> Vec<(&'static str, &str)> {
+    let mut headers = peer_headers(app);
+    headers.push((LEADER_ID_HEADER, app.replication.node_id.as_str()));
+    headers
+}
+
 fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
         write_json_response(
@@ -371,6 +417,12 @@ fn replication_config(bind_addr: &str) -> Result<ReplicationConfig> {
             peers.len()
         )));
     }
+    if peers.len() > 1 && quorum <= peers.len() / 2 {
+        return Err(GlobAclError::InvalidData(format!(
+            "clustered commitd quorum must be a majority: quorum={quorum} peers={}",
+            peers.len()
+        )));
+    }
     let heartbeat_interval_ms = commitd_env("HEARTBEAT_MS")
         .ok()
         .map(|value| parse_env_u64(&value, "GLOBACL_COMMITD_HEARTBEAT_MS"))
@@ -386,6 +438,21 @@ fn replication_config(bind_addr: &str) -> Result<ReplicationConfig> {
         .map(|value| parse_env_u64(&value, "GLOBACL_COMMITD_SYNC_MS"))
         .transpose()?
         .unwrap_or(1000);
+    if heartbeat_interval_ms == 0 {
+        return Err(GlobAclError::InvalidData(
+            "GLOBACL_COMMITD_HEARTBEAT_MS must be greater than zero".to_owned(),
+        ));
+    }
+    if election_timeout_ms < heartbeat_interval_ms.saturating_mul(3) {
+        return Err(GlobAclError::InvalidData(format!(
+            "GLOBACL_COMMITD_ELECTION_MS must be at least 3x heartbeat: election={election_timeout_ms} heartbeat={heartbeat_interval_ms}"
+        )));
+    }
+    if sync_interval_ms == 0 {
+        return Err(GlobAclError::InvalidData(
+            "GLOBACL_COMMITD_SYNC_MS must be greater than zero".to_owned(),
+        ));
+    }
 
     Ok(ReplicationConfig {
         cluster_id,
@@ -397,6 +464,20 @@ fn replication_config(bind_addr: &str) -> Result<ReplicationConfig> {
         election_timeout_ms,
         sync_interval_ms,
     })
+}
+
+fn peer_token_config(replication: &ReplicationConfig) -> Result<Option<String>> {
+    let token = commitd_env("PEER_TOKEN")
+        .or_else(|_| env::var("GLOBACL_PEER_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if replication.is_clustered() && token.is_none() {
+        return Err(GlobAclError::InvalidData(
+            "GLOBACL_COMMITD_PEER_TOKEN is required when commitd is clustered".to_owned(),
+        ));
+    }
+    Ok(token)
 }
 
 fn commitd_env(suffix: &str) -> std::result::Result<String, env::VarError> {
@@ -417,6 +498,21 @@ fn parse_peers(value: &str) -> Result<Vec<ControlPeer>> {
         if node_id.trim().is_empty() || addr.trim().is_empty() {
             return Err(GlobAclError::Parse(format!(
                 "invalid peer {part:?}; node_id and address are required"
+            )));
+        }
+        if peers
+            .iter()
+            .any(|peer: &ControlPeer| peer.node_id == node_id.trim())
+        {
+            return Err(GlobAclError::Parse(format!(
+                "duplicate peer node id {:?}",
+                node_id.trim()
+            )));
+        }
+        if peers.iter().any(|peer| peer.addr == addr.trim()) {
+            return Err(GlobAclError::Parse(format!(
+                "duplicate peer address {:?}",
+                addr.trim()
             )));
         }
         peers.push(ControlPeer {
@@ -515,13 +611,23 @@ fn persist_consensus_state(path: &Path, consensus: &ConsensusState) -> Result<()
 }
 
 fn local_log_status(app: &App) -> Result<(u64, u64, Vec<u64>)> {
-    let state = lock_state(app)?;
-    let last_seq = state.watermarks().iter().copied().max().unwrap_or(0);
-    Ok((
-        last_seq,
-        state.mutations_len() as u64,
-        state.watermarks().to_vec(),
-    ))
+    let (mut watermarks, mut log_len) = {
+        let state = lock_state(app)?;
+        (state.watermarks().to_vec(), state.mutations_len() as u64)
+    };
+    for mutation in load_pending_mutations(&app.pending_dir)? {
+        if mutation.commit_id.source_region != app.replication.cluster_id {
+            continue;
+        }
+        if let Some(watermark) = watermarks.get_mut(mutation.commit_id.shard_id as usize) {
+            if mutation.commit_id.seq > *watermark {
+                *watermark = mutation.commit_id.seq;
+                log_len += 1;
+            }
+        }
+    }
+    let last_seq = watermarks.iter().copied().max().unwrap_or(0);
+    Ok((last_seq, log_len, watermarks))
 }
 
 fn next_election_deadline_ms(node_id: &str, election_timeout_ms: u64) -> u64 {

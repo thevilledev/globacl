@@ -13,6 +13,7 @@ stringData:
   key_id: dev-ed25519
   private_key: 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
   public_key: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+  peer_token: dev-commitd-peer-token
 ---
 apiVersion: v1
 kind: Service
@@ -74,6 +75,11 @@ spec:
                 globacl-commitd-0=globacl-commitd-0.globacl-commitd-peer.globacl.svc.cluster.local:7003,
                 globacl-commitd-1=globacl-commitd-1.globacl-commitd-peer.globacl.svc.cluster.local:7003,
                 globacl-commitd-2=globacl-commitd-2.globacl-commitd-peer.globacl.svc.cluster.local:7003
+            - name: GLOBACL_COMMITD_PEER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: globacl-signature
+                  key: peer_token
             - name: GLOBACL_SIGNATURE_KEY_ID
               valueFrom:
                 secretKeyRef:
