@@ -357,12 +357,20 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
         }
         ("GET", "/v1/snapshot_manifest") => {
             ensure_latest_snapshot_manifest(&app)?;
-            let body = fs::read(&app.snapshot_manifest_path)?;
+            let body = read_file_or_object_store(
+                &app.snapshot_manifest_path,
+                app.object_store.as_ref(),
+                LATEST_MANIFEST_OBJECT,
+            )?;
             write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshot_manifest.sig") => {
             ensure_latest_snapshot_manifest(&app)?;
-            let body = fs::read(signature_path(&app.snapshot_manifest_path))?;
+            let body = read_file_or_object_store(
+                &signature_path(&app.snapshot_manifest_path),
+                app.object_store.as_ref(),
+                LATEST_MANIFEST_SIGNATURE_OBJECT,
+            )?;
             write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshot_artifact") => {
@@ -378,7 +386,11 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            let body = fs::read(app.snapshot_object_dir.join(object))?;
+            let body = read_file_or_object_store(
+                &app.snapshot_object_dir.join(object),
+                app.object_store.as_ref(),
+                object,
+            )?;
             write_http_response(&mut stream, 200, "application/octet-stream", &body)?;
         }
         ("GET", "/v1/snapshot_artifact.sig") => {
@@ -394,7 +406,12 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            let body = fs::read(signature_path(app.snapshot_object_dir.join(object)))?;
+            let signature_object = format!("{object}.sig");
+            let body = read_file_or_object_store(
+                &signature_path(app.snapshot_object_dir.join(object)),
+                app.object_store.as_ref(),
+                &signature_object,
+            )?;
             write_http_response(&mut stream, 200, "application/json", &body)?;
         }
         ("GET", "/v1/snapshots") => {

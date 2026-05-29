@@ -47,19 +47,19 @@ k() {
 
 wait_for_http() {
   local url="$1"
-  smoke_client wait-health --base-url "${url}" --timeout 120s
+  e2e_client wait-health --base-url "${url}" --timeout 120s
 }
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  smoke_client wait-propagation \
+  e2e_client wait-propagation \
     --base-url "http://127.0.0.1:${CENTRAL_HOST_PORT}" \
     --expected-agents "${expected_agents}" \
     --timeout 120s
 }
 
-smoke_client() {
-  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
+e2e_client() {
+  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-e2e "$@")
 }
 
 render_region() {
@@ -114,14 +114,14 @@ for region in "${REGIONS[@]}"; do
   k "${cluster}" -n "${NAMESPACE}" rollout status deploy/globacl-demo --timeout=180s
 done
 
-smoke_client deny \
+e2e_client deny \
   --base-url "http://127.0.0.1:${CENTRAL_HOST_PORT}" \
   --op-id ci-global-user \
   --tenant-id tenant-a \
   --namespace user \
   --key user-global \
   --delivery-priority p0 \
-  --reason-code ci_global_smoke \
+  --reason-code ci_global_e2e \
   --created-by ci >/tmp/globacl-global-commit.out
 
 index=1
@@ -132,13 +132,13 @@ for region in "${REGIONS[@]}"; do
   PIDS+=("$!")
   wait_for_http "http://127.0.0.1:${port}/health"
 
-  if ! smoke_client wait-demo-deny \
+  if ! e2e_client wait-demo-deny \
     --base-url "http://127.0.0.1:${port}" \
     --tenant-id tenant-a \
     --namespace user \
     --key user-global \
     --timeout 120s; then
-    echo "global smoke failed: ${region} did not observe deny" >&2
+    echo "global e2e failed: ${region} did not observe deny" >&2
     exit 1
   fi
   echo "${region} observed global deny"
@@ -146,4 +146,4 @@ for region in "${REGIONS[@]}"; do
 done
 
 wait_for_propagation_ack "${#REGIONS[@]}"
-echo "global smoke passed"
+echo "global e2e passed"

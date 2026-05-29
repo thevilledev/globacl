@@ -19,6 +19,7 @@ mod tests {
                 .join("snapshots")
                 .join("manifests")
                 .join("latest.manifest"),
+            object_store: None,
             audit_path: root.join("audit.log"),
             publisher_offsets_path: root.join("publisher_offsets.state"),
             propagation_acks_path: root.join("propagation_acks.log"),

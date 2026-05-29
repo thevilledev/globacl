@@ -1,4 +1,5 @@
 include!("app/bootstrap.rs");
+include!("app/object_store.rs");
 include!("app/routes.rs");
 include!("app/commit.rs");
 include!("app/storage.rs");

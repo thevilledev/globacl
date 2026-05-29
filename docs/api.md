@@ -203,7 +203,7 @@ It calls the local agent and maps deny decisions to `HTTP 403` with `"access": "
 
 ## Edge Hot Path
 
-The sidecar HTTP API is still supported for polyglot services and smoke tests:
+The sidecar HTTP API is still supported for polyglot services and e2e tests:
 
 ```text
 GET /v1/lookup?tenant_id=...&namespace=...&key=...

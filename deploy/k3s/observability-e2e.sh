@@ -46,12 +46,12 @@ port_forward() {
 
 wait_for_http() {
   local url="$1"
-  smoke_client wait-health --base-url "${url}" --timeout 120s
+  e2e_client wait-health --base-url "${url}" --timeout 120s
 }
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  smoke_client wait-propagation \
+  e2e_client wait-propagation \
     --base-url "http://127.0.0.1:${CONTROL_PORT}" \
     --expected-agents "${expected_agents}" \
     --timeout 120s
@@ -60,7 +60,7 @@ wait_for_propagation_ack() {
 wait_for_prometheus_query() {
   local query="$1"
   local minimum="$2"
-  smoke_client wait-prometheus-query \
+  e2e_client wait-prometheus-query \
     --base-url "http://127.0.0.1:${PROMETHEUS_PORT}" \
     --query "${query}" \
     --min "${minimum}" \
@@ -68,14 +68,14 @@ wait_for_prometheus_query() {
 }
 
 wait_for_grafana_dashboard() {
-  smoke_client wait-grafana-dashboard \
+  e2e_client wait-grafana-dashboard \
     --base-url "http://127.0.0.1:${GRAFANA_PORT}" \
     --uid globacl-overview \
     --timeout 180s
 }
 
-smoke_client() {
-  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
+e2e_client() {
+  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-e2e "$@")
 }
 
 apply_grafana() {
@@ -120,17 +120,17 @@ wait_for_prometheus_query "vector(1)" 1
 port_forward svc/globacl-grafana "${GRAFANA_PORT}" 3000 /tmp/globacl-observability-grafana-pf.log
 wait_for_grafana_dashboard
 
-smoke_client deny \
+e2e_client deny \
   --base-url "http://127.0.0.1:${CONTROL_PORT}" \
   --op-id ci-observability-user \
   --tenant-id tenant-a \
   --namespace user \
   --key user-observability \
   --delivery-priority p0 \
-  --reason-code ci_observability_smoke \
+  --reason-code ci_observability_e2e \
   --created-by ci >/tmp/globacl-observability-commit.out
 
-smoke_client wait-demo-deny \
+e2e_client wait-demo-deny \
   --base-url "http://127.0.0.1:${DEMO_PORT}" \
   --tenant-id tenant-a \
   --namespace user \
@@ -145,4 +145,4 @@ wait_for_prometheus_query "sum(globacl_agent_entries)" 3
 wait_for_prometheus_query "sum(globacl_agent_applied_mutations_total)" 3
 wait_for_prometheus_query "sum(globacl_commitd_central_ack_count)" 3
 
-echo "observability smoke passed"
+echo "observability e2e passed"

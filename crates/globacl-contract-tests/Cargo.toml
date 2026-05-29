@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 globacl-agent = { path = "../globacl-agent" }
 globacl-core = { path = "../globacl-core" }
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "rustls"] }
+sha2 = "=0.11.0"
 
 [[bin]]
 name = "globacl-contract-commitd"

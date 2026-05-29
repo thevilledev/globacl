@@ -14,7 +14,7 @@ PORT_FORWARD_TIMEOUT_SECONDS="${PORT_FORWARD_TIMEOUT_SECONDS:-30}"
 CONTROL_PF_PID=""
 RELAY_PF_PID=""
 DEMO_PF_PID=""
-SMOKE_BIN=""
+E2E_BIN=""
 START_PORT_FORWARD_PID=""
 
 CONTROL_PF_LOG="${TMPDIR:-/tmp}/globacl-jetstream-control-pf.log"
@@ -34,8 +34,8 @@ cleanup() {
     kill "${DEMO_PF_PID}" 2>/dev/null || true
     wait "${DEMO_PF_PID}" 2>/dev/null || true
   fi
-  if [[ -n "${SMOKE_BIN}" ]]; then
-    rm -f "${SMOKE_BIN}" 2>/dev/null || true
+  if [[ -n "${E2E_BIN}" ]]; then
+    rm -f "${E2E_BIN}" 2>/dev/null || true
   fi
   if [[ "${KEEP_CLUSTER}" != "1" ]]; then
     k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
@@ -57,7 +57,7 @@ k() {
 wait_for_http() {
   local url="$1"
   local log_file="${2:-}"
-  if ! smoke_client wait-health --base-url "${url}" --timeout 120s; then
+  if ! e2e_client wait-health --base-url "${url}" --timeout 120s; then
     if [[ -n "${log_file}" ]]; then
       print_port_forward_log "${log_file}"
     fi
@@ -67,19 +67,19 @@ wait_for_http() {
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  smoke_client wait-propagation \
+  e2e_client wait-propagation \
     --base-url "http://127.0.0.1:${CONTROL_PORT}" \
     --expected-agents "${expected_agents}" \
     --timeout 120s
 }
 
-smoke_client() {
-  "${SMOKE_BIN}" "$@"
+e2e_client() {
+  "${E2E_BIN}" "$@"
 }
 
-build_smoke_client() {
-  SMOKE_BIN="$(mktemp "${TMPDIR:-/tmp}/globacl-smoke.XXXXXX")"
-  (cd "${ROOT_DIR}/clients/go" && go build -o "${SMOKE_BIN}" ./cmd/globacl-smoke)
+build_e2e_client() {
+  E2E_BIN="$(mktemp "${TMPDIR:-/tmp}/globacl-e2e.XXXXXX")"
+  (cd "${ROOT_DIR}/clients/go" && go build -o "${E2E_BIN}" ./cmd/globacl-e2e)
 }
 
 print_port_forward_log() {
@@ -131,7 +131,7 @@ require_cmd k3d
 require_cmd kubectl
 require_cmd go
 
-build_smoke_client
+build_e2e_client
 
 cd "${ROOT_DIR}"
 docker build -t "${IMAGE}" .
@@ -171,28 +171,28 @@ start_port_forward globacl-demo "${DEMO_PORT}" 8080 "${DEMO_PF_LOG}"
 DEMO_PF_PID="${START_PORT_FORWARD_PID}"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health" "${DEMO_PF_LOG}"
 
-smoke_client require-health-fields \
+e2e_client require-health-fields \
   --base-url "http://127.0.0.1:${RELAY_PORT}" \
   --fields source_lag_max,consumer_num_pending,consumer_num_ack_pending \
   --timeout 120s
 
-smoke_client deny \
+e2e_client deny \
   --base-url "http://127.0.0.1:${CONTROL_PORT}" \
   --op-id ci-jetstream-user \
   --tenant-id tenant-a \
   --namespace user \
   --key user-js-ci \
   --delivery-priority p0 \
-  --reason-code ci_jetstream_smoke \
+  --reason-code ci_jetstream_e2e \
   --created-by ci >/tmp/globacl-jetstream-commit.out
 
-if ! smoke_client wait-demo-deny \
+if ! e2e_client wait-demo-deny \
   --base-url "http://127.0.0.1:${DEMO_PORT}" \
   --tenant-id tenant-a \
   --namespace user \
   --key user-js-ci \
   --timeout 120s; then
-  echo "jetstream smoke failed: demo app did not observe deny" >&2
+  echo "jetstream e2e failed: demo app did not observe deny" >&2
   k -n "${NAMESPACE}" get pods -o wide >&2 || true
   k -n "${NAMESPACE}" logs deploy/globacl-commitd --tail=100 >&2 || true
   k -n "${NAMESPACE}" logs deploy/globacl-relay --tail=100 >&2 || true
@@ -201,4 +201,4 @@ if ! smoke_client wait-demo-deny \
 fi
 
 wait_for_propagation_ack 1
-echo "jetstream smoke passed"
+echo "jetstream e2e passed"

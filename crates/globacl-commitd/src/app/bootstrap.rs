@@ -1,10 +1,11 @@
 use globacl_core::{
     append_mutation_to_log, append_prometheus_metric, auth_config_from_env_var,
     compact_logs_to_watermarks, decode_mutation, decode_mutation_stream, decode_snapshot,
-    deny_requires_blast_radius_override, encode_mutation, encode_mutation_stream, encode_snapshot,
-    encode_snapshot_manifest, format_commit_outcome, format_decision, format_watermarks, http_get,
-    http_post, http_post_with_headers, immutable_snapshot_object_name, is_safe_snapshot_object_name,
-    json, load_all_logs, metrics_bind_addr_from_env, nats_jetstream_ensure_stream,
+    decode_snapshot_manifest, deny_requires_blast_radius_override, encode_mutation,
+    encode_mutation_stream, encode_snapshot, encode_snapshot_manifest, format_commit_outcome,
+    format_decision, format_watermarks, http_get, http_post, http_post_with_headers,
+    immutable_snapshot_object_name, is_safe_snapshot_object_name, json, load_all_logs,
+    metrics_bind_addr_from_env, nats_jetstream_ensure_stream,
     nats_jetstream_publish, now_unix, parse_json_fields, parse_query_path, parse_watermarks,
     parse_json_body, prometheus_bool, read_http_request, rule_requires_blast_radius_override,
     sanitize_audit_value, snapshot_artifact_sha256_hex, spawn_prometheus_metrics_listener,
@@ -36,6 +37,7 @@ struct App {
     snapshot_manifest_dir: PathBuf,
     snapshot_path: PathBuf,
     snapshot_manifest_path: PathBuf,
+    object_store: Option<ObjectStoreConfig>,
     audit_path: PathBuf,
     publisher_offsets_path: PathBuf,
     propagation_acks_path: PathBuf,
@@ -183,6 +185,7 @@ pub(crate) fn run() -> Result<()> {
     let propagation_acks_path = data_dir.join("propagation_acks.log");
     let signature_signer = signature_signer_from_env()?;
     let auth = auth_config_from_env_var("GLOBACL_AUTH_TOKENS")?;
+    let object_store = object_store_config()?;
     let replication = replication_config(bind_addr)?;
     let compaction = compaction_config()?;
     let publisher = publisher_config()?;
@@ -197,6 +200,14 @@ pub(crate) fn run() -> Result<()> {
     }
     let consensus = load_consensus_state(&consensus_path, &replication)?;
     let last_published = load_publisher_offsets(&publisher_offsets_path, shard_count)?;
+    restore_snapshot_before_load(
+        object_store.as_ref(),
+        &log_dir,
+        &snapshot_object_dir,
+        &snapshot_manifest_dir,
+        &snapshot_path,
+        &snapshot_manifest_path,
+    )?;
     let state = load_source_of_truth(
         &log_dir,
         &snapshot_path,
@@ -213,6 +224,7 @@ pub(crate) fn run() -> Result<()> {
         &snapshot_manifest_path,
         &startup_snapshot,
         &signature_signer,
+        object_store.as_ref(),
     )?;
 
     let propagation_acks = load_propagation_acks(&propagation_acks_path)?;
@@ -228,6 +240,7 @@ pub(crate) fn run() -> Result<()> {
         snapshot_manifest_dir,
         snapshot_path,
         snapshot_manifest_path,
+        object_store,
         audit_path,
         publisher_offsets_path,
         propagation_acks_path,

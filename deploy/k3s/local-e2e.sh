@@ -40,19 +40,19 @@ k() {
 
 wait_for_http() {
   local url="$1"
-  smoke_client wait-health --base-url "${url}" --timeout 120s
+  e2e_client wait-health --base-url "${url}" --timeout 120s
 }
 
 wait_for_propagation_ack() {
   local expected_agents="$1"
-  smoke_client wait-propagation \
+  e2e_client wait-propagation \
     --base-url "http://127.0.0.1:${CONTROL_PORT}" \
     --expected-agents "${expected_agents}" \
     --timeout 120s
 }
 
-smoke_client() {
-  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-smoke "$@")
+e2e_client() {
+  (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-e2e "$@")
 }
 
 require_cmd docker
@@ -82,17 +82,17 @@ k -n "${NAMESPACE}" port-forward svc/globacl-demo "${DEMO_PORT}:8080" >/tmp/glob
 DEMO_PF_PID="$!"
 wait_for_http "http://127.0.0.1:${DEMO_PORT}/health"
 
-smoke_client deny \
+e2e_client deny \
   --base-url "http://127.0.0.1:${CONTROL_PORT}" \
   --op-id ci-local-user \
   --tenant-id tenant-a \
   --namespace user \
   --key user-ci \
   --delivery-priority p0 \
-  --reason-code ci_smoke \
+  --reason-code ci_e2e \
   --created-by ci >/tmp/globacl-local-commit.out
 
-smoke_client wait-demo-deny \
+e2e_client wait-demo-deny \
   --base-url "http://127.0.0.1:${DEMO_PORT}" \
   --tenant-id tenant-a \
   --namespace user \
@@ -100,4 +100,4 @@ smoke_client wait-demo-deny \
   --timeout 120s
 
 wait_for_propagation_ack 1
-echo "local smoke passed"
+echo "local e2e passed"

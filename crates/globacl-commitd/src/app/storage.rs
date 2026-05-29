@@ -107,6 +107,7 @@ fn persist_snapshot_manifest(app: &App, snapshot: &Snapshot) -> Result<SnapshotM
         &app.snapshot_manifest_path,
         snapshot,
         &app.signature_signer,
+        app.object_store.as_ref(),
     )
 }
 
@@ -116,12 +117,14 @@ fn write_snapshot_manifest_publication(
     latest_manifest_path: &Path,
     snapshot: &Snapshot,
     signer: &SignatureSigner,
+    object_store: Option<&ObjectStoreConfig>,
 ) -> Result<SnapshotManifest> {
     let payload = encode_snapshot(snapshot);
     let artifact_sha256 = snapshot_artifact_sha256_hex(&payload);
     let artifact_object = immutable_snapshot_object_name(snapshot, &artifact_sha256);
     let artifact_path = object_dir.join(&artifact_object);
     write_signed_payload_file(&artifact_path, &payload, signer)?;
+    let artifact_signature_payload = fs::read(signature_path(&artifact_path))?;
 
     let manifest = SnapshotManifest::for_snapshot(
         snapshot,
@@ -131,14 +134,23 @@ fn write_snapshot_manifest_publication(
         artifact_sha256,
     );
     let manifest_payload = encode_snapshot_manifest(&manifest);
-    let immutable_manifest_path = manifest_dir.join(format!(
-        "epoch_{:020}_seq_{:020}_sha256_{}.manifest",
-        manifest.created_at_unix,
-        manifest.max_seq,
-        &manifest.artifact_sha256[..16]
-    ));
+    let immutable_manifest_path = manifest_dir.join(snapshot_manifest_file_name(&manifest));
     write_signed_payload_file(&immutable_manifest_path, &manifest_payload, signer)?;
+    let immutable_manifest_signature_payload = fs::read(signature_path(&immutable_manifest_path))?;
     write_signed_payload_file(latest_manifest_path, &manifest_payload, signer)?;
+    let latest_manifest_signature_payload = fs::read(signature_path(latest_manifest_path))?;
+    publish_snapshot_to_object_store_best_effort(
+        object_store,
+        &SnapshotPublication {
+            manifest: &manifest,
+            artifact_payload: &payload,
+            artifact_signature_payload: &artifact_signature_payload,
+            immutable_manifest_payload: &manifest_payload,
+            immutable_manifest_signature_payload: &immutable_manifest_signature_payload,
+            latest_manifest_payload: &manifest_payload,
+            latest_manifest_signature_payload: &latest_manifest_signature_payload,
+        },
+    )?;
     Ok(manifest)
 }
 

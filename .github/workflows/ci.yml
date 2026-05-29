@@ -73,10 +73,11 @@ jobs:
       - name: Check shell scripts
         run: |
           set -euo pipefail
-          bash -n deploy/k3s/local-smoke.sh
-          bash -n deploy/k3s/jetstream-smoke.sh
-          bash -n deploy/k3s/global-smoke.sh
-          bash -n deploy/k3s/observability-smoke.sh
+          bash -n deploy/k3s/local-e2e.sh
+          bash -n deploy/k3s/jetstream-e2e.sh
+          bash -n deploy/k3s/object-storage-e2e.sh
+          bash -n deploy/k3s/global-e2e.sh
+          bash -n deploy/k3s/observability-e2e.sh
           bash -n deploy/k3s/dev-cluster.sh
 
       - name: Check Grafana dashboards

@@ -3,6 +3,8 @@ FROM rust:1.93-alpine AS build
 WORKDIR /src
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 
+RUN apk add --no-cache cmake
+
 COPY . .
 RUN cargo build --release --locked --workspace --bins
 

@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: globacl-seaweedfs
+  namespace: globacl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: globacl-seaweedfs
+  template:
+    metadata:
+      labels:
+        app: globacl-seaweedfs
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:4.29
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: admin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: secret
+            - name: S3_BUCKET
+              value: globacl-snapshots
+          ports:
+            - containerPort: 8333
+              name: s3
+            - containerPort: 8888
+              name: filer
+            - containerPort: 9333
+              name: master
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: globacl-seaweedfs
+  namespace: globacl
+spec:
+  selector:
+    app: globacl-seaweedfs
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: s3
+    - name: filer
+      port: 8888
+      targetPort: filer
+    - name: master
+      port: 9333
+      targetPort: master

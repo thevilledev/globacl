@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: globacl-smoke <wait-health|require-health-fields|deny|wait-demo-deny|wait-propagation|wait-prometheus-query|wait-grafana-dashboard>")
+		fatalf("usage: globacl-e2e <wait-health|require-health-fields|deny|wait-demo-deny|wait-check-deny|wait-propagation|wait-prometheus-query|wait-grafana-dashboard>")
 	}
 
 	var err error
@@ -31,6 +31,8 @@ func main() {
 		err = deny(os.Args[2:])
 	case "wait-demo-deny":
 		err = waitDemoDeny(os.Args[2:])
+	case "wait-check-deny":
+		err = waitCheckDeny(os.Args[2:])
 	case "wait-propagation":
 		err = waitPropagation(os.Args[2:])
 	case "wait-prometheus-query":
@@ -137,8 +139,8 @@ func deny(args []string) error {
 	tenantID := flags.String("tenant-id", "", "tenant id")
 	namespace := flags.String("namespace", "", "namespace")
 	key := flags.String("key", "", "key")
-	reasonCode := flags.String("reason-code", "smoke", "reason code")
-	createdBy := flags.String("created-by", "smoke", "creator")
+	reasonCode := flags.String("reason-code", "e2e", "reason code")
+	createdBy := flags.String("created-by", "e2e", "creator")
 	deliveryPriority := flags.String("delivery-priority", "p0", "delivery priority")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -221,6 +223,42 @@ func waitDemoDeny(args []string) error {
 		}
 		return response.StatusCode == http.StatusForbidden && payload.Access == "denied", nil
 	})
+}
+
+func waitCheckDeny(args []string) error {
+	flags := flag.NewFlagSet("wait-check-deny", flag.ExitOnError)
+	baseURL := flags.String("base-url", "", "control base URL")
+	tenantID := flags.String("tenant-id", "", "tenant id")
+	namespace := flags.String("namespace", "", "namespace")
+	key := flags.String("key", "", "key")
+	timeout := flags.Duration("timeout", 120*time.Second, "wait timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	client, err := newClient(*baseURL)
+	if err != nil {
+		return err
+	}
+	var lastDecision string
+	err = waitUntil(*timeout, func(ctx context.Context) (bool, error) {
+		decision, err := client.Check(
+			ctx,
+			requireValue("tenant-id", *tenantID),
+			requireValue("namespace", *namespace),
+			requireValue("key", *key),
+		)
+		if err != nil {
+			return false, nil
+		}
+		encoded, _ := json.Marshal(decision)
+		lastDecision = string(encoded)
+		deny, err := decision.AsDenyDecision()
+		return err == nil && deny.Decision == globacl.DenyDecisionDecisionDeny, nil
+	})
+	if err != nil && lastDecision != "" {
+		return fmt.Errorf("%w: last check decision %s", err, lastDecision)
+	}
+	return err
 }
 
 func waitPropagation(args []string) error {

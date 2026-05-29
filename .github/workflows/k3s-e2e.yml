@@ -1,15 +1,16 @@
-name: k3s smoke manual
+name: k3s e2e manual
 
 on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Smoke suite to run
+        description: E2E suite to run
         required: true
         default: local
         type: choice
         options:
           - local
+          - object-storage
           - jetstream
           - global
           - observability
@@ -39,8 +40,8 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
-      - name: Run local k3s smoke
-        run: ./deploy/k3s/local-smoke.sh
+      - name: Run local k3s e2e
+        run: ./deploy/k3s/local-e2e.sh
 
   jetstream:
     if: ${{ inputs.suite == 'jetstream' || inputs.suite == 'all' }}
@@ -58,8 +59,27 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
-      - name: Run JetStream k3s smoke
-        run: ./deploy/k3s/jetstream-smoke.sh
+      - name: Run JetStream k3s e2e
+        run: ./deploy/k3s/jetstream-e2e.sh
+
+  object-storage:
+    if: ${{ inputs.suite == 'object-storage' || inputs.suite == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Install k3d
+        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+      - name: Run object-storage k3s e2e
+        run: ./deploy/k3s/object-storage-e2e.sh
 
   global:
     if: ${{ inputs.suite == 'global' || inputs.suite == 'all' }}
@@ -77,8 +97,8 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
-      - name: Run global k3s smoke
-        run: ./deploy/k3s/global-smoke.sh
+      - name: Run global k3s e2e
+        run: ./deploy/k3s/global-e2e.sh
 
   observability:
     if: ${{ inputs.suite == 'observability' || inputs.suite == 'all' }}
@@ -96,5 +116,5 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
       - name: Install k3d
         run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
-      - name: Run observability k3s smoke
-        run: ./deploy/k3s/observability-smoke.sh
+      - name: Run observability k3s e2e
+        run: ./deploy/k3s/observability-e2e.sh

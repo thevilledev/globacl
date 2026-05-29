@@ -75,31 +75,37 @@ The core tests cover:
 - Ed25519 payload signature verification
 - signature keyring parsing and minimum-version downgrade rejection
 
-For an end-to-end smoke test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, verify `/v1/audit`, list `/v1/snapshots`, then commit a delete and confirm the agent returns `"decision": "allow"`.
+For a manual e2e test, run the services from [Getting started](getting-started.md), commit a deny, query the agent, commit an IPv4/domain rule, check it through `/v1/check`, inspect relay acknowledgements, verify `/v1/audit`, list `/v1/snapshots`, then commit a delete and confirm the agent returns `"decision": "allow"`.
 
-Run k3d-backed k3s smoke tests:
+Run k3d-backed k3s e2e tests:
 
 ```sh
-./deploy/k3s/local-smoke.sh
-./deploy/k3s/jetstream-smoke.sh
-./deploy/k3s/global-smoke.sh
-./deploy/k3s/observability-smoke.sh
+./deploy/k3s/local-e2e.sh
+./deploy/k3s/jetstream-e2e.sh
+./deploy/k3s/object-storage-e2e.sh
+./deploy/k3s/global-e2e.sh
+./deploy/k3s/observability-e2e.sh
 ```
 
-The local smoke deploys one commitd, one control gateway, one relay, one
-agent, and one demo app in a single k3s cluster. The JetStream smoke uses the
+The local e2e deploys one commitd, one control gateway, one relay, one
+agent, and one demo app in a single k3s cluster. The JetStream e2e uses the
 same local shape, adds NATS JetStream, enables commitd publishing, switches
 the relay to `GLOBACL_RELAY_SOURCE=jetstream`, and verifies that the demo app
-observes a deny through the agent. The global smoke deploys a three-replica
-central commitd StatefulSet with persistent volumes, stateless central control
-gateways, plus three regional k3s clusters with HA relays and demo apps. The
-observability smoke deploys a three-replica local control plane, three relays,
-three agents, three demo apps, Prometheus, and Grafana. It asserts scrape
-discovery, verifies that the provisioned `globacl-overview` Grafana dashboard is
-available, and checks live propagation metrics after a deny.
+observes a deny through the agent. The object-storage e2e adds a single-node
+SeaweedFS S3 endpoint, requires commitd snapshot upload to succeed, deletes the
+commitd pod, and verifies the deny is restored from object storage. The global
+e2e deploys a three-replica central commitd StatefulSet with persistent
+volumes, stateless central control gateways, plus three regional k3s clusters
+with HA relays and demo apps. The observability e2e deploys a three-replica
+local control plane, three relays, three agents, three demo apps, Prometheus,
+and Grafana. It asserts scrape discovery, verifies that the provisioned
+`globacl-overview` Grafana dashboard is available, and checks live propagation
+metrics after a deny.
 
-The smoke scripts use the Go client smoke runner in `clients/go/cmd/globacl-smoke` for API operations and assertions, so they exercise the generated client model surface instead of shell JSON parsing.
-If a smoke environment enables `GLOBACL_AUTH_TOKENS`, export
+The e2e scripts use the Go client e2e runner in `clients/go/cmd/globacl-e2e`
+for API operations and assertions, so they exercise the generated client model
+surface instead of shell JSON parsing.
+If an e2e environment enables `GLOBACL_AUTH_TOKENS`, export
 `GLOBACL_BEARER_TOKEN` with a token that has `acl:write` before running the
 script.
 
@@ -107,7 +113,10 @@ script.
 test. It loads a signed snapshot into `AgentHandle` and checks lookup decisions
 directly, without starting the localhost HTTP sidecar.
 
-The global smoke also exercises the custom control-plane consensus path: the three central commitd pods elect a leader, writes can arrive through any control gateway pod, and committed mutations are replicated to the commitd quorum before regional relays and agents observe them.
+The global e2e also exercises the custom control-plane consensus path: the
+three central commitd pods elect a leader, writes can arrive through any control
+gateway pod, and committed mutations are replicated to the commitd quorum before
+regional relays and agents observe them.
 
 Run the focused multi-process partition test:
 
@@ -117,7 +126,7 @@ cargo test -p globacl-commitd --test multi_process_partition --locked
 
 This starts three real `globacl-commitd` processes behind per-link loopback TCP proxies, isolates the current leader, verifies the isolated leader cannot commit or apply a mutation without quorum, and verifies the remaining two-node majority elects a leader and commits.
 
-Rollback smoke test:
+Rollback e2e test:
 
 ```text
 1. Start control, relay, and agent.
@@ -127,7 +136,7 @@ Rollback smoke test:
 5. Confirm the agent receives forward rollback mutations and returns the snapshot's expected decision.
 ```
 
-Stale-agent smoke test:
+Stale-agent e2e test:
 
 ```text
 1. Start the agent with stale_after_secs=2.
