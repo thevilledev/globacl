@@ -142,26 +142,12 @@ fn replicate_propagation_ack_on_quorum(app: &App, ack: &PropagationAck) -> Resul
     }
 
     let payload = ack.to_json_body();
-    let mut replicated = 1usize;
-    let mut failures = Vec::new();
-    for peer in app.replication.remote_peers() {
-        let headers = peer_headers(app);
-        match http_post_with_headers(
-            &peer.addr,
-            "/internal/replication/ack",
-            payload.as_bytes(),
-            &headers,
-        ) {
-            Ok(response) if response.status_code == 200 => replicated += 1,
-            Ok(response) => {
-                failures.push(format!(
-                    "{}:http_status:{}",
-                    peer.node_id, response.status_code
-                ))
-            }
-            Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
-        }
-    }
+    let (replicated, failures) = post_to_remote_peers_until_quorum(
+        app,
+        "/internal/replication/ack",
+        payload.as_bytes(),
+        peer_header_values(app),
+    );
 
     if replicated >= app.replication.quorum {
         return Ok(());

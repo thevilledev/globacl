@@ -269,26 +269,12 @@ fn prepare_on_quorum(app: &App, mutation: &Mutation) -> Result<()> {
     }
 
     let payload = encode_mutation(mutation);
-    let headers = replication_headers(app);
-    let mut prepared = 1usize;
-    let mut failures = Vec::new();
-    for peer in app.replication.remote_peers() {
-        match http_post_with_headers(
-            &peer.addr,
-            "/internal/replication/prepare",
-            &payload,
-            &headers,
-        ) {
-            Ok(response) if response.status_code == 200 => prepared += 1,
-            Ok(response) => {
-                failures.push(format!(
-                    "{}:http_status:{}",
-                    peer.node_id, response.status_code
-                ))
-            }
-            Err(err) => failures.push(format!("{}:{err}", peer.node_id)),
-        }
-    }
+    let (prepared, failures) = post_to_remote_peers_until_quorum(
+        app,
+        "/internal/replication/prepare",
+        &payload,
+        replication_header_values(app),
+    );
 
     if prepared >= app.replication.quorum {
         return Ok(());

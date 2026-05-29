@@ -150,6 +150,75 @@ fn replication_headers(app: &App) -> Vec<(&'static str, &str)> {
     headers
 }
 
+fn peer_header_values(app: &App) -> Vec<(&'static str, String)> {
+    app.peer_token
+        .as_ref()
+        .map(|token| vec![(PEER_TOKEN_HEADER, token.clone())])
+        .unwrap_or_default()
+}
+
+fn replication_header_values(app: &App) -> Vec<(&'static str, String)> {
+    let mut headers = peer_header_values(app);
+    headers.push((LEADER_ID_HEADER, app.replication.node_id.clone()));
+    headers
+}
+
+fn post_to_remote_peers_until_quorum(
+    app: &App,
+    path: &str,
+    payload: &[u8],
+    headers: Vec<(&'static str, String)>,
+) -> (usize, Vec<String>) {
+    let peers = app.replication.remote_peers().cloned().collect::<Vec<_>>();
+    let mut replicated = 1usize;
+    if replicated >= app.replication.quorum || peers.is_empty() {
+        return (replicated, Vec::new());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for peer in peers.iter().cloned() {
+        let tx = tx.clone();
+        let path = path.to_owned();
+        let payload = payload.to_vec();
+        let headers = headers.clone();
+        thread::spawn(move || {
+            let header_refs = headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect::<Vec<_>>();
+            let result = http_post_with_headers(&peer.addr, &path, &payload, &header_refs);
+            let _ = tx.send((peer.node_id, result));
+        });
+    }
+    drop(tx);
+
+    let mut pending = peers.len();
+    let mut failures = Vec::new();
+    while pending > 0 && replicated < app.replication.quorum {
+        match rx.recv_timeout(Duration::from_millis(4_500)) {
+            Ok((node_id, Ok(response))) if response.status_code == 200 => {
+                replicated += 1;
+                pending -= 1;
+            }
+            Ok((node_id, Ok(response))) => {
+                failures.push(format!("{node_id}:http_status:{}", response.status_code));
+                pending -= 1;
+            }
+            Ok((node_id, Err(err))) => {
+                failures.push(format!("{node_id}:{err}"));
+                pending -= 1;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                failures.push(format!("timeout_waiting_for_{pending}_peer_responses"));
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    (replicated, failures)
+}
+
 fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {
     let Some(leader_addr) = current_leader_addr(app)? else {
         write_json_response(
