@@ -1,4 +1,5 @@
 fn persist_mutation(app: &App, mutation: &Mutation) -> Result<()> {
+    maybe_inject_test_storage_fault("mutation_log", StorageFault::DiskFull)?;
     append_mutation_to_log(&app.log_dir, mutation)?;
     write_delta_bundle_file(
         &app.bundle_dir,
@@ -169,6 +170,7 @@ fn write_payload_file(path: impl AsRef<Path>, payload: &[u8]) -> Result<()> {
     if let Some(parent) = path.as_ref().parent() {
         fs::create_dir_all(parent)?;
     }
+    maybe_inject_test_storage_fault("payload_file", StorageFault::DiskFull)?;
     let tmp = path.as_ref().with_extension("tmp");
     {
         let mut file = OpenOptions::new()
@@ -177,10 +179,93 @@ fn write_payload_file(path: impl AsRef<Path>, payload: &[u8]) -> Result<()> {
             .truncate(true)
             .open(&tmp)?;
         file.write_all(payload)?;
+        maybe_inject_test_storage_fault("payload_file", StorageFault::Fsync)?;
         file.sync_all()?;
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageFault {
+    DiskFull,
+    Fsync,
+}
+
+fn maybe_inject_test_storage_fault(operation: &str, fault: StorageFault) -> Result<()> {
+    #[cfg(test)]
+    {
+        if take_test_storage_fault(operation, fault) {
+            let message = match fault {
+                StorageFault::DiskFull => "simulated disk full",
+                StorageFault::Fsync => "simulated fsync failure",
+            };
+            return Err(GlobAclError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                message,
+            )));
+        }
+    }
+
+    let _ = (operation, fault);
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TestStorageFault {
+    operation: &'static str,
+    fault: StorageFault,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STORAGE_FAULT: std::cell::RefCell<Option<TestStorageFault>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+struct TestStorageFaultGuard {
+    previous: Option<TestStorageFault>,
+}
+
+#[cfg(test)]
+impl Drop for TestStorageFaultGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_STORAGE_FAULT.with(|slot| {
+            *slot.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn set_test_storage_fault(
+    operation: &'static str,
+    fault: StorageFault,
+) -> TestStorageFaultGuard {
+    let previous = TEST_STORAGE_FAULT.with(|slot| slot.borrow_mut().replace(TestStorageFault {
+        operation,
+        fault,
+    }));
+    TestStorageFaultGuard { previous }
+}
+
+#[cfg(test)]
+fn take_test_storage_fault(operation: &str, fault: StorageFault) -> bool {
+    TEST_STORAGE_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .map(|configured| configured.operation == operation && configured.fault == fault)
+            .unwrap_or(false)
+        {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn write_pending_mutation(pending_dir: &Path, mutation: &Mutation) -> Result<()> {

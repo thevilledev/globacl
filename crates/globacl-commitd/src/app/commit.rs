@@ -294,37 +294,24 @@ fn commit_on_peers(app: &App, mutation: &Mutation) {
     }
 
     let payload = encode_mutation(mutation);
-    let headers = replication_headers(app);
-    for peer in app.replication.remote_peers() {
-        match http_post_with_headers(
-            &peer.addr,
-            "/internal/replication/commit",
-            &payload,
-            &headers,
-        ) {
-            Ok(response) if response.status_code == 200 => {}
-            Ok(response) => eprintln!(
-                "peer commit failed: peer {} returned HTTP status {}",
-                peer.node_id, response.status_code
-            ),
-            Err(err) => eprintln!("peer commit failed: peer {} error {err}", peer.node_id),
-        }
-    }
+    post_to_remote_peers_best_effort(
+        app,
+        "/internal/replication/commit",
+        payload,
+        replication_header_values(app),
+        "commit",
+    );
 }
 
 fn abort_on_peers(app: &App, mutation: &Mutation) {
     let payload = encode_mutation(mutation);
-    let headers = replication_headers(app);
-    for peer in app.replication.remote_peers() {
-        if let Err(err) = http_post_with_headers(
-            &peer.addr,
-            "/internal/replication/abort",
-            &payload,
-            &headers,
-        ) {
-            eprintln!("peer abort failed: peer {} error {err}", peer.node_id);
-        }
-    }
+    post_to_remote_peers_best_effort(
+        app,
+        "/internal/replication/abort",
+        payload,
+        replication_header_values(app),
+        "abort",
+    );
 }
 
 fn prepare_replicated_mutation_from_leader(

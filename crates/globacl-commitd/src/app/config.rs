@@ -144,12 +144,6 @@ fn peer_headers(app: &App) -> Vec<(&'static str, &str)> {
         .unwrap_or_default()
 }
 
-fn replication_headers(app: &App) -> Vec<(&'static str, &str)> {
-    let mut headers = peer_headers(app);
-    headers.push((LEADER_ID_HEADER, app.replication.node_id.as_str()));
-    headers
-}
-
 fn peer_header_values(app: &App) -> Vec<(&'static str, String)> {
     app.peer_token
         .as_ref()
@@ -217,6 +211,36 @@ fn post_to_remote_peers_until_quorum(
     }
 
     (replicated, failures)
+}
+
+fn post_to_remote_peers_best_effort(
+    app: &App,
+    path: &'static str,
+    payload: Vec<u8>,
+    headers: Vec<(&'static str, String)>,
+    operation: &'static str,
+) {
+    for peer in app.replication.remote_peers().cloned() {
+        let payload = payload.clone();
+        let headers = headers.clone();
+        thread::spawn(move || {
+            let header_refs = headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect::<Vec<_>>();
+            match http_post_with_headers(&peer.addr, path, &payload, &header_refs) {
+                Ok(response) if response.status_code == 200 => {}
+                Ok(response) => eprintln!(
+                    "peer {operation} failed: peer {} returned HTTP status {}",
+                    peer.node_id, response.status_code
+                ),
+                Err(err) => eprintln!(
+                    "peer {operation} failed: peer {} error {err}",
+                    peer.node_id
+                ),
+            }
+        });
+    }
 }
 
 fn proxy_get_to_leader(stream: &mut TcpStream, app: &App, request: &HttpRequest) -> Result<()> {

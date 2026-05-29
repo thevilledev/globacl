@@ -8,7 +8,7 @@ use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -151,6 +151,7 @@ fn lagging_follower_repairs_from_compacted_leader_snapshot() {
     let _guard = multi_process_test_guard();
     let mut cluster = CommitdCluster::start_with(ClusterOptions {
         compaction_min_log_entries: Some(1),
+        ..ClusterOptions::default()
     });
 
     wait_for_healthy_nodes(&cluster);
@@ -172,11 +173,39 @@ fn lagging_follower_repairs_from_compacted_leader_snapshot() {
 }
 
 #[test]
+fn slow_peer_does_not_delay_quorum_write_response() {
+    let _guard = multi_process_test_guard();
+    let cluster = CommitdCluster::start_with(ClusterOptions {
+        heartbeat_ms: Some(100),
+        election_ms: Some(6_000),
+        ..ClusterOptions::default()
+    });
+
+    wait_for_healthy_nodes(&cluster);
+    wait_for_role(cluster.addr(NODE_A), "leader");
+
+    cluster.delay_link(NODE_A, NODE_B, Duration::from_millis(2_000));
+    let started = Instant::now();
+    let (shard_id, seq) = commit_deny(cluster.addr(NODE_A), "chaos-slow-peer", "user-slow-peer");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(1_500),
+        "quorum write response was delayed by slow peer: {elapsed:?}"
+    );
+    wait_for_watermark_at_least(cluster.addr(NODE_C), shard_id, seq);
+
+    cluster.delay_link(NODE_A, NODE_B, Duration::ZERO);
+    wait_for_watermark_at_least(cluster.addr(NODE_B), shard_id, seq);
+}
+
+#[test]
 #[ignore = "soak test; run explicitly with GLOBACL_SOAK_SECONDS/GLOBACL_SOAK_WRITERS"]
 fn compacting_cluster_survives_sustained_write_load() {
     let _guard = multi_process_test_guard();
     let mut cluster = CommitdCluster::start_with(ClusterOptions {
         compaction_min_log_entries: Some(16),
+        ..ClusterOptions::default()
     });
     let duration = Duration::from_secs(env_usize("GLOBACL_SOAK_SECONDS", 30) as u64);
     let writers = env_usize("GLOBACL_SOAK_WRITERS", 4).max(1);
@@ -284,6 +313,9 @@ fn multi_process_test_guard() -> MutexGuard<'static, ()> {
 #[derive(Clone, Copy, Debug, Default)]
 struct ClusterOptions {
     compaction_min_log_entries: Option<usize>,
+    heartbeat_ms: Option<u64>,
+    election_ms: Option<u64>,
+    sync_ms: Option<u64>,
 }
 
 struct CommitdCluster {
@@ -419,6 +451,10 @@ impl CommitdCluster {
         }
     }
 
+    fn delay_link(&self, from: &str, to: &str, delay: Duration) {
+        self.links.proxy(from, to).set_delay(delay);
+    }
+
     fn stop_node(&mut self, node_id: &'static str) {
         self.nodes
             .get_mut(node_id)
@@ -521,9 +557,18 @@ impl Node {
             .env("GLOBACL_COMMITD_PEERS", peers)
             .env("GLOBACL_COMMITD_QUORUM", "2")
             .env("GLOBACL_COMMITD_PEER_TOKEN", PEER_TOKEN)
-            .env("GLOBACL_COMMITD_HEARTBEAT_MS", "50")
-            .env("GLOBACL_COMMITD_ELECTION_MS", "250")
-            .env("GLOBACL_COMMITD_SYNC_MS", "50")
+            .env(
+                "GLOBACL_COMMITD_HEARTBEAT_MS",
+                options.heartbeat_ms.unwrap_or(50).to_string(),
+            )
+            .env(
+                "GLOBACL_COMMITD_ELECTION_MS",
+                options.election_ms.unwrap_or(250).to_string(),
+            )
+            .env(
+                "GLOBACL_COMMITD_SYNC_MS",
+                options.sync_ms.unwrap_or(50).to_string(),
+            )
             .env("GLOBACL_COMMITD_METRICS_ADDR", "off")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -586,11 +631,24 @@ impl DirectedLinks {
             cb: TcpProxy::start(addr_b),
         }
     }
+
+    fn proxy(&self, from: &str, to: &str) -> &TcpProxy {
+        match (from, to) {
+            (NODE_A, NODE_B) => &self.ab,
+            (NODE_A, NODE_C) => &self.ac,
+            (NODE_B, NODE_A) => &self.ba,
+            (NODE_B, NODE_C) => &self.bc,
+            (NODE_C, NODE_A) => &self.ca,
+            (NODE_C, NODE_B) => &self.cb,
+            _ => panic!("unknown link {from}->{to}"),
+        }
+    }
 }
 
 struct TcpProxy {
     addr: String,
     enabled: Arc<AtomicBool>,
+    delay_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -606,8 +664,10 @@ impl TcpProxy {
             .expect("proxy listener should have local addr")
             .to_string();
         let enabled = Arc::new(AtomicBool::new(true));
+        let delay_ms = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_enabled = Arc::clone(&enabled);
+        let thread_delay_ms = Arc::clone(&delay_ms);
         let thread_stop = Arc::clone(&stop);
         let target_addr = target_addr.to_owned();
         let thread = thread::spawn(move || {
@@ -616,7 +676,10 @@ impl TcpProxy {
                     Ok((stream, _)) => {
                         let target_addr = target_addr.clone();
                         let enabled = Arc::clone(&thread_enabled);
-                        thread::spawn(move || proxy_connection(stream, target_addr, enabled));
+                        let delay_ms = Arc::clone(&thread_delay_ms);
+                        thread::spawn(move || {
+                            proxy_connection(stream, target_addr, enabled, delay_ms)
+                        });
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -629,6 +692,7 @@ impl TcpProxy {
         Self {
             addr,
             enabled,
+            delay_ms,
             stop,
             thread: Some(thread),
         }
@@ -641,6 +705,11 @@ impl TcpProxy {
     fn enable(&self) {
         self.enabled.store(true, Ordering::SeqCst);
     }
+
+    fn set_delay(&self, delay: Duration) {
+        let delay_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.delay_ms.store(delay_ms, Ordering::SeqCst);
+    }
 }
 
 impl Drop for TcpProxy {
@@ -652,9 +721,19 @@ impl Drop for TcpProxy {
     }
 }
 
-fn proxy_connection(mut client: TcpStream, target_addr: String, enabled: Arc<AtomicBool>) {
+fn proxy_connection(
+    mut client: TcpStream,
+    target_addr: String,
+    enabled: Arc<AtomicBool>,
+    delay_ms: Arc<AtomicU64>,
+) {
     if !enabled.load(Ordering::SeqCst) {
         return;
+    }
+
+    let delay_ms = delay_ms.load(Ordering::SeqCst);
+    if delay_ms > 0 {
+        thread::sleep(Duration::from_millis(delay_ms));
     }
 
     let Ok(mut server) = TcpStream::connect(target_addr) else {

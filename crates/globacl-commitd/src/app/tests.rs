@@ -162,6 +162,208 @@ mod tests {
         }
     }
 
+    fn single_node_leader(root: &Path) -> App {
+        let mut app = consensus_test_app(root, "node-a", ConsensusRole::Leader, 1);
+        app.replication.peers = vec![ControlPeer {
+            node_id: "node-a".to_owned(),
+            addr: "127.0.0.1:7101".to_owned(),
+        }];
+        app.replication.quorum = 1;
+        app
+    }
+
+    fn unavailable_object_store(require_upload: bool) -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "globacl-test".to_owned(),
+            prefix: "commitd-tests".to_owned(),
+            access_key_id: "test-access".to_owned(),
+            secret_access_key: "test-secret".to_owned(),
+            session_token: None,
+            force_path_style: true,
+            request_timeout_ms: 500,
+            allow_empty_bootstrap: false,
+            require_upload,
+        }
+    }
+
+    #[test]
+    fn disk_full_before_log_append_does_not_apply_locally() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-disk-full-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = single_node_leader(&root);
+        let _fault = set_test_storage_fault("mutation_log", StorageFault::DiskFull);
+
+        let err = commit_request(&app, deny_request("op-disk-full", "user-1"))
+            .expect_err("disk-full log write should reject commit");
+
+        assert!(err.to_string().contains("simulated disk full"));
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 0);
+        assert!(state.watermarks().iter().all(|seq| *seq == 0));
+        drop(state);
+        assert!(load_all_logs(&app.log_dir, 4)
+            .expect("load logs after disk-full fault")
+            .is_empty());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn fsync_failure_during_snapshot_persist_keeps_durable_log() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-fsync-failure-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = single_node_leader(&root);
+        let _fault = set_test_storage_fault("payload_file", StorageFault::Fsync);
+
+        let err = commit_request(&app, deny_request("op-fsync", "user-1"))
+            .expect_err("snapshot fsync failure should surface");
+
+        assert!(err.to_string().contains("simulated fsync failure"));
+        let state = lock_state(&app).expect("state");
+        assert_eq!(state.mutations_len(), 1);
+        let watermarks = state.watermarks().to_vec();
+        drop(state);
+        assert!(watermarks.iter().any(|seq| *seq == 1));
+        let log = load_all_logs(&app.log_dir, 4).expect("load durable log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].op_id, "op-fsync");
+        assert!(
+            !app.snapshot_path.exists(),
+            "failed fsync must not promote latest snapshot"
+        );
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn corrupted_snapshot_is_rejected_on_restart_load() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-corrupt-snapshot-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        std::fs::create_dir_all(app.snapshot_path.parent().expect("snapshot parent"))
+            .expect("create snapshot parent");
+        std::fs::write(&app.snapshot_path, b"not-a-valid-snapshot").expect("write corrupt snapshot");
+
+        let err = load_source_of_truth(
+            &app.log_dir,
+            &app.snapshot_path,
+            &app.idempotency_path,
+            4,
+            &app.replication.cluster_id,
+            None,
+        )
+        .expect_err("corrupt snapshot should not be accepted");
+
+        assert!(err.to_string().contains("magic"));
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn corrupted_log_is_rejected_on_restart_load() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-corrupt-log-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let app = consensus_test_app(&root, "node-a", ConsensusRole::Follower, 1);
+        std::fs::create_dir_all(&app.log_dir).expect("create log dir");
+        std::fs::write(app.log_dir.join("shard_0000.glog"), [8u8, 0, 0, 0, b'G', b'M'])
+            .expect("write corrupt log");
+
+        let err = load_source_of_truth(
+            &app.log_dir,
+            &app.snapshot_path,
+            &app.idempotency_path,
+            4,
+            &app.replication.cluster_id,
+            None,
+        )
+        .expect_err("corrupt log should not be accepted");
+
+        assert!(
+            err.to_string().contains("failed to fill whole buffer")
+                || err.to_string().contains("magic"),
+            "unexpected corrupt log error: {err}"
+        );
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn object_store_outage_is_best_effort_by_default() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-object-store-best-effort-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut app = single_node_leader(&root);
+        app.object_store = Some(unavailable_object_store(false));
+
+        let outcome = commit_request(&app, deny_request("op-object-store-outage", "user-1"))
+            .expect("best-effort object-store outage should not reject local commit");
+
+        assert_eq!(outcome.mutation.op_id, "op-object-store-outage");
+        assert!(app.snapshot_path.exists());
+        assert!(app.snapshot_manifest_path.exists());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn required_object_store_upload_outage_rejects_publication() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-object-store-required-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let mut app = single_node_leader(&root);
+        app.object_store = Some(unavailable_object_store(true));
+        let snapshot = {
+            let state = lock_state(&app).expect("state");
+            state.snapshot()
+        };
+
+        let err = persist_latest_snapshot(&app, &snapshot)
+            .expect_err("required object-store outage should reject publication");
+
+        assert!(err.to_string().contains("object store request failed"));
+        assert!(app.snapshot_path.exists());
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn object_store_outage_blocks_bootstrap_without_local_state() {
+        let root = env::temp_dir().join(format!(
+            "globacl-commitd-object-store-bootstrap-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ));
+        let store = unavailable_object_store(false);
+
+        let err = restore_snapshot_before_load(
+            Some(&store),
+            &root.join("logs"),
+            &root.join("snapshots").join("objects"),
+            &root.join("snapshots").join("manifests"),
+            &root.join("snapshots").join("latest.gacl"),
+            &root
+                .join("snapshots")
+                .join("manifests")
+                .join("latest.manifest"),
+        )
+        .expect_err("object-store outage should block remote bootstrap");
+
+        assert!(err.to_string().contains("object store request failed"));
+        remove_test_dir(root);
+    }
+
     #[test]
     fn vote_request_rejects_stale_candidate_term() {
         let root = env::temp_dir().join(format!(
