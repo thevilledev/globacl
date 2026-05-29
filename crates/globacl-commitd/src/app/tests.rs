@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(state.mutations_len(), 1);
         let watermarks = state.watermarks().to_vec();
         drop(state);
-        assert!(watermarks.iter().any(|seq| *seq == 1));
+        assert!(watermarks.contains(&1));
         let log = load_all_logs(&app.log_dir, 4).expect("load durable log");
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].op_id, "op-fsync");

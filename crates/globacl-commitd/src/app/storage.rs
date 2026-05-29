@@ -200,10 +200,7 @@ fn maybe_inject_test_storage_fault(operation: &str, fault: StorageFault) -> Resu
                 StorageFault::DiskFull => "simulated disk full",
                 StorageFault::Fsync => "simulated fsync failure",
             };
-            return Err(GlobAclError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                message,
-            )));
+            return Err(GlobAclError::Io(std::io::Error::other(message)));
         }
     }
 
@@ -221,7 +218,7 @@ struct TestStorageFault {
 #[cfg(test)]
 thread_local! {
     static TEST_STORAGE_FAULT: std::cell::RefCell<Option<TestStorageFault>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
