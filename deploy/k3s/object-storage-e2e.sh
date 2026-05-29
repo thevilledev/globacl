@@ -4,7 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER="${CLUSTER:-globacl-object-storage}"
 IMAGE="${IMAGE:-ghcr.io/thevilledev/globacl:ci}"
-SEAWEEDFS_IMAGE="${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.29}"
 NAMESPACE="${NAMESPACE:-globacl}"
 CONTROL_PORT="${CONTROL_PORT:-17300}"
 DEMO_PORT="${DEMO_PORT:-18380}"
@@ -46,6 +45,10 @@ require_cmd() {
 
 k() {
   kubectl --context "k3d-${CLUSTER}" "$@"
+}
+
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
 }
 
 e2e_client() {
@@ -134,9 +137,8 @@ k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
 k3d cluster create "${CLUSTER}" --agents 1 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
-k apply -f "${ROOT_DIR}/deploy/k8s/local.yaml"
-sed "s#chrislusf/seaweedfs:4.29#${SEAWEEDFS_IMAGE}#g" \
-  "${ROOT_DIR}/deploy/k8s/seaweedfs-s3.yaml" | k apply -f -
+render_manifest "${ROOT_DIR}/deploy/k8s/local.yaml" | k apply -f -
+k apply -f "${ROOT_DIR}/deploy/k8s/seaweedfs-s3.yaml"
 k -n "${NAMESPACE}" rollout status deploy/globacl-seaweedfs --timeout=180s
 
 k -n "${NAMESPACE}" set env deploy/globacl-commitd \

@@ -62,11 +62,16 @@ e2e_client() {
   (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-e2e "$@")
 }
 
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
+}
+
 render_region() {
   local region="$1"
   sed \
     -e "s#__REGION_NAME__#${region}#g" \
     -e "s#__CONTROL_UPSTREAM__#${CONTROL_UPSTREAM}#g" \
+    -e "s#__GLOBACL_IMAGE__#${IMAGE}#g" \
     "${ROOT_DIR}/deploy/k8s/global/region.yaml.tpl"
 }
 
@@ -90,7 +95,7 @@ k3d cluster create "${CENTRAL_CLUSTER}" \
   --port "${CENTRAL_HOST_PORT}:30080@server:0" \
   --wait
 k3d image import "${IMAGE}" -c "${CENTRAL_CLUSTER}"
-k "${CENTRAL_CLUSTER}" apply -f "${ROOT_DIR}/deploy/k8s/global/central.yaml"
+render_manifest "${ROOT_DIR}/deploy/k8s/global/central.yaml" | k "${CENTRAL_CLUSTER}" apply -f -
 k "${CENTRAL_CLUSTER}" -n "${NAMESPACE}" rollout status statefulset/globacl-commitd --timeout=180s
 k "${CENTRAL_CLUSTER}" -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
 wait_for_http "http://127.0.0.1:${CENTRAL_HOST_PORT}/health"

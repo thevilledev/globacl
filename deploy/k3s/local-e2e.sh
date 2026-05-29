@@ -38,6 +38,10 @@ k() {
   kubectl --context "k3d-${CLUSTER}" "$@"
 }
 
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
+}
+
 wait_for_http() {
   local url="$1"
   e2e_client wait-health --base-url "${url}" --timeout 120s
@@ -67,7 +71,7 @@ k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
 k3d cluster create "${CLUSTER}" --agents 1 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
-k apply -f "${ROOT_DIR}/deploy/k8s/local.yaml"
+render_manifest "${ROOT_DIR}/deploy/k8s/local.yaml" | k apply -f -
 k -n "${NAMESPACE}" rollout status deploy/globacl-commitd --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s
 k -n "${NAMESPACE}" rollout status deploy/globacl-relay --timeout=180s

@@ -35,6 +35,10 @@ k() {
   kubectl --context "k3d-${CLUSTER}" "$@"
 }
 
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
+}
+
 port_forward() {
   local resource="$1"
   local host_port="$2"
@@ -98,7 +102,7 @@ k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
 k3d cluster create "${CLUSTER}" --agents 2 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
-k apply -f "${ROOT_DIR}/deploy/k8s/local-observability.yaml"
+render_manifest "${ROOT_DIR}/deploy/k8s/local-observability.yaml" | k apply -f -
 apply_grafana
 k -n "${NAMESPACE}" rollout status statefulset/globacl-commitd --timeout=240s
 k -n "${NAMESPACE}" rollout status deploy/globacl-control --timeout=180s

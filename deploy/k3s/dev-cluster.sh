@@ -121,6 +121,10 @@ k() {
   kubectl --context "k3d-${CLUSTER}" "$@"
 }
 
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
+}
+
 cluster_exists() {
   k3d cluster list "${CLUSTER}" >/dev/null 2>&1
 }
@@ -226,7 +230,7 @@ deploy_current_code() {
   build_and_import_image
 
   echo "applying local observability topology"
-  k apply -f "${ROOT_DIR}/deploy/k8s/local-observability.yaml"
+  render_manifest "${ROOT_DIR}/deploy/k8s/local-observability.yaml" | k apply -f -
   apply_grafana
   configure_messaging
   rollout_restart

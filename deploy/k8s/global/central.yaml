@@ -52,7 +52,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: commitd
-          image: ghcr.io/thevilledev/globacl:ci
+          image: __GLOBACL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-commitd"]
           args: ["/data/commitd", "0.0.0.0:7003", "64", "0"]
@@ -141,7 +141,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: control
-          image: ghcr.io/thevilledev/globacl:ci
+          image: __GLOBACL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-control"]
           args:

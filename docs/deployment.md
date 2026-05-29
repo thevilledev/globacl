@@ -2,10 +2,14 @@
 
 This repo includes Kubernetes manifests and k3d-backed k3s e2e scripts for proving the propagation path end to end.
 
-The manifests are intentionally small and dependency-free:
+The manifests are intentionally small. Checked-in Kubernetes manifests do not
+carry a mutable `globacl` image tag; they use `__GLOBACL_IMAGE__`, and the e2e
+and dev scripts render that placeholder with the locally built image before
+applying the manifest. Third-party runtime images are pinned with
+`tag@sha256:<digest>` references in the manifests.
 
 ```text
-Docker image:      ghcr.io/thevilledev/globacl:ci
+App image:         __GLOBACL_IMAGE__ rendered by scripts
 Namespace:         globacl
 Control port:      7000
 Commitd port:      7003
@@ -51,7 +55,7 @@ The script:
 1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
 2. Creates one k3d-backed k3s cluster.
 3. Imports the image into the cluster.
-4. Deploys commitd, control, relay, agent, and demo app.
+4. Renders __GLOBACL_IMAGE__ and deploys commitd, control, relay, agent, and demo app.
 5. Commits a P0 deny to control.
 6. Calls the demo app until it returns `"access": "denied"`.
 ```
@@ -93,8 +97,8 @@ The script:
 1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
 2. Creates one k3d-backed k3s cluster with two worker agents.
 3. Imports the image into the cluster.
-4. Deploys the three-node commitd quorum, three control pods, three relays,
-   three agents, three demo apps, and Prometheus.
+4. Renders __GLOBACL_IMAGE__ and deploys the three-node commitd quorum,
+   three control pods, three relays, three agents, three demo apps, and Prometheus.
 5. Commits a P0 deny to control.
 6. Calls the demo app until it returns `"access": "denied"`.
 7. Waits for central ack aggregation from all three agents.
@@ -133,7 +137,7 @@ The script:
 
 ```text
 1. Builds Docker image ghcr.io/thevilledev/globacl:ci.
-2. Pulls and imports chrislusf/seaweedfs:4.29.
+2. Deploys the digest-pinned SeaweedFS S3 manifest.
 3. Creates one k3d-backed k3s cluster.
 4. Deploys SeaweedFS with a pre-created globacl-snapshots bucket.
 5. Configures commitd to publish signed snapshots to the SeaweedFS S3 API.
@@ -154,8 +158,9 @@ iterate on code:
 
 That command creates or reuses one k3d cluster, builds
 `ghcr.io/thevilledev/globacl:ci`, imports it into the cluster, applies
-`deploy/k8s/local-observability.yaml`, restarts the runtime workloads, waits
-for rollout, and then keeps these local port-forwards open:
+`deploy/k8s/local-observability.yaml` after rendering `__GLOBACL_IMAGE__`,
+restarts the runtime workloads, waits for rollout, and then keeps these local
+port-forwards open:
 
 ```text
 control:    http://127.0.0.1:17200
@@ -264,11 +269,12 @@ The script:
 2. Creates a shared Docker network for k3d clusters.
 3. Creates one central k3s cluster.
 4. Creates three regional k3s clusters.
-5. Waits for the three-replica central commitd StatefulSet and control Deployment.
-6. Exposes central control on host port 17000.
-7. Points regional HA relays at the central k3d server node's NodePort address on the shared Docker network.
-8. Commits a P0 deny to central control.
-9. Calls every regional demo app until each returns `"access": "denied"`.
+5. Renders __GLOBACL_IMAGE__ into central and regional manifests.
+6. Waits for the three-replica central commitd StatefulSet and control Deployment.
+7. Exposes central control on host port 17000.
+8. Points regional HA relays at the central k3d server node's NodePort address on the shared Docker network.
+9. Commits a P0 deny to central control.
+10. Calls every regional demo app until each returns `"access": "denied"`.
 ```
 
 ## CI
@@ -303,12 +309,21 @@ CENTRAL_CLUSTER=globacl-central
 REGIONS="region-a region-b region-c"
 CONTROL_UPSTREAM=<optional-control-hostport>
 PROMETHEUS_PORT=19090
-SEAWEEDFS_IMAGE=chrislusf/seaweedfs:4.29
 KEEP_CLUSTER=1
 KEEP_CLUSTERS=1
 ```
 
 Use `KEEP_CLUSTER=1` or `KEEP_CLUSTERS=1` when debugging locally so the script does not delete the clusters on exit.
+
+For production-style manifest rendering, pass a digest-pinned first-party image:
+
+```text
+IMAGE=ghcr.io/thevilledev/globacl@sha256:<published-digest>
+```
+
+CI runs `scripts/check-k8s-images-pinned.sh` to reject checked-in Kubernetes
+manifests that use mutable image tags. The only allowed non-digest value is the
+`__GLOBACL_IMAGE__` placeholder, which must be rendered before apply.
 
 When `CONTROL_UPSTREAM` is unset, the global e2e script resolves the central k3d server container IP and uses `<central-server-ip>:30080`. Override it only when your environment has a different routable address for central control.
 
@@ -498,6 +513,8 @@ For direct Kubernetes use, create the dashboard ConfigMap and apply the Grafana
 manifests after `local-observability.yaml`:
 
 ```sh
+sed "s#__GLOBACL_IMAGE__#ghcr.io/thevilledev/globacl@sha256:<published-digest>#g" \
+  deploy/k8s/local-observability.yaml | kubectl apply -f -
 kubectl -n globacl create configmap globacl-grafana-dashboard \
   --from-file=globacl-overview.json=deploy/grafana/globacl-overview.json \
   --dry-run=client \

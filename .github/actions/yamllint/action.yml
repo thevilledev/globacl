@@ -15,6 +15,7 @@ inputs:
       .github/workflows
       deploy/k8s/local.yaml
       deploy/k8s/local-observability.yaml
+      deploy/k8s/grafana.yaml
       deploy/k8s/nats-jetstream.yaml
       deploy/k8s/seaweedfs-s3.yaml
       deploy/k8s/global/central.yaml

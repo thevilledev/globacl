@@ -54,6 +54,10 @@ k() {
   kubectl --context "k3d-${CLUSTER}" "$@"
 }
 
+render_manifest() {
+  sed "s#__GLOBACL_IMAGE__#${IMAGE}#g" "$1"
+}
+
 wait_for_http() {
   local url="$1"
   local log_file="${2:-}"
@@ -140,7 +144,7 @@ k3d cluster delete "${CLUSTER}" >/dev/null 2>&1 || true
 k3d cluster create "${CLUSTER}" --agents 1 --wait
 k3d image import "${IMAGE}" -c "${CLUSTER}"
 
-k apply -f "${ROOT_DIR}/deploy/k8s/local.yaml"
+render_manifest "${ROOT_DIR}/deploy/k8s/local.yaml" | k apply -f -
 k apply -f "${ROOT_DIR}/deploy/k8s/nats-jetstream.yaml"
 k -n "${NAMESPACE}" rollout status deploy/globacl-nats --timeout=180s
 

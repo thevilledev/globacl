@@ -79,6 +79,10 @@ jobs:
           bash -n deploy/k3s/global-e2e.sh
           bash -n deploy/k3s/observability-e2e.sh
           bash -n deploy/k3s/dev-cluster.sh
+          bash -n scripts/check-k8s-images-pinned.sh
+
+      - name: Check Kubernetes image pins
+        run: scripts/check-k8s-images-pinned.sh
 
       - name: Check Grafana dashboards
         run: jq empty deploy/grafana/*.json

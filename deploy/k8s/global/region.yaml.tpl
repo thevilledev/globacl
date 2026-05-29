@@ -35,7 +35,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: relay
-          image: ghcr.io/thevilledev/globacl:ci
+          image: __GLOBACL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-relay"]
           args:
@@ -100,7 +100,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/thevilledev/globacl:ci
+          image: __GLOBACL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-agent"]
           args:
@@ -172,7 +172,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: demo
-          image: ghcr.io/thevilledev/globacl:ci
+          image: __GLOBACL_IMAGE__
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/globacl-demo-app"]
           args:
