@@ -88,8 +88,9 @@ interface UiEvent {
   detail: string;
 }
 
+type UiEventDraft = Omit<UiEvent, "at">;
 type MutationMode = "point" | "rule";
-type ActiveView = "command" | "flow" | "consensus" | "regions" | "forensics";
+type ActiveView = "flow" | "command" | "consensus" | "regions" | "forensics" | "settings";
 
 interface UiState {
   config: UiConfig;
@@ -108,7 +109,7 @@ const DEFAULT_TARGET: LookupTarget = {
 };
 
 const STORAGE_KEY = "globacl.global-ui.config";
-const MAX_EVENT_COUNT = 20;
+const MAX_EVENT_COUNT = 300;
 const MAX_AUDIT_ITEMS = 80;
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -133,7 +134,7 @@ let state: UiState = {
   loading: false,
   busyAction: null,
   mutationMode: "point",
-  activeView: "command",
+  activeView: "flow",
   events: [],
 };
 
@@ -261,12 +262,26 @@ async function refresh(options: { quiet?: boolean } = {}): Promise<void> {
   }
 
   try {
-    state.snapshot = await loadDashboardSnapshot();
+    const previous = state.snapshot;
+    const next = await loadDashboardSnapshot();
+    state.snapshot = next;
+    recordSnapshotEvents(previous, next);
   } finally {
     state.loading = false;
     refreshInFlight = false;
-    render();
+    if (!options.quiet || !isEditingForm()) {
+      render();
+    }
   }
+}
+
+function isEditingForm(): boolean {
+  const active = document.activeElement;
+  return (
+    active instanceof HTMLInputElement ||
+    active instanceof HTMLSelectElement ||
+    active instanceof HTMLTextAreaElement
+  );
 }
 
 async function loadDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -374,6 +389,206 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function recordSnapshotEvents(
+  previous: DashboardSnapshot | null,
+  next: DashboardSnapshot,
+): void {
+  const events: UiEventDraft[] = [];
+  const propagation = okValue(next.propagation);
+  const previousPropagation = okValue(previous?.propagation);
+
+  if (!previous) {
+    events.push({
+      level: "info",
+      title: "session attached",
+      detail: `${state.config.regions.length} regions | poll ${state.config.pollMs}ms | ${targetLabel(state.config.target)}`,
+    });
+  }
+
+  compareResultEvent(
+    events,
+    "control health",
+    previous?.centralHealth,
+    next.centralHealth,
+    (health) => `${health.status} | ${consensusValue(health, "role", health.role ?? "control")}`,
+  );
+  compareResultEvent(
+    events,
+    "propagation status",
+    previous?.propagation,
+    next.propagation,
+    (status) => `${status.status} | lag ${formatInt(status.max_seq_lag)} | acks ${formatInt(status.ack_count)}`,
+  );
+  compareDecisionEvent(events, "central decision", previous?.centralDecision, next.centralDecision);
+
+  if (propagation && previousPropagation) {
+    if (propagation.source_max_seq > previousPropagation.source_max_seq) {
+      events.push({
+        level: "info",
+        title: "source advanced",
+        detail: `max seq ${formatInt(previousPropagation.source_max_seq)} -> ${formatInt(propagation.source_max_seq)}`,
+      });
+    }
+    if (propagation.max_seq_lag !== previousPropagation.max_seq_lag) {
+      events.push({
+        level: propagation.max_seq_lag > previousPropagation.max_seq_lag ? "error" : "info",
+        title: "lag changed",
+        detail: `max lag ${formatInt(previousPropagation.max_seq_lag)} -> ${formatInt(propagation.max_seq_lag)}`,
+      });
+    }
+  }
+
+  compareCanaryEvent(events, previous?.latestCanary, next.latestCanary);
+  compareCentralAckEvents(events, previousPropagation?.acks ?? [], propagation?.acks ?? []);
+
+  for (const region of next.regions) {
+    const prior = previous?.regions.find((item) => item.config.name === region.config.name);
+    compareResultEvent(
+      events,
+      `${region.config.name} agent`,
+      prior?.agentHealth,
+      region.agentHealth,
+      (health) => `${health.status} | max seq ${formatInt(numberField(health, "max_seq"))}`,
+    );
+    compareResultEvent(
+      events,
+      `${region.config.name} relay`,
+      prior?.relayHealth,
+      region.relayHealth,
+      (health) => health.status,
+    );
+    compareDecisionEvent(events, `${region.config.name} edge decision`, prior?.decision, region.decision);
+    compareAgentAdvanceEvent(events, region.config.name, prior?.agentHealth, region.agentHealth);
+  }
+
+  if (events.length > 18) {
+    const summarized = events.slice(0, 16);
+    summarized.push({
+      level: "info",
+      title: "poll summarized",
+      detail: `${events.length - summarized.length} additional changes in this refresh`,
+    });
+    pushSessionEvents(summarized);
+  } else {
+    pushSessionEvents(events);
+  }
+}
+
+function compareResultEvent<T>(
+  events: UiEventDraft[],
+  title: string,
+  previous: LoadResult<T> | undefined,
+  next: LoadResult<T>,
+  summary: (value: T) => string,
+): void {
+  const previousSignature = previous ? resultSignature(previous, summary) : "";
+  const nextSignature = resultSignature(next, summary);
+  if (previousSignature === nextSignature) {
+    return;
+  }
+  events.push({
+    level: next.ok ? "info" : "error",
+    title,
+    detail: next.ok ? summary(next.value) : next.message,
+  });
+}
+
+function compareDecisionEvent(
+  events: UiEventDraft[],
+  title: string,
+  previous: LoadResult<DecisionResponse> | undefined,
+  next: LoadResult<DecisionResponse>,
+): void {
+  compareResultEvent(events, title, previous, next, decisionSummary);
+}
+
+function compareAgentAdvanceEvent(
+  events: UiEventDraft[],
+  region: string,
+  previous: LoadResult<HealthResponse> | undefined,
+  next: LoadResult<HealthResponse>,
+): void {
+  if (!next.ok || !previous?.ok) {
+    return;
+  }
+  const priorSeq = numberField(previous.value, "max_seq");
+  const nextSeq = numberField(next.value, "max_seq");
+  if (nextSeq > priorSeq) {
+    events.push({
+      level: "info",
+      title: "agent applied",
+      detail: `${region} max seq ${formatInt(priorSeq)} -> ${formatInt(nextSeq)}`,
+    });
+  }
+}
+
+function compareCanaryEvent(
+  events: UiEventDraft[],
+  previous: LoadResult<LatestCanaryResponse> | undefined,
+  next: LoadResult<LatestCanaryResponse>,
+): void {
+  if (!next.ok || next.value.status !== "ok") {
+    compareResultEvent(events, "canary status", previous, next, canaryEventSummary);
+    return;
+  }
+  const previousCanary = previous?.ok && previous.value.status === "ok" ? previous.value : null;
+  if (!previousCanary || previousCanary.seq !== next.value.seq) {
+    events.push({
+      level: "info",
+      title: "canary observed",
+      detail: `${next.value.key} shard ${next.value.shard_id} seq ${next.value.seq}`,
+    });
+  }
+}
+
+function compareCentralAckEvents(
+  events: UiEventDraft[],
+  previousAcks: PropagationAckStatus[],
+  nextAcks: PropagationAckStatus[],
+): void {
+  const previousByKey = new Map(previousAcks.map((ack) => [ackKey(ack), ack]));
+  for (const ack of nextAcks) {
+    const previous = previousByKey.get(ackKey(ack));
+    if (!previous || ack.seq > previous.seq || ack.seq_lag !== previous.seq_lag) {
+      events.push({
+        level: (ack.seq_lag ?? 0) > 0 ? "error" : "info",
+        title: "ack received",
+        detail: `${ack.location}/${ack.agent_id} shard ${ack.shard_id} seq ${formatInt(ack.seq)} lag ${formatInt(ack.seq_lag ?? 0)}`,
+      });
+    }
+  }
+}
+
+function resultSignature<T>(result: LoadResult<T>, summary: (value: T) => string): string {
+  return result.ok ? `ok:${summary(result.value)}` : `error:${result.message}`;
+}
+
+function decisionSummary(decision: DecisionResponse): string {
+  if (decision.decision === "deny") {
+    return `deny | shard ${decision.shard_id} seq ${decision.seq} | ${decision.reason_code}`;
+  }
+  return "allow";
+}
+
+function canaryEventSummary(canary: LatestCanaryResponse): string {
+  return canary.status === "ok" ? `${canary.key} shard ${canary.shard_id} seq ${canary.seq}` : "none";
+}
+
+function ackKey(ack: PropagationAckStatus): string {
+  return `${ack.relay_id}\u0000${ack.location}\u0000${ack.agent_id}\u0000${ack.shard_id}`;
+}
+
+function pushSessionEvents(events: UiEventDraft[]): void {
+  if (events.length === 0) {
+    return;
+  }
+  const at = new Date();
+  state.events = [
+    ...events.map((event) => ({ ...event, at })).reverse(),
+    ...state.events,
+  ].slice(0, MAX_EVENT_COUNT);
+}
+
 function render(): void {
   app.innerHTML = `
     <header class="topbar">
@@ -392,18 +607,18 @@ function render(): void {
       ${renderEndpointStrip()}
       ${renderViewNav()}
       ${renderActiveView()}
-      ${renderConfigPanel()}
     </main>
   `;
   bindEvents();
 }
 
 const VIEW_DEFS: Array<{ id: ActiveView; label: string; meta: string }> = [
-  { id: "command", label: "Command", meta: "write + probe" },
-  { id: "flow", label: "Flow", meta: "message path" },
+  { id: "flow", label: "Flow", meta: "live stream" },
+  { id: "command", label: "Command", meta: "full write" },
   { id: "consensus", label: "Consensus", meta: "authority" },
   { id: "regions", label: "Regions", meta: "edge endpoints" },
   { id: "forensics", label: "Forensics", meta: "acks + audit" },
+  { id: "settings", label: "Settings", meta: "endpoints" },
 ];
 
 function renderViewNav(): string {
@@ -429,10 +644,12 @@ function renderActiveView(): string {
   switch (state.activeView) {
     case "flow":
       return `
-        <div class="view-stack">
+        <div class="flow-console">
           ${renderDataFlowPanel()}
-          ${renderTopology()}
-          ${renderWatermarksPanel()}
+          <div class="session-rail">
+            ${renderMutationPanel()}
+            ${renderSessionEventsPanel()}
+          </div>
         </div>
       `;
     case "consensus":
@@ -463,16 +680,22 @@ function renderActiveView(): string {
           ${renderEventsPanel()}
         </div>
       `;
+    case "settings":
+      return `
+        <div class="view-stack">
+          ${renderConfigPanel()}
+          ${renderRegionEndpointPanel()}
+        </div>
+      `;
     case "command":
     default:
       return `
         <div class="view-stack">
-          ${renderMetricGrid()}
           <div class="two-column command-columns">
             ${renderMutationPanel()}
             ${renderCommandPosturePanel()}
           </div>
-          ${renderDataFlowPanel()}
+          ${renderMetricGrid()}
         </div>
       `;
   }
@@ -483,7 +706,7 @@ function renderEndpointStrip(): string {
   const health = okValue(snapshot?.centralHealth);
   const target = state.config.target;
   const mutationPath = state.mutationMode === "rule" ? "/v1/rule" : "/v1/deny";
-  const readPath = `/v1/check?tenant_id=${encodeURIComponent(target.tenantId)}&namespace=${encodeURIComponent(target.namespace)}&value=${encodeURIComponent(target.key)}`;
+  const readPath = `/v1/check ${target.tenantId}/${target.namespace}/${target.key}`;
   const auth = state.config.bearerToken.trim() ? "bearer set" : "local/dev auth";
   return `
     <section class="endpoint-strip" aria-label="Active endpoints">
@@ -494,7 +717,7 @@ function renderEndpointStrip(): string {
       </div>
       <div class="endpoint-callouts">
         ${renderEndpointCallout("write", mutationPath, auth, healthTone(health))}
-        ${renderEndpointCallout("read probe", readPath, target.key, decisionTone(okValue(snapshot?.centralDecision)))}
+        ${renderEndpointCallout("read probe", readPath, renderDecisionText(okValue(snapshot?.centralDecision)), decisionTone(okValue(snapshot?.centralDecision)))}
         ${renderEndpointCallout("regions", `${state.config.regions.length} agent paths`, `${state.config.regions.length} relay paths`, "neutral")}
       </div>
     </section>
@@ -727,6 +950,10 @@ function renderDataFlowPanel(): string {
   const propagation = okValue(snapshot?.propagation);
   const manifest = okValue(snapshot?.snapshotManifest);
   const role = consensusValue(health, "role", health?.role ?? "control");
+  const maxAgentSeq = maxNumber(
+    snapshot?.regions.map((region) => numberField(okValue(region.agentHealth), "max_seq")) ?? [],
+  );
+  const centralDecision = okValue(snapshot?.centralDecision);
   const regions = state.config.regions
     .map((config) => {
       const region = snapshot?.regions.find((item) => item.config.name === config.name);
@@ -742,6 +969,12 @@ function renderDataFlowPanel(): string {
         </div>
         <span class="status-pill ${propagationTone(propagation)}">lag ${formatInt(propagation?.max_seq_lag ?? 0)}</span>
       </div>
+      <div class="flow-status-grid">
+        ${renderFlowStat("source", formatInt(propagation?.source_max_seq ?? manifest?.max_seq ?? 0), "committed max seq", "neutral")}
+        ${renderFlowStat("acks", formatInt(propagation?.ack_count ?? 0), `${formatInt(propagation?.acked_shards ?? 0)} acked shards`, propagationTone(propagation))}
+        ${renderFlowStat("edge", formatInt(maxAgentSeq), "highest agent seq", maxAgentSeq >= (propagation?.source_max_seq ?? 0) ? "ok" : "warn")}
+        ${renderFlowStat("decision", renderDecisionText(centralDecision), targetLabel(state.config.target), decisionTone(centralDecision))}
+      </div>
       <div class="flow-map">
         <div class="flow-chain">
           ${renderFlowNode("operator", "Operator", state.mutationMode === "rule" ? "rule mutation" : "point mutation", "neutral")}
@@ -755,6 +988,16 @@ function renderDataFlowPanel(): string {
         </div>
       </div>
     </section>
+  `;
+}
+
+function renderFlowStat(title: string, value: string, detail: string, tone: Tone): string {
+  return `
+    <article class="flow-stat ${tone}">
+      <span>${escapeHtml(title)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </article>
   `;
 }
 
@@ -1154,6 +1397,26 @@ function renderSnapshotPanel(): string {
   `;
 }
 
+function renderSessionEventsPanel(): string {
+  return `
+    <section class="panel events-panel session-events-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">session stream</p>
+          <h2>Observed flow events</h2>
+        </div>
+        <div class="section-actions">
+          <span class="status-pill neutral">${state.events.length} events</span>
+          <button class="small-button" id="clear-events-button" type="button">Clear</button>
+        </div>
+      </div>
+      <div class="event-list">
+        ${state.events.map(renderUiEvent).join("") || `<div class="empty-state">Waiting for the first poll</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderEventsPanel(): string {
   const audit = okValue(state.snapshot?.audit);
   const auditItems = audit?.items ?? [];
@@ -1227,6 +1490,10 @@ function bindEvents(): void {
   });
   document.querySelector<HTMLButtonElement>("#canary-button")?.addEventListener("click", () => {
     void createCanary();
+  });
+  document.querySelector<HTMLButtonElement>("#clear-events-button")?.addEventListener("click", () => {
+    state.events = [];
+    render();
   });
   document.querySelector<HTMLFormElement>("#config-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
