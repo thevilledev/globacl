@@ -277,6 +277,29 @@ The script:
 10. Calls every regional demo app until each returns `"access": "denied"`.
 ```
 
+Run the interactive global view:
+
+```sh
+./deploy/k3s/global-ui.sh
+```
+
+The UI runner uses the same central and regional k3d topology, keeps local
+port-forwards open for every regional demo, agent, and relay, seeds the same
+kind of P0 deny by default, and starts the vanilla TypeScript dashboard from
+`clients/typescript`. The dashboard uses the generated TypeScript client
+through a small same-origin proxy so browser CORS does not affect local
+inspection.
+
+Useful environment variables:
+
+```text
+GLOBACL_UI_PORT=18000
+GLOBACL_UI_KEY=user-global
+SEED_DENY=0
+AGENT_BASE_PORT=18200
+RELAY_BASE_PORT=18300
+```
+
 ## CI
 
 The manual GitHub Actions workflow is:

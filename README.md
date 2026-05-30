@@ -107,6 +107,13 @@ This workspace keeps runtime dependencies small. The shared core uses `ed25519-d
 - [Go client](clients/go)
 - [TypeScript client](clients/typescript)
 
+The TypeScript client package includes a no-React global operations UI for the
+k3d global topology:
+
+```sh
+./deploy/k3s/global-ui.sh
+```
+
 Regenerate checked-in clients after OpenAPI changes:
 
 ```sh

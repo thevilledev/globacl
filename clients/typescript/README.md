@@ -25,3 +25,20 @@ Regenerate from `docs/openapi.yaml`:
 ```sh
 scripts/generate-clients.sh
 ```
+
+## Global UI
+
+The package also contains a vanilla TypeScript operational UI that uses this
+client against a same-origin proxy:
+
+```sh
+pnpm run global-ui
+```
+
+By default it expects central control on `127.0.0.1:17000` and regional
+agent/relay/demo port-forwards on `18201`/`18301`/`18101` and up. To create
+that topology and keep the dashboard running:
+
+```sh
+./deploy/k3s/global-ui.sh
+```

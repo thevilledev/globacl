@@ -243,7 +243,8 @@ export class GlobaclClient {
   }
 
   private url(path: string): URL {
-    return new URL(path, this.baseUrl);
+    const relativePath = path.startsWith("/") ? path.slice(1) : path;
+    return new URL(relativePath, this.baseUrl);
   }
 
   private headers(values: HeadersInit): Headers {
