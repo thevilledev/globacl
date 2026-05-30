@@ -90,7 +90,7 @@ interface UiEvent {
 
 type UiEventDraft = Omit<UiEvent, "at">;
 type MutationMode = "point" | "rule";
-type ActiveView = "flow" | "command" | "consensus" | "regions" | "forensics" | "settings";
+type ActiveView = "flow" | "graph" | "command" | "consensus" | "regions" | "forensics" | "settings";
 
 interface UiState {
   config: UiConfig;
@@ -614,6 +614,7 @@ function render(): void {
 
 const VIEW_DEFS: Array<{ id: ActiveView; label: string; meta: string }> = [
   { id: "flow", label: "Flow", meta: "live stream" },
+  { id: "graph", label: "Graph", meta: "consensus map" },
   { id: "command", label: "Command", meta: "full write" },
   { id: "consensus", label: "Consensus", meta: "authority" },
   { id: "regions", label: "Regions", meta: "edge endpoints" },
@@ -650,6 +651,12 @@ function renderActiveView(): string {
             ${renderMutationPanel()}
             ${renderSessionEventsPanel()}
           </div>
+        </div>
+      `;
+    case "graph":
+      return `
+        <div class="graph-console">
+          ${renderConsensusGraphPanel()}
         </div>
       `;
     case "consensus":
@@ -941,6 +948,149 @@ function renderQuorumDots(peerCount: number, quorum: number, authority: boolean)
       <div class="quorum-dots">${dots}</div>
       <strong>${formatInt(quorum)} / ${formatInt(peerCount)} quorum</strong>
     </div>
+  `;
+}
+
+function renderConsensusGraphPanel(): string {
+  const snapshot = state.snapshot;
+  const health = okValue(snapshot?.centralHealth);
+  const propagation = okValue(snapshot?.propagation);
+  const manifest = okValue(snapshot?.snapshotManifest);
+  const centralDecision = okValue(snapshot?.centralDecision);
+  const role = consensusValue(health, "role", health?.role ?? "unknown");
+  const leader = consensusValue(health, "leader_id", "unknown");
+  const term = consensusValue(health, "term", "unknown");
+  const peerCount = Math.max(numberHealthField(health, "peer_count"), 1);
+  const quorum = Math.max(numberHealthField(health, "quorum"), 1);
+  const authority = booleanHealthField(health, "write_authority");
+  const sourceSeq = propagation?.source_max_seq ?? manifest?.max_seq ?? 0;
+  const regionCards = state.config.regions
+    .map((config) => {
+      const region = snapshot?.regions.find((item) => item.config.name === config.name);
+      return renderGraphRegionNode(config, region, propagation?.acks ?? [], sourceSeq);
+    })
+    .join("");
+
+  return `
+    <section class="panel graph-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">graph</p>
+          <h2>Consensus to regional decisions</h2>
+        </div>
+        <span class="status-pill ${authority ? "ok" : role === "candidate" ? "warn" : healthTone(health)}">${escapeHtml(role)} term ${escapeHtml(term)}</span>
+      </div>
+      <div class="graph-canvas">
+        <section class="graph-layer consensus-layer">
+          <header>
+            <span>consensus layer</span>
+            <strong>${escapeHtml(leader)}</strong>
+          </header>
+          <div class="consensus-ring">
+            ${renderGraphConsensusPeers(peerCount, quorum, leader, authority)}
+          </div>
+          <dl class="graph-facts">
+            <div><dt>quorum</dt><dd>${formatInt(quorum)} / ${formatInt(peerCount)}</dd></div>
+            <div><dt>write authority</dt><dd>${authority ? "yes" : "no"}</dd></div>
+            <div><dt>node</dt><dd>${escapeHtml(consensusValue(health, "node_id", "unknown"))}</dd></div>
+          </dl>
+        </section>
+
+        ${renderGraphLink("proposal", state.mutationMode === "rule" ? "/v1/rule" : "/v1/deny")}
+
+        <section class="graph-layer decision-layer ${decisionTone(centralDecision)}">
+          <header>
+            <span>committed decision</span>
+            <strong>${renderDecisionText(centralDecision)}</strong>
+          </header>
+          <div class="decision-core">
+            <span>source max seq</span>
+            <strong>${formatInt(sourceSeq)}</strong>
+            <small>${escapeHtml(targetLabel(state.config.target))}</small>
+          </div>
+          <dl class="graph-facts">
+            <div><dt>propagation</dt><dd>${escapeHtml(propagation?.status ?? "unknown")}</dd></div>
+            <div><dt>max lag</dt><dd>${formatInt(propagation?.max_seq_lag ?? 0)}</dd></div>
+            <div><dt>acks</dt><dd>${formatInt(propagation?.ack_count ?? 0)}</dd></div>
+          </dl>
+        </section>
+
+        ${renderGraphLink("fan out", `${state.config.regions.length} regions`)}
+
+        <section class="graph-layer region-graph-layer">
+          <header>
+            <span>regional edge</span>
+            <strong>${state.config.regions.length} regions</strong>
+          </header>
+          <div class="graph-regions">
+            ${regionCards || `<div class="empty-state">No regions configured</div>`}
+          </div>
+        </section>
+      </div>
+    </section>
+  `;
+}
+
+function renderGraphConsensusPeers(
+  peerCount: number,
+  quorum: number,
+  leader: string,
+  authority: boolean,
+): string {
+  const visiblePeers = Math.min(peerCount, 7);
+  return Array.from({ length: visiblePeers }, (_, index) => {
+    const isLeader = index === 0;
+    const committed = authority && index < quorum;
+    const label = isLeader ? leader : `peer-${index + 1}`;
+    return `
+      <article class="consensus-peer ${isLeader ? "leader" : ""} ${committed ? "committed" : ""}">
+        <span>${escapeHtml(isLeader ? "leader" : "voter")}</span>
+        <strong>${escapeHtml(label)}</strong>
+      </article>
+    `;
+  }).join("");
+}
+
+function renderGraphLink(title: string, detail: string): string {
+  return `
+    <div class="graph-link">
+      <span>${escapeHtml(title)}</span>
+      <strong>${escapeHtml(detail)}</strong>
+    </div>
+  `;
+}
+
+function renderGraphRegionNode(
+  config: RegionConfig,
+  snapshot: RegionSnapshot | undefined,
+  centralAcks: PropagationAckStatus[],
+  sourceSeq: number,
+): string {
+  const agentHealth = okValue(snapshot?.agentHealth);
+  const relayHealth = okValue(snapshot?.relayHealth);
+  const demoHealth = okValue(snapshot?.demoHealth);
+  const relayAcks = okValue(snapshot?.relayAcks);
+  const decision = okValue(snapshot?.decision);
+  const matchingAcks = centralAcks.filter((ack) => ack.location === config.name);
+  const lag = maxNumber(matchingAcks.map((ack) => ack.seq_lag ?? 0));
+  const agentSeq = numberField(agentHealth, "max_seq");
+  const tone = lag > 0 || agentSeq < sourceSeq ? "warn" : healthTone(agentHealth);
+  return `
+    <article class="graph-region ${tone}">
+      <header>
+        <strong>${escapeHtml(config.name)}</strong>
+        <span>lag ${formatInt(lag)}</span>
+      </header>
+      <div class="region-stage-line">
+        <div class="${healthTone(relayHealth)}"><span>relay</span><strong>${formatInt(relayAcks?.ack_count ?? 0)}</strong></div>
+        <div class="${healthTone(agentHealth)}"><span>agent</span><strong>${formatInt(agentSeq)}</strong></div>
+        <div class="${decisionTone(decision)}"><span>decision</span><strong>${renderDecisionText(decision)}</strong></div>
+      </div>
+      <footer>
+        <span>${escapeHtml(demoHealth?.status ?? "demo unknown")}</span>
+        <code>${escapeHtml(formatEndpoint(config.agentBaseUrl))}</code>
+      </footer>
+    </article>
   `;
 }
 

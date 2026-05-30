@@ -19,6 +19,8 @@ GLOBACL_UI_TENANT_ID="${GLOBACL_UI_TENANT_ID:-tenant-a}"
 GLOBACL_UI_NAMESPACE="${GLOBACL_UI_NAMESPACE:-user}"
 GLOBACL_UI_KEY="${GLOBACL_UI_KEY:-user-global}"
 SEED_DENY="${SEED_DENY:-1}"
+GLOBACL_UI_EVENT_STREAM="${GLOBACL_UI_EVENT_STREAM:-1}"
+GLOBACL_UI_EVENT_INTERVAL_SECONDS="${GLOBACL_UI_EVENT_INTERVAL_SECONDS:-5}"
 
 PIDS=()
 CLUSTERS=("${CENTRAL_CLUSTER}")
@@ -68,6 +70,37 @@ wait_for_propagation_ack() {
 
 e2e_client() {
   (cd "${ROOT_DIR}/clients/go" && go run ./cmd/globacl-e2e "$@")
+}
+
+start_event_generator() {
+  if [[ "${GLOBACL_UI_EVENT_STREAM}" != "1" ]]; then
+    return
+  fi
+
+  (
+    trap 'exit 0' INT TERM
+    event_index=0
+    while true; do
+      event_index="$((event_index + 1))"
+      priority_index="$(((event_index - 1) % 3))"
+      op_id="ui-stream-$(date +%s)-${event_index}-${RANDOM}"
+      if e2e_client deny \
+        --base-url "http://127.0.0.1:${CENTRAL_HOST_PORT}" \
+        --op-id "${op_id}" \
+        --tenant-id "${GLOBACL_UI_TENANT_ID}" \
+        --namespace "${GLOBACL_UI_NAMESPACE}" \
+        --key "${GLOBACL_UI_KEY}" \
+        --delivery-priority "p${priority_index}" \
+        --reason-code global_ui_stream \
+        --created-by global-ui-stream >>/tmp/globacl-global-ui-events.out 2>&1; then
+        echo "generated UI stream event ${op_id} for ${GLOBACL_UI_NAMESPACE}/${GLOBACL_UI_KEY}"
+      else
+        echo "global UI event generator failed for ${op_id}; see /tmp/globacl-global-ui-events.out" >&2
+      fi
+      sleep "${GLOBACL_UI_EVENT_INTERVAL_SECONDS}"
+    done
+  ) &
+  PIDS+=("$!")
 }
 
 render_manifest() {
@@ -198,12 +231,15 @@ if [[ "${SEED_DENY}" == "1" ]]; then
   wait_for_propagation_ack "${#REGIONS[@]}"
 fi
 
+start_event_generator
+
 region_list="${REGIONS[*]}"
 cat <<EOF
 global UI setup is running
 control: http://127.0.0.1:${CENTRAL_HOST_PORT}
 ui:      http://${GLOBACL_UI_HOST}:${GLOBACL_UI_PORT}/global-ui/
 regions: ${region_list}
+events:  GLOBACL_UI_EVENT_STREAM=${GLOBACL_UI_EVENT_STREAM}, interval=${GLOBACL_UI_EVENT_INTERVAL_SECONDS}s, key=${GLOBACL_UI_NAMESPACE}/${GLOBACL_UI_KEY}
 
 Press Ctrl-C to stop port-forwards and delete clusters.
 Set KEEP_CLUSTERS=1 to keep k3d clusters after exit.
