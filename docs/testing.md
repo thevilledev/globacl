@@ -118,6 +118,29 @@ three central commitd pods elect a leader, writes can arrive through any control
 gateway pod, and committed mutations are replicated to the commitd quorum before
 regional relays and agents observe them.
 
+Run the opt-in 100M-user scale scenario:
+
+```sh
+SCALE_USERS=100000000 \
+SEED_DENIES=1000000 \
+LOOKUP_WORKERS=256 \
+LOOKUP_DURATION=5m \
+./deploy/k3s/scale-e2e.sh
+```
+
+The scale e2e uses a virtual user keyspace rather than creating users or pods.
+It deploys the same central-plus-regional topology as the global e2e under
+separate `globacl-scale-*` k3d cluster names, seeds deterministic denies into
+the first `SEED_DENIES` user keys, waits for regional agents to catch up, runs
+demo-app lookup load across every region, then commits a P0 canary and requires
+every region to observe it within `CANARY_TIMEOUT` (default `60s`). Tune
+`SEED_CONCURRENCY`, `SEED_RETRIES`, `LOOKUP_DENY_RATIO`, `LOAD_RETRIES`,
+`LOAD_MAX_ERROR_RATE`, and `SEED_PROPAGATION_TIMEOUT` for larger local
+machines or longer soaks. The seeder retries transient control-plane write
+errors with stable operation IDs. Local `kubectl port-forward` can produce
+transient transport errors under lookup load, so the load runner retries failed
+lookup requests before counting them against `LOAD_MAX_ERROR_RATE`.
+
 Run the focused multi-process partition test:
 
 ```sh
