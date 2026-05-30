@@ -89,6 +89,7 @@ interface UiEvent {
 }
 
 type MutationMode = "point" | "rule";
+type ActiveView = "command" | "flow" | "consensus" | "regions" | "forensics";
 
 interface UiState {
   config: UiConfig;
@@ -96,6 +97,7 @@ interface UiState {
   loading: boolean;
   busyAction: string | null;
   mutationMode: MutationMode;
+  activeView: ActiveView;
   events: UiEvent[];
 }
 
@@ -131,6 +133,7 @@ let state: UiState = {
   loading: false,
   busyAction: null,
   mutationMode: "point",
+  activeView: "command",
   events: [],
 };
 
@@ -374,9 +377,10 @@ function errorMessage(error: unknown): string {
 function render(): void {
   app.innerHTML = `
     <header class="topbar">
-      <div>
+      <div class="brand-block">
         <p class="eyebrow">globacl</p>
-        <h1>Global system view</h1>
+        <h1>Global Operations Console</h1>
+        <p class="subtitle">${escapeHtml(targetLabel(state.config.target))}</p>
       </div>
       <div class="topbar-actions">
         ${renderRefreshState()}
@@ -385,20 +389,126 @@ function render(): void {
       </div>
     </header>
     <main class="layout">
+      ${renderEndpointStrip()}
+      ${renderViewNav()}
+      ${renderActiveView()}
       ${renderConfigPanel()}
-      ${renderMetricGrid()}
-      ${renderTopology()}
-      <div class="content-grid">
-        ${renderMutationPanel()}
-        ${renderRegionalPanel()}
-        ${renderWatermarksPanel()}
-        ${renderPropagationPanel()}
-        ${renderSnapshotPanel()}
-        ${renderEventsPanel()}
-      </div>
     </main>
   `;
   bindEvents();
+}
+
+const VIEW_DEFS: Array<{ id: ActiveView; label: string; meta: string }> = [
+  { id: "command", label: "Command", meta: "write + probe" },
+  { id: "flow", label: "Flow", meta: "message path" },
+  { id: "consensus", label: "Consensus", meta: "authority" },
+  { id: "regions", label: "Regions", meta: "edge endpoints" },
+  { id: "forensics", label: "Forensics", meta: "acks + audit" },
+];
+
+function renderViewNav(): string {
+  return `
+    <nav class="view-nav" aria-label="Global UI views">
+      ${VIEW_DEFS.map(
+        (view) => `
+          <button
+            type="button"
+            data-view="${view.id}"
+            class="${state.activeView === view.id ? "active" : ""}"
+          >
+            <strong>${escapeHtml(view.label)}</strong>
+            <span>${escapeHtml(view.meta)}</span>
+          </button>
+        `,
+      ).join("")}
+    </nav>
+  `;
+}
+
+function renderActiveView(): string {
+  switch (state.activeView) {
+    case "flow":
+      return `
+        <div class="view-stack">
+          ${renderDataFlowPanel()}
+          ${renderTopology()}
+          ${renderWatermarksPanel()}
+        </div>
+      `;
+    case "consensus":
+      return `
+        <div class="view-stack">
+          <div class="two-column">
+            ${renderConsensusPanel()}
+            ${renderCommandPosturePanel()}
+          </div>
+          ${renderPropagationPanel()}
+        </div>
+      `;
+    case "regions":
+      return `
+        <div class="view-stack">
+          ${renderRegionalPanel()}
+          ${renderRegionEndpointPanel()}
+        </div>
+      `;
+    case "forensics":
+      return `
+        <div class="view-stack">
+          ${renderPropagationPanel()}
+          <div class="two-column">
+            ${renderWatermarksPanel()}
+            ${renderSnapshotPanel()}
+          </div>
+          ${renderEventsPanel()}
+        </div>
+      `;
+    case "command":
+    default:
+      return `
+        <div class="view-stack">
+          ${renderMetricGrid()}
+          <div class="two-column command-columns">
+            ${renderMutationPanel()}
+            ${renderCommandPosturePanel()}
+          </div>
+          ${renderDataFlowPanel()}
+        </div>
+      `;
+  }
+}
+
+function renderEndpointStrip(): string {
+  const snapshot = state.snapshot;
+  const health = okValue(snapshot?.centralHealth);
+  const target = state.config.target;
+  const mutationPath = state.mutationMode === "rule" ? "/v1/rule" : "/v1/deny";
+  const readPath = `/v1/check?tenant_id=${encodeURIComponent(target.tenantId)}&namespace=${encodeURIComponent(target.namespace)}&value=${encodeURIComponent(target.key)}`;
+  const auth = state.config.bearerToken.trim() ? "bearer set" : "local/dev auth";
+  return `
+    <section class="endpoint-strip" aria-label="Active endpoints">
+      <div class="endpoint-primary">
+        <p class="eyebrow">active control endpoint</p>
+        <strong>${escapeHtml(formatEndpoint(state.config.controlBaseUrl))}</strong>
+        <span>${escapeHtml(formatHealthField(health, "commit_addr", "commitd via control gateway"))}</span>
+      </div>
+      <div class="endpoint-callouts">
+        ${renderEndpointCallout("write", mutationPath, auth, healthTone(health))}
+        ${renderEndpointCallout("read probe", readPath, target.key, decisionTone(okValue(snapshot?.centralDecision)))}
+        ${renderEndpointCallout("regions", `${state.config.regions.length} agent paths`, `${state.config.regions.length} relay paths`, "neutral")}
+      </div>
+    </section>
+  `;
+}
+
+function renderEndpointCallout(title: string, path: string, detail: string, tone: Tone): string {
+  return `
+    <article class="endpoint-callout ${tone}">
+      <span>${escapeHtml(title)}</span>
+      <strong>${escapeHtml(path)}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </article>
+  `;
 }
 
 function renderRefreshState(): string {
@@ -516,6 +626,179 @@ function renderMetric(title: string, value: string, tone: Tone, detail: string):
       <span>${escapeHtml(title)}</span>
       <strong>${escapeHtml(value)}</strong>
       <small>${escapeHtml(detail)}</small>
+    </article>
+  `;
+}
+
+function renderCommandPosturePanel(): string {
+  const snapshot = state.snapshot;
+  const health = okValue(snapshot?.centralHealth);
+  const propagation = okValue(snapshot?.propagation);
+  const manifest = okValue(snapshot?.snapshotManifest);
+  const decision = okValue(snapshot?.centralDecision);
+  const canary = okValue(snapshot?.latestCanary);
+  return `
+    <section class="panel posture-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">posture</p>
+          <h2>Control and target state</h2>
+        </div>
+        <span class="status-pill ${healthTone(health)}">${escapeHtml(health?.status ?? "unknown")}</span>
+      </div>
+      <dl class="detail-grid posture-grid">
+        <div><dt>gateway role</dt><dd>${escapeHtml(formatHealthField(health, "role", "unknown"))}</dd></div>
+        <div><dt>commit upstream</dt><dd>${escapeHtml(formatHealthField(health, "commitd", "unknown"))}</dd></div>
+        <div><dt>write path</dt><dd>${escapeHtml(state.mutationMode === "rule" ? "/v1/rule" : "/v1/deny")}</dd></div>
+        <div><dt>target decision</dt><dd>${renderDecisionBadge(decision, snapshot?.centralDecision ?? { ok: false, label: "central decision", message: "not loaded" })}</dd></div>
+        <div><dt>propagation lag</dt><dd>${formatInt(propagation?.max_seq_lag ?? 0)}</dd></div>
+        <div><dt>lagging acks</dt><dd>${formatInt(propagation?.lagging_ack_count ?? 0)}</dd></div>
+        <div><dt>manifest max seq</dt><dd>${formatInt(manifest?.max_seq ?? 0)}</dd></div>
+        <div><dt>latest canary</dt><dd>${canary?.status === "ok" ? `seq ${formatInt(canary.seq)}` : "none"}</dd></div>
+      </dl>
+      <div class="target-card">
+        <span>probe target</span>
+        <strong>${escapeHtml(targetLabel(state.config.target))}</strong>
+      </div>
+    </section>
+  `;
+}
+
+function renderConsensusPanel(): string {
+  const health = okValue(state.snapshot?.centralHealth);
+  const role = consensusValue(health, "role", health?.role ?? "unknown");
+  const authority = booleanHealthField(health, "write_authority");
+  const quorum = numberHealthField(health, "quorum");
+  const peerCount = numberHealthField(health, "peer_count");
+  const tone: Tone = authority ? "ok" : role === "candidate" ? "warn" : healthTone(health);
+  return `
+    <section class="panel consensus-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">consensus</p>
+          <h2>Commit authority</h2>
+        </div>
+        <span class="status-pill ${tone}">${escapeHtml(role)}</span>
+      </div>
+      <div class="consensus-hero ${tone}">
+        <div>
+          <span>leader</span>
+          <strong>${escapeHtml(consensusValue(health, "leader_id", authority ? consensusValue(health, "node_id", "local") : "unknown"))}</strong>
+        </div>
+        <div>
+          <span>term</span>
+          <strong>${escapeHtml(consensusValue(health, "term", "unknown"))}</strong>
+        </div>
+        <div>
+          <span>write authority</span>
+          <strong>${authority ? "yes" : "no"}</strong>
+        </div>
+      </div>
+      ${renderQuorumDots(peerCount, quorum, authority)}
+      <dl class="detail-grid consensus-grid">
+        <div><dt>node id</dt><dd>${escapeHtml(consensusValue(health, "node_id", "unknown"))}</dd></div>
+        <div><dt>cluster id</dt><dd>${escapeHtml(consensusValue(health, "cluster_id", "unknown"))}</dd></div>
+        <div><dt>voted for</dt><dd>${escapeHtml(consensusValue(health, "voted_for", "none"))}</dd></div>
+        <div><dt>peer count</dt><dd>${formatInt(peerCount)}</dd></div>
+        <div><dt>quorum</dt><dd>${formatInt(quorum)}</dd></div>
+        <div><dt>commit addr</dt><dd>${escapeHtml(formatHealthField(health, "commit_addr", "direct commitd"))}</dd></div>
+      </dl>
+    </section>
+  `;
+}
+
+function renderQuorumDots(peerCount: number, quorum: number, authority: boolean): string {
+  const count = Math.max(peerCount, quorum, 1);
+  const dots = Array.from({ length: Math.min(count, 9) }, (_, index) => {
+    const committed = authority && index < Math.max(quorum, 1);
+    return `<span class="${committed ? "committed" : ""}"></span>`;
+  }).join("");
+  return `
+    <div class="quorum-bar">
+      <div class="quorum-dots">${dots}</div>
+      <strong>${formatInt(quorum)} / ${formatInt(peerCount)} quorum</strong>
+    </div>
+  `;
+}
+
+function renderDataFlowPanel(): string {
+  const snapshot = state.snapshot;
+  const health = okValue(snapshot?.centralHealth);
+  const propagation = okValue(snapshot?.propagation);
+  const manifest = okValue(snapshot?.snapshotManifest);
+  const role = consensusValue(health, "role", health?.role ?? "control");
+  const regions = state.config.regions
+    .map((config) => {
+      const region = snapshot?.regions.find((item) => item.config.name === config.name);
+      return renderFlowRegionLane(config, region, propagation?.acks ?? []);
+    })
+    .join("");
+  return `
+    <section class="panel flow-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">data flow</p>
+          <h2>Mutation to edge decision</h2>
+        </div>
+        <span class="status-pill ${propagationTone(propagation)}">lag ${formatInt(propagation?.max_seq_lag ?? 0)}</span>
+      </div>
+      <div class="flow-map">
+        <div class="flow-chain">
+          ${renderFlowNode("operator", "Operator", state.mutationMode === "rule" ? "rule mutation" : "point mutation", "neutral")}
+          ${renderFlowLink(state.mutationMode === "rule" ? "POST /v1/rule" : "POST /v1/deny")}
+          ${renderFlowNode("control", "Control gateway", formatHealthField(health, "commit_addr", "commitd upstream"), healthTone(health))}
+          ${renderFlowLink(`term ${consensusValue(health, "term", "?")} / ${role}`)}
+          ${renderFlowNode("log", "Committed log", `source max ${formatInt(propagation?.source_max_seq ?? manifest?.max_seq ?? 0)}`, propagationTone(propagation))}
+        </div>
+        <div class="flow-region-grid">
+          ${regions || `<div class="empty-state">No regions configured</div>`}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderFlowNode(kind: string, title: string, detail: string, tone: Tone): string {
+  return `
+    <article class="flow-node ${kind} ${tone}">
+      <span>${escapeHtml(title)}</span>
+      <strong>${escapeHtml(detail)}</strong>
+    </article>
+  `;
+}
+
+function renderFlowLink(label: string): string {
+  return `<div class="flow-link"><span>${escapeHtml(label)}</span></div>`;
+}
+
+function renderFlowRegionLane(
+  config: RegionConfig,
+  snapshot: RegionSnapshot | undefined,
+  centralAcks: PropagationAckStatus[],
+): string {
+  const agentHealth = okValue(snapshot?.agentHealth);
+  const relayHealth = okValue(snapshot?.relayHealth);
+  const demoHealth = okValue(snapshot?.demoHealth);
+  const relayAcks = okValue(snapshot?.relayAcks);
+  const decision = okValue(snapshot?.decision);
+  const matchingAcks = centralAcks.filter((ack) => ack.location === config.name);
+  const lag = maxNumber(matchingAcks.map((ack) => ack.seq_lag ?? 0));
+  const tone = lag > 0 ? "warn" : healthTone(agentHealth);
+  return `
+    <article class="region-flow ${tone}">
+      <header>
+        <strong>${escapeHtml(config.name)}</strong>
+        <span>lag ${formatInt(lag)}</span>
+      </header>
+      <div class="mini-flow">
+        <div class="${healthTone(relayHealth)}"><span>relay</span><strong>${formatInt(relayAcks?.ack_count ?? 0)}</strong></div>
+        <div class="${healthTone(agentHealth)}"><span>agent</span><strong>${formatInt(numberField(agentHealth, "max_seq"))}</strong></div>
+        <div class="${healthTone(demoHealth)}"><span>demo</span><strong>${escapeHtml(demoHealth?.status ?? "unknown")}</strong></div>
+      </div>
+      <footer>
+        <span>${renderDecisionBadge(decision, snapshot?.decision ?? { ok: false, label: `${config.name} decision`, message: "not loaded" })}</span>
+        <code>${escapeHtml(formatEndpoint(config.agentBaseUrl))}</code>
+      </footer>
     </article>
   `;
 }
@@ -689,6 +972,54 @@ function renderRegionalPanel(): string {
         ${rows}
       </div>
     </section>
+  `;
+}
+
+function renderRegionEndpointPanel(): string {
+  const rows = state.config.regions.map((config) => {
+    const snapshot = state.snapshot?.regions.find((item) => item.config.name === config.name);
+    return renderRegionEndpointRow(config, snapshot);
+  }).join("");
+  return `
+    <section class="panel endpoint-panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">endpoint map</p>
+          <h2>Regional paths in use</h2>
+        </div>
+        <span class="status-pill neutral">${state.config.regions.length} regions</span>
+      </div>
+      <div class="data-table endpoint-table">
+        <div class="table-head">
+          <span>Region</span>
+          <span>Agent decision API</span>
+          <span>Relay ack API</span>
+          <span>Demo probe API</span>
+          <span>State</span>
+        </div>
+        ${rows || renderEmptyRow("No endpoints configured")}
+      </div>
+    </section>
+  `;
+}
+
+function renderRegionEndpointRow(config: RegionConfig, snapshot: RegionSnapshot | undefined): string {
+  const agentHealth = okValue(snapshot?.agentHealth);
+  const relayHealth = okValue(snapshot?.relayHealth);
+  const demoHealth = okValue(snapshot?.demoHealth);
+  const worstTone = [healthTone(agentHealth), healthTone(relayHealth), healthTone(demoHealth)].includes("bad")
+    ? "bad"
+    : [healthTone(agentHealth), healthTone(relayHealth), healthTone(demoHealth)].includes("warn")
+      ? "warn"
+      : "ok";
+  return `
+    <div class="table-row">
+      <span>${escapeHtml(config.name)}</span>
+      <span title="${escapeHtml(config.agentBaseUrl)}">${escapeHtml(formatEndpoint(config.agentBaseUrl))}</span>
+      <span title="${escapeHtml(config.relayBaseUrl)}">${escapeHtml(formatEndpoint(config.relayBaseUrl))}</span>
+      <span title="${escapeHtml(config.demoBaseUrl)}">${escapeHtml(formatEndpoint(config.demoBaseUrl))}</span>
+      <span><span class="status-pill ${worstTone}">${worstTone}</span></span>
+    </div>
   `;
 }
 
@@ -882,6 +1213,15 @@ function renderEmptyRow(message: string): string {
 }
 
 function bindEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const view = button.dataset.view;
+      if (isActiveView(view)) {
+        state.activeView = view;
+        render();
+      }
+    });
+  });
   document.querySelector<HTMLButtonElement>("#refresh-button")?.addEventListener("click", () => {
     void refresh();
   });
@@ -1068,6 +1408,76 @@ function outcomeSummary(outcome: CommitOutcomeResponse): string {
 
 function canarySummary(canary: CanaryStatusResponse): string {
   return `${canary.key} shard ${canary.shard_id} seq ${canary.seq}`;
+}
+
+function isActiveView(value: string | undefined): value is ActiveView {
+  return VIEW_DEFS.some((view) => view.id === value);
+}
+
+function targetLabel(target: LookupTarget): string {
+  return `${target.tenantId} / ${target.namespace} / ${target.key}`;
+}
+
+function formatEndpoint(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function formatHealthField(
+  health: HealthResponse | undefined,
+  field: string,
+  fallback: string,
+): string {
+  const value = health?.[field];
+  if (value === undefined || value === "") {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value ? "yes" : "no";
+  }
+  if (typeof value === "number") {
+    return formatInt(value);
+  }
+  return value;
+}
+
+function consensusValue(
+  health: HealthResponse | undefined,
+  field: string,
+  fallback: string,
+): string {
+  const direct = health?.[field];
+  const upstream = health?.[`commitd_${field}`];
+  return formatUnknown(upstream ?? direct, fallback);
+}
+
+function booleanHealthField(health: HealthResponse | undefined, field: string): boolean {
+  const value = health?.[`commitd_${field}`] ?? health?.[field];
+  return value === true || value === 1 || value === "1" || value === "true" || value === "yes";
+}
+
+function numberHealthField(health: HealthResponse | undefined, field: string): number {
+  const value = health?.[`commitd_${field}`] ?? health?.[field];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function formatUnknown(value: string | number | boolean | undefined, fallback: string): string {
+  if (value === undefined || value === "") {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value ? "yes" : "no";
+  }
+  if (typeof value === "number") {
+    return formatInt(value);
+  }
+  return value;
 }
 
 type Tone = "ok" | "warn" | "bad" | "neutral";

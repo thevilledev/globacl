@@ -5,15 +5,9 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     match (request.method.as_str(), route.as_str()) {
         ("GET", "/health") => {
             let (status_code, body) = match http_get(&app.commit_addr, "/health") {
-                Ok(response) if response.status_code == 200 => (
-                    200,
-                    json!({
-                        "status": "ok",
-                        "role": "control",
-                        "commitd": "ok",
-                        "commit_addr": app.commit_addr.as_str()
-                    }),
-                ),
+                Ok(response) if response.status_code == 200 => {
+                    (200, control_health_ok(&app, &response.body))
+                }
                 Ok(response) => (
                     503,
                     json!({
@@ -124,6 +118,54 @@ fn handle_connection(mut stream: TcpStream, app: Arc<App>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn control_health_ok(app: &App, commitd_body: &[u8]) -> JsonValue {
+    let mut body = JsonMap::new();
+    body.insert("status".to_owned(), json!("ok"));
+    body.insert("role".to_owned(), json!("control"));
+    body.insert("commitd".to_owned(), json!("ok"));
+    body.insert("commit_addr".to_owned(), json!(app.commit_addr.as_str()));
+
+    match parse_json_body(commitd_body) {
+        Ok(value) => {
+            if let Some(object) = value.as_object() {
+                for key in [
+                    "status",
+                    "role",
+                    "node_id",
+                    "cluster_id",
+                    "leader_id",
+                    "term",
+                    "voted_for",
+                    "write_authority",
+                    "quorum",
+                    "peer_count",
+                    "shard_count",
+                    "entries",
+                    "mutations",
+                    "jetstream_publisher",
+                    "max_published_seq",
+                    "central_ack_count",
+                    "last_publish_unix",
+                    "publish_errors",
+                    "last_peer_sync_unix",
+                    "sync_errors",
+                ] {
+                    if let Some(value) = object.get(key) {
+                        body.insert(format!("commitd_{key}"), value.clone());
+                    }
+                }
+            } else {
+                body.insert("commitd_health_parse".to_owned(), json!("non_object"));
+            }
+        }
+        Err(err) => {
+            body.insert("commitd_health_parse".to_owned(), json!(err.to_string()));
+        }
+    }
+
+    JsonValue::Object(body)
 }
 
 fn format_control_metrics(app: &App) -> String {
